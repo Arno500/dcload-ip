@@ -1212,9 +1212,11 @@ int do_console(char *path, char *isofile)
     unsigned char buffer[2048];
 	struct timespec time = {0},  remain = {0};
 
-    if (isofile) {
+	if (isofile) {
 	isofd = open(isofile, O_RDONLY | O_BINARY);
 	if (isofd < 0)
+	    log_error(isofile);
+	if (dc_cdfs_setup(isofd))
 	    log_error(isofile);
     }
 
@@ -1278,6 +1280,8 @@ int do_console(char *path, char *isofile)
 	    CatchError(dc_readdir(buffer));
 	if (!(memcmp(buffer, CMD_CDFSREAD, 4)))
 	    CatchError(dc_cdfs_redir_read_sectors(isofd, buffer));
+	if (!(memcmp(buffer, CMD_CDFSTOC, 4)))
+	    CatchError(dc_cdfs_redir_read_toc(isofd, buffer));
 	if (!(memcmp(buffer, CMD_GDBPACKET, 4)))
 	    CatchError(dc_gdbpacket(buffer));
     }

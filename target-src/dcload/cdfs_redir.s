@@ -3,7 +3,12 @@
 	.extern _gdGdcExecServer
 	.extern _gdGdcInitSystem
 	.extern _gdGdcGetDrvStat
+	.extern _gdGdcG1DmaEnd
+	.extern _gdGdcReqDmaTrans
+	.extern _gdGdcCheckDmaTrans
+	.extern _gdGdcReadAbort
 	.extern _gdGdcChangeDataType
+	.extern _gdGdcReset
 
 	.section .text
 	.global _cdfs_redir_enable
@@ -51,7 +56,8 @@ cdfs_redir_k:
 
 cdfs_redir:
 	mov r7,r0
-	mov #10,r1
+	! allow syscall IDs 0..10 (11 entries in gd_first_k table)
+	mov #11,r1
 	cmp/hs r0,r1
 	bf badsyscall
 	mov.l gd_first_k,r1
@@ -78,14 +84,14 @@ gdGdcInitSystem:
 gdGdcGetDrvStat:
 	.long _gdGdcGetDrvStat
 gdGdcG1DmaEnd:
-	.long badsyscall
+	.long _gdGdcG1DmaEnd
 gdGdcReqDmaTrans:
-	.long badsyscall
+	.long _gdGdcReqDmaTrans
 gdGdcCheckDmaTrans:
-	.long badsyscall
+	.long _gdGdcCheckDmaTrans
 gdGdcReadAbort:
-	.long badsyscall
+	.long _gdGdcReadAbort
 gdGdcReset:
-	.long badsyscall
+	.long _gdGdcReset
 gdGdcChangeDataType:
 	.long _gdGdcChangeDataType

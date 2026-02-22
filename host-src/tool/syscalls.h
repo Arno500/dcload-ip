@@ -44,7 +44,9 @@ int dc_readdir(unsigned char * buffer);
 int dc_closedir(unsigned char * buffer);
 int dc_rewinddir(unsigned char * buffer);
 
+int dc_cdfs_setup(int isofd);
 int dc_cdfs_redir_read_sectors(int isofd, unsigned char * buffer);
+int dc_cdfs_redir_read_toc(int isofd, unsigned char * buffer);
 
 int dc_gdbpacket(unsigned char * buffer);
 
@@ -71,6 +73,7 @@ int dc_gdbpacket(unsigned char * buffer);
 #define CMD_CDFSREAD "DC19"
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
+#define CMD_CDFSTOC "DC22"
 
 // Special definition for exception handler data
 #define CMD_EXCEPTION "EXPT"

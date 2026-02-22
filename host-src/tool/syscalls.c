@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <time.h>
@@ -67,6 +68,18 @@
 static DIR *opendirs[MAX_OPEN_DIRS];
 static char *mappath = NULL;
 static int mappatlen = -1;
+static uint32_t cdfs_start_sector = 150;
+static uint32_t cdfs_num_sectors = 0;
+
+struct dc_toc {
+	uint32_t entry[99];
+	uint32_t first;
+	uint32_t last;
+	uint32_t dunno;
+};
+
+#define MAKE_DC_TOC_ENTRY(lba, adr, ctrl) ((lba) | ((adr) << 24) | ((ctrl) << 28))
+#define MAKE_DC_TOC_TRACK(n) (((n) & 0xff) << 16)
 
 static char path_work_buffer[MAX_PATH_LEN];
 static char path_result_buffer[MAX_PATH_LEN];
@@ -74,6 +87,85 @@ void set_mappath(char *path) {
   mappath = path;
   mappatlen = strlen(mappath);
   strcpy(path_work_buffer, mappath);
+}
+
+static int read_exact(int fd, void *buf, size_t size)
+{
+	unsigned char *out = (unsigned char *)buf;
+	size_t done = 0;
+	while (done < size) {
+		ssize_t r = read(fd, out + done, size - done);
+		if (r <= 0) {
+			return -1;
+		}
+		done += (size_t)r;
+	}
+	return 0;
+}
+
+static int read_at(int fd, off_t offset, void *buf, size_t size)
+{
+	if (lseek(fd, offset, SEEK_SET) < 0) {
+		return -1;
+	}
+	return read_exact(fd, buf, size);
+}
+
+int dc_cdfs_setup(int isofd)
+{
+	unsigned char pvd_sig[6];
+	unsigned char root_sig[0x22];
+	unsigned char next_sig[0x22];
+	uint32_t sec;
+	off_t filesize = lseek(isofd, 0, SEEK_END);
+
+	if (filesize < 0) {
+		cdfs_start_sector = 150;
+		cdfs_num_sectors = 0;
+		return -1;
+	}
+
+	cdfs_num_sectors = (uint32_t)(filesize / 2048);
+	cdfs_start_sector = 150;
+
+	for (sec = 16; sec < 500; sec++) {
+		if (read_at(isofd, (off_t)sec * 2048, pvd_sig, sizeof(pvd_sig)) < 0) {
+			return -1;
+		}
+
+		if (!memcmp(pvd_sig, "\001CD001", 6)) {
+			break;
+		}
+		if (!memcmp(pvd_sig, "\377CD001", 6)) {
+			return 0;
+		}
+	}
+
+	if (sec >= 500) {
+		return 0;
+	}
+
+	if (read_at(isofd, ((off_t)sec * 2048) + 0x9c, root_sig, sizeof(root_sig)) < 0) {
+		return -1;
+	}
+
+	while (++sec < 500) {
+		if (read_at(isofd, (off_t)sec * 2048, next_sig, sizeof(next_sig)) < 0) {
+			return -1;
+		}
+		if (!memcmp(root_sig, next_sig, 0x12) && !memcmp(root_sig + 0x19, next_sig + 0x19, 0x9)) {
+			uint32_t root_lba = ((uint32_t)root_sig[5] << 24) |
+				((uint32_t)root_sig[4] << 16) |
+				((uint32_t)root_sig[3] << 8) |
+				(uint32_t)root_sig[2];
+			if ((root_lba + 150) >= sec) {
+				cdfs_start_sector = root_lba + 150 - sec;
+			}
+			break;
+		}
+	}
+
+	return 0;
 }
 
 /**
@@ -534,24 +626,60 @@ int dc_rewinddir(unsigned char * buffer)
 
 int dc_cdfs_redir_read_sectors(int isofd, unsigned char * buffer)
 {
-    int start;
-    unsigned char * buf;
-    command_3int_t *command = (command_3int_t *)buffer;
+	int64_t start;
+	unsigned int size;
+	unsigned char *buf;
+	command_3int_t *command = (command_3int_t *)buffer;
 
-    start = ntohl(command->value0) - 150;
+	size = ntohl(command->value2);
+	start = (int64_t)ntohl(command->value0) - (int64_t)cdfs_start_sector;
+	if (start < 0) {
+		send_cmd(CMD_RETVAL, -1, -1, NULL, 0);
+		return 0;
+	}
 
-    lseek(isofd, start * 2048, SEEK_SET);
+	buf = malloc(size);
+	if (!buf) {
+		send_cmd(CMD_RETVAL, -1, -1, NULL, 0);
+		return 0;
+	}
 
-    buf = malloc(ntohl(command->value2));
+	if (read_at(isofd, (off_t)(start * 2048), buf, size) < 0) {
+		send_cmd(CMD_RETVAL, -1, -1, NULL, 0);
+		free(buf);
+		return 0;
+	}
 
-    read(isofd, buf, ntohl(command->value2));
+	send_data(buf, ntohl(command->value1), size);
+	send_cmd(CMD_RETVAL, 0, 0, NULL, 0);
 
-    send_data(buf, ntohl(command->value1), ntohl(command->value2));
+	free(buf);
+	return 0;
+}
 
-    send_cmd(CMD_RETVAL, 0, 0, NULL, 0);
+int dc_cdfs_redir_read_toc(int isofd, unsigned char * buffer)
+{
+	command_3int_t *command = (command_3int_t *)buffer;
+	struct dc_toc toc;
 
-    free(buf);
-    return 0;
+	(void)isofd;
+
+	memset(&toc, 0xff, sizeof(toc));
+	if (cdfs_start_sector > 150) {
+		toc.entry[0] = MAKE_DC_TOC_ENTRY(150, 1, 0);
+		toc.entry[1] = MAKE_DC_TOC_ENTRY(cdfs_start_sector, 1, 4);
+		toc.last = MAKE_DC_TOC_TRACK(2);
+	}
+	else {
+		toc.entry[0] = MAKE_DC_TOC_ENTRY(cdfs_start_sector, 1, 4);
+		toc.last = MAKE_DC_TOC_TRACK(1);
+	}
+	toc.first = MAKE_DC_TOC_TRACK(1);
+	toc.dunno = MAKE_DC_TOC_ENTRY(cdfs_start_sector + cdfs_num_sectors, 1, 4);
+
+	send_data((unsigned char *)&toc, ntohl(command->value1), sizeof(toc));
+	send_cmd(CMD_RETVAL, 0, 0, NULL, 0);
+	return 0;
 }
 
 #define GDBBUFSIZE 1024

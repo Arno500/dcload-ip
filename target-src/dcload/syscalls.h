@@ -45,6 +45,7 @@
 #define CMD_CDFSREAD "DC19"
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
+#define CMD_CDFSTOC "DC22"
 
 extern unsigned short dcload_syscall_port;
 

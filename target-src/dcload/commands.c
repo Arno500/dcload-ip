@@ -178,6 +178,21 @@ void cmd_partbin(command_t * command)
 	int index = 0;
 	unsigned int cmd_addr = ntohl(command->address);
 	unsigned int cmd_size = ntohl(command->size);
+	unsigned int load_start = bin_info.load_address;
+	unsigned int load_end = load_start + bin_info.load_size;
+	unsigned int cmd_end = cmd_addr + cmd_size;
+
+	/* Drop stale/out-of-window PBIN packets. During runtime CDFS transfers,
+	 * late UDP packets from a previous LBIN can otherwise underflow the
+	 * packet map index and corrupt memory. */
+	if (cmd_size == 0)
+	{
+		return;
+	}
+	if ((cmd_addr < load_start) || (cmd_end < cmd_addr) || (cmd_end > load_end))
+	{
+		return;
+	}
 
 	// Thanks to packet buffer alignment, command->data is guaranteed to be 8-byte aligned.
 	// If the destination address is 8-byte aligned, this will be a rocket.
@@ -188,7 +203,25 @@ void cmd_partbin(command_t * command)
 	SH4_aligned_memcpy((void*)cmd_addr, to_p1(command->data), cmd_size);
 	if(cached_dest)
 	{
-		CacheBlockPurge((void*)cmd_addr, (cmd_size + 31)/32 + 2); // +1 for misalignment, +1 again for prefetch
+		/* Flush exactly the cache lines touched by this packet write. */
+		unsigned int purge_base = cmd_addr & ~31U;
+		unsigned int purge_end = (cmd_addr + cmd_size + 31U) & ~31U;
+
+		/* Clamp to the end of the 16MB RAM aperture for any SH4 segment alias. */
+		if ((cmd_addr & 0x1f000000U) == 0x0c000000U)
+		{
+			unsigned int seg_base = cmd_addr & 0xe0000000U;
+			unsigned int ram_end = seg_base | 0x0d000000U;
+			if (purge_end > ram_end)
+			{
+				purge_end = ram_end;
+			}
+		}
+
+		if (purge_end > purge_base)
+		{
+			CacheBlockPurge((void*)purge_base, (purge_end - purge_base) / 32U);
+		}
 	}
 	// Ensure physical memory is actually written to from the cache, since we don't know how it might be used.
 	// Purge instead of writeback to avoid cache conflicts/trashing.
@@ -202,7 +235,10 @@ void cmd_partbin(command_t * command)
 	{
 		index = (cmd_addr - bin_info.load_address) / 1440; // /1440 = 64-bit multiplication trick
 	}
-
+	if ((unsigned int)index >= BIN_INFO_MAP_SIZE)
+	{
+		return;
+	}
 	bin_info.map[index] = 1;
 }
 
