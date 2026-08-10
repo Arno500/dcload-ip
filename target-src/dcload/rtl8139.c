@@ -353,6 +353,21 @@ static void rtl_init(void)
 	/* clear all interrupts */
 	nic16[RT_INTRSTATUS/2] = 0xffff;
 
+	/*
+	 * UNMASK THE RX STATUS BITS.
+	 *
+	 * dcload is polled and takes no interrupt, so it is tempting to leave
+	 * RT_INTRMASK at zero -- which is what happened here, the only line that
+	 * ever set it (0x53) having ended up inside a large commented-out block.
+	 * But the mask does not merely gate the interrupt line: it governs whether
+	 * these status bits become OBSERVABLE at all. With the mask at zero,
+	 * RT_INTRSTATUS never reliably shows RxOK, the `intr & RT_INT_RX_ACK`
+	 * arm of the poll loop looks permanently dead, and reception depends
+	 * entirely on the RxBufEmpty fallback -- which cannot distinguish "a frame
+	 * has fully arrived" from "the chip has begun storing one".
+	 */
+	nic16[RT_INTRMASK/2] = RT_INT_RX_ACK;
+
 	/* Reset RXMISSED counter */
 	nic32[RT_RXMISSED/4] = 0;
 
@@ -673,10 +688,37 @@ static int rtl_bb_rx()
 		/* apparently this means the rtl8139 is still copying */
 		if (rx_size == 0xfff0U)
 		{
+			g_rx_copying++;
 			rtl_is_copying = 1; // Really don't want to run a DHCP renewal while data is in flight...
 			break;
 		}
 		rtl_is_copying = 0;
+
+		/*
+		 * IMPLAUSIBLE HEADER -> GIVE UP, DO NOT CONSUME.
+		 *
+		 * The chip writes the status word LAST, so a header read a few
+		 * microseconds too early still holds the PREVIOUS occupant's bytes.
+		 * 0xfff0 above catches only the case where the chip says so itself;
+		 * every other stale pattern falls through, and the length taken from
+		 * it then advances cur_rx by an arbitrary amount. From that moment the
+		 * ring is desynchronised for good: CAPR walks ahead of CBR, the chip
+		 * stops reporting frames, and reception is dead with no error
+		 * anywhere. Measured on Sonic Adventure: CAPR 6340 against CBR 2212
+		 * with RxBufEmpty clear, dcload receiving nothing while flycast
+		 * reported every frame delivered.
+		 *
+		 * Breaking out is safe and self-correcting -- nothing is consumed,
+		 * nothing is acknowledged, cur_rx does not move, and the next poll
+		 * re-reads the same slot once the chip has finished writing it.
+		 * Do NOT "recover" here by flushing the ring: that turns one early
+		 * read into a loop that destroys the very frame being waited for.
+		 */
+		if ((rx_size < 8U) || (rx_size > (RX_PKT_BUF_SIZE + 4U)))
+		{
+			g_rx_hdr_defer++;
+			break;
+		}
 
 		pkt_size = rx_size - 4;
 
@@ -727,14 +769,40 @@ static int rtl_bb_rx()
 
 		}
 
+		g_rx_frames++;
+
 		// Align next packet to 4-bytes (add 4 to account for transmit status; the 4 extra bytes included in rx_size are the CRC)
 		rtl.cur_rx = (rtl.cur_rx + rx_size + 4 + 3) & ~3;
 
+		/*
+		 * CAPR MUST BE WRITTEN IN RANGE, WRAP OR NO WRAP.
+		 *
+		 * This used to publish 0x7ff0 on the wrap. That value is outside the
+		 * 16 KB ring, and it tells the chip that everything has been drained:
+		 * it moves its own pointer to CBA and discards the queued frames while
+		 * cur_rx stays put. CAPR then sits ahead of CBR and the ring is
+		 * mutually locked -- the chip never reports another frame and the CPU
+		 * never advances. There is no recovery from that state.
+		 *
+		 * Measured symptom, and it is not subtle: Sonic Adventure ran 86 disc
+		 * reads and then received NOTHING more. flycast's bridge reported
+		 * every frame delivered (dropped=0), dcload's LBIN/PBIN/DBIN counters
+		 * were frozen solid, and the read timed out after 20 s. The wrap is
+		 * simply where the ring happened to turn over.
+		 *
+		 * The -16 bias is the RTL8139 convention (it is what distinguishes
+		 * empty from full); masking keeps it inside the ring when cur_rx is
+		 * below 16. Same expression on both paths, deliberately -- the wrap is
+		 * not a special case for this register.
+		 */
 		if(rtl.cur_rx >= RX_BUFFER_LEN)
 		{
+			g_rx_wraps++;
 			// Prevent underflowing the RX buffer
 			rtl.cur_rx %= RX_BUFFER_LEN;
-			nic16[RT_RXBUFTAIL/2] = 0x7ff0;
+			g_rx_last_capr = (rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1);
+			g_rx_last_cbr = nic16[RT_RXBUFHEAD/2];
+			nic16[RT_RXBUFTAIL/2] = g_rx_last_capr;
 			// According to the RTL8139C datasheet, 0xfff0 = 65520 is the default value of the register,
 			// and the register cannot be written to before data has been read from the buffer for some
 			// reason. So, presumably, we can just use that value here.
@@ -748,7 +816,9 @@ static int rtl_bb_rx()
 		else
 		{
 			rtl.cur_rx %= RX_BUFFER_LEN;
-			nic16[RT_RXBUFTAIL/2] = rtl.cur_rx - 16;
+			g_rx_last_capr = (rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1);
+			g_rx_last_cbr = nic16[RT_RXBUFHEAD/2];
+			nic16[RT_RXBUFTAIL/2] = g_rx_last_capr;
 			// Why 16? NetBSD and Linux do this, too. Status is 4, CRC appended is 4, what's the other 8?
 			// Things don't work if this isn't 16, anyways (I tried changing it). Maybe this is 16 for DMA reasons?
 			// RealTek does it here: https://www.cs.usfca.edu/~cruse/cs326f04/RTL8139_ProgrammersGuide.pdf
@@ -778,9 +848,49 @@ static int rtl_bb_rx()
 	return processed;
 }
 
+volatile int drain_iters = 0;
+/* Times the performance counter read lower than it had before. Non-zero means
+ * the clock cannot be trusted for deadlines on this machine. */
+unsigned int g_pmcr_backwards = 0;
+/* Poll iterations spent with nothing received, at the last timeout. */
+unsigned int g_idle_polls_max = 0;
+
+/*
+ * RX ring forensics. Pure counters -- no network I/O, so sampling them cannot
+ * perturb what they measure (a write(1,...) trace here would be a transmit
+ * nested inside bb->loop, which corrupts pkt_buf).
+ */
+unsigned int g_rx_frames = 0;		/* frames handed to the stack */
+unsigned int g_rx_wraps = 0;		/* cur_rx crossed the end of the ring */
+unsigned int g_rx_hdr_defer = 0;	/* header implausible, gave up and retried */
+unsigned int g_rx_copying = 0;		/* chip said "still copying" (0xfff0) */
+unsigned int g_rx_overflow = 0;		/* RX buffer overflow seen */
+unsigned int g_rx_reinit = 0;		/* ring refused to drain, NIC re-initialised */
+unsigned int g_rx_last_capr = 0;	/* CAPR as we last published it */
+unsigned int g_rx_last_cbr = 0;		/* CBR as the chip last reported it */
+unsigned int g_rx_polls = 0;		/* poll iterations, a liveness heartbeat */
+unsigned int g_rx_linkchange = 0;	/* entered the PHY-reset branch */
+unsigned int g_rx_link_giveup = 0;	/* a bounded link wait ran out */
+unsigned int g_rx_underrun_ack = 0;	/* underrun acked without touching the PHY */
+
+/* Spins before a link wait gives up. Large enough that a genuine
+ * auto-negotiation completes, small enough that a dead link costs a blip
+ * rather than the session. */
+#define RTL_LINK_SPIN_LIMIT 200000u
+
+/*
+ * Clock-free deadline. The performance counter is unusable once a game is
+ * running, so the only thing left to bound is IDLENESS: how many poll
+ * iterations went by without a single frame arriving. Deliberately generous --
+ * cutting a slow read short hands the title a half-filled buffer, which is
+ * worse than waiting.
+ */
+#define RTL_IDLE_POLL_LIMIT 2000000u
+
 void rtl_bb_loop(int is_main_loop)
 {
 	unsigned int intr = 0;
+	unsigned int idle_polls = 0;
 	unsigned int loop_start[2] = {0};
 	unsigned int loop_measure[2] = {0};
 	unsigned int prev_loop_elapsed = 0;
@@ -804,6 +914,7 @@ void rtl_bb_loop(int is_main_loop)
 	// OMG this is polling the network adapter. Well, ok then.
 	while(!escape_loop)
 	{
+		g_rx_polls++;
 
 		/* Check interrupt status */
 		if (nic16[RT_INTRSTATUS/2] != intr)
@@ -816,25 +927,120 @@ void rtl_bb_loop(int is_main_loop)
 		if (intr & RT_INT_RX_ACK)
 		{
 			//i = rtl_bb_rx();
-			rtl_bb_rx();
+			if (rtl_bb_rx() > 0)
+			{
+				idle_polls = 0;
+			}
+			else
+			{
+				idle_polls++;
+			}
+		}
+		else if (!(nic8[RT_CHIPCMD] & 1))
+		{
+			/* Safety net, deliberately ungated. Some RTL8139 revisions do not
+			 * re-assert RxOK for a frame that arrived just after an ack, and
+			 * RxBufEmpty clearing is then the only evidence that anything is
+			 * queued. Without this the ring can hold frames that no status bit
+			 * ever announces, and the host retransmits forever into a DC that
+			 * never reads them. */
+			if (rtl_bb_rx() > 0)
+			{
+				idle_polls = 0;
+			}
+			else
+			{
+				idle_polls++;
+			}
+		}
+		else
+		{
+			idle_polls++;
+		}
+
+		/* The real deadline: nothing has arrived for a very long time. */
+		if ((timeout_loop > 0) && (idle_polls > RTL_IDLE_POLL_LIMIT))
+		{
+			if (idle_polls > g_idle_polls_max)
+			{
+				g_idle_polls_max = idle_polls;
+			}
+			idle_polls = 0;
+			timeout_loop = -1;
+			escape_loop = 1;
 		}
 
 		/* link change */
 		if (__builtin_expect(intr & RT_INT_RXFIFO_UNDERRUN, 0))
 		{
+			/*
+			 * THIS BIT IS SHARED: "packet underrun OR link change". Taking the
+			 * PHY-reset path for every underrun is self-sustaining -- writing
+			 * BMCR 0x9200 restarts auto-negotiation, which drops the link,
+			 * which sets the bit again. The visible symptom is the on-screen
+			 * status flickering between "link change..." and "idle...", and
+			 * the invisible one is that every reset discards whatever was in
+			 * flight: a steady trickle of lost packets with no congestion
+			 * behind it.
+			 *
+			 * So look before resetting. If auto-negotiation still reports
+			 * complete, the link is fine and this was an underrun: acknowledge
+			 * it and carry on.
+			 */
+			if (nic16[RT_MII_BMSR/2] & 0x20)
+			{
+				g_rx_underrun_ack++;
+				nic16[RT_INTRSTATUS/2] = RT_INT_RXFIFO_UNDERRUN;
+				rtl_link_up = 1;
+				intr &= ~RT_INT_RXFIFO_UNDERRUN;
+				continue;
+			}
 
 			if (booted && (!running))
 			{
 				disp_status("link change...");
 			}
 
+			/*
+			 * BOUND BOTH WAITS. THEY USED TO BE `while (!cond);`.
+			 *
+			 * This branch resets the PHY and then spins for auto-negotiation
+			 * and for the follow-up interrupt. Nothing guarantees either ever
+			 * arrives -- and when they do not, dcload stops dead INSIDE one
+			 * poll iteration, still nominally "in bb->loop" but never looking
+			 * at the ring again. Measured on Sonic Adventure: g_rx_polls went
+			 * from ~45000 per 0.3 s to ONE per 0.26 s while g_rx_frames froze,
+			 * the host retransmitted into a DC that was no longer listening,
+			 * and the read timed out with no answer. It looked for a long time
+			 * like a lost packet; it was the loader hanging on the PHY.
+			 *
+			 * A bounded wait that gives up is always right here: the link is
+			 * either back, in which case the next poll sees it, or it is not,
+			 * in which case spinning changes nothing. Every hardware wait in
+			 * dcload is supposed to be bounded -- this pair was missed.
+			 */
+			g_rx_linkchange++;
 			nic16[RT_MII_BMCR/2] = 0x9200;
 
 			/* wait for valid link */
-			while (!(nic16[RT_MII_BMSR/2] & 0x20));
+			{
+				unsigned int spins = RTL_LINK_SPIN_LIMIT;
+				while (!(nic16[RT_MII_BMSR/2] & 0x20) && --spins);
+				if (!spins)
+				{
+					g_rx_link_giveup++;
+				}
+			}
 
 			/* wait for the additional link change interrupt that is coming */
-			while (!(nic16[RT_INTRSTATUS/2] & RT_INT_RXFIFO_UNDERRUN));
+			{
+				unsigned int spins = RTL_LINK_SPIN_LIMIT;
+				while (!(nic16[RT_INTRSTATUS/2] & RT_INT_RXFIFO_UNDERRUN) && --spins);
+				if (!spins)
+				{
+					g_rx_link_giveup++;
+				}
+			}
 			nic16[RT_INTRSTATUS/2] = RT_INT_RXFIFO_UNDERRUN;
 
 			if (booted && (!running))
@@ -865,6 +1071,7 @@ void rtl_bb_loop(int is_main_loop)
 		/* Rx Buffer overflow */
 		if (intr & RT_INT_RXBUF_OVERFLOW)
 		{
+			g_rx_overflow++;
 /*
 			// Update CAPR
 			rtl.cur_rx = nic16[RT_RXBUFHEAD];
@@ -884,8 +1091,36 @@ void rtl_bb_loop(int is_main_loop)
 			// clear interrupts
 			nic16[RT_INTRSTATUS/2] = 0xffff;
 	*/
-			// NetBSD, FreeBSD, and OpenBSD all just do a full re-init if this happens.
-			rtl_init();
+			/*
+			 * DRAIN FIRST, RE-INITIALISE ONLY IF THE RING REFUSES TO EMPTY.
+			 *
+			 * The BSDs (and KOS) re-init unconditionally here, but they can
+			 * afford to: their interrupt handler has always emptied the ring
+			 * before an overflow is seen. dcload is polled, and the ring is
+			 * 16 KB while a single chunked disc read pushes ~18 KB through it,
+			 * so overflow is the NORMAL back-pressure signal, not a fault.
+			 * Re-initialising on it throws away frames that were correctly
+			 * received and never acknowledged, and the host -- which has
+			 * already moved on -- retransmits into a ring that has just been
+			 * reset under it.
+			 *
+			 * Measured before this change: a multi-chunk read would complete
+			 * and then the NEXT read got nothing at all. flycast reported
+			 * every frame delivered (dropped=0) while dcload's LBIN/PBIN/DBIN
+			 * counters sat frozen for the full 20 s syscall timeout.
+			 */
+			rtl_bb_rx();
+			if (nic8[RT_CHIPCMD] & 1)
+			{
+				/* RxBufEmpty: the ring drained fine, just acknowledge. */
+				nic16[RT_INTRSTATUS/2] = RT_INT_RXBUF_OVERFLOW;
+			}
+			else
+			{
+				// NetBSD, FreeBSD, and OpenBSD all just do a full re-init if this happens.
+				g_rx_reinit++;
+				rtl_init();
+			}
 		}
 
 		if(is_main_loop && rtl_link_up && (!rtl_is_copying)) // Only want this to run in main loop
@@ -895,10 +1130,46 @@ void rtl_bb_loop(int is_main_loop)
 			set_ip_dhcp();
 		}
 
+		/* Bounded drain: leave after a fixed number of polls instead of
+		 * waiting for a reply. The ring is emptied, nothing is awaited. */
+		if (drain_iters > 0 && --drain_iters == 0)
+		{
+			escape_loop = 1;
+		}
+
 		if(timeout_loop > 0)
 		{
 			PMCR_Read(DCLOAD_PMCR, loop_measure);
-			unsigned int loop_secs_elapsed = (unsigned int)((*(unsigned long long int*)loop_measure - *(unsigned long long int*)loop_start)/200000000);
+
+			/*
+			 * NEVER LET THIS SUBTRACTION RUN BACKWARDS.
+			 *
+			 * The performance counter is not dependable once a game owns the
+			 * machine -- it has been measured returning 0 outright. When the
+			 * "now" reading is below the "start" reading, this unsigned
+			 * subtraction wraps to about 1.8e19, divides down to a number
+			 * enormously larger than any timeout, and fires INSTANTLY.
+			 *
+			 * The consequence is not a slow path, it is a wrong answer: the
+			 * read wait is abandoned microseconds after the request goes out,
+			 * before the host's very first reply can arrive; dcload reports
+			 * the read finished; and the title runs on a buffer that was never
+			 * filled. Sonic Adventure did exactly that -- executed the empty
+			 * buffer and jumped to address 0 -- while every counter in dcload
+			 * still looked perfectly healthy.
+			 *
+			 * Re-base instead. A counter that has stopped or gone backwards
+			 * means "no information", never "time is up".
+			 */
+			unsigned long long int now = *(unsigned long long int*)loop_measure;
+			unsigned long long int start = *(unsigned long long int*)loop_start;
+			if (now < start)
+			{
+				*(unsigned long long int*)loop_start = now;
+				start = now;
+				g_pmcr_backwards++;
+			}
+			unsigned int loop_secs_elapsed = (unsigned int)((now - start)/200000000);
 			if(prev_loop_elapsed != loop_secs_elapsed)
 			{
 				if(dhcp_attempts > 1) // Don't show a counter yet if it's the first attempt

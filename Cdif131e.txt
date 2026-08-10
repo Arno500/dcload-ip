@@ -1,0 +1,2886 @@
+                      GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+
+                          GD-ROM Protocol
+SPI (Sega Packet Interface) Specifications
+
+
+
+
+                  Issued:
+Prepared   Reviewed     Approved      SEGA Enterprises, Ltd.
+                                      CS Development & Manufacturing Division
+
+                                      2-12, Haneda, 1-chome, Ohta-ku, Tokyo, 144-0043, Japan
+
+
+
+                                               1
+GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+                Tel: 03-5736-7206
+                THIS DOCUMENT WILL IN NO WAY BE COPIED.
+                TO BE RETURNED ON DEMAND.
+
+
+
+
+                         2
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+
+                                                Revision History
+  Version                         Change description                                Date                 By
+    0.1                         Initial document creation                         97-04-11           Suetsugu
+    0.2                                 Revision                                  97-04-18           Suetsugu
+    0.3                                 Revision                                  97-05-01           Suetsugu
+    0.4                                 Revision                                  97-05-09           Suetsugu
+    1.0                                  Release                                  97-05-15           Suetsugu
+   1.01                              Partial revision                             97-07-07           Suetsugu
+   1.10                              Partial revision                             97-09-05           Suetsugu
+    1.11                             Partial revision                             97-09-09           Suetsugu
+   1.12                              Partial revision                             97-09-24           Suetsugu
+   1.20                              Partial revision                             98-01-23           Suetsugu
+   1.21                              Partial revision                             98-02-16           Suetsugu
+   1.22                              Partial revision                             98-05-13           Suetsugu
+   1.30                         Additions and revisions                           98-07-15           Nakamura
+   1.31               Errors corrected and explanations added                     99-01-12           Nakamura
+
+
+Changes made from Ver 1.21 to 1.22
+          Modified shape transfer picture in according to the current drive.
+          Added notes on command flow when data transmission amount is 0.
+Changes from version 1.20 to version 1.21
+          Single-density and double-density specification was added to GET_TOC command, with separate
+           get procedure.
+Changes from version 1.12 to version 1.20
+          Protocol name set to SPI (Sega Packet Interface), ATA commands in protocol changed to SATA.
+          Explanation of Feature register added.
+          Control/Address sequence as shown in data for CD_SCD command corrected (was reversed
+           from GET_TOC command).
+          ECC Retry Times deleted from REQ_MODE/SET_MODE command (not supported by chip).
+          ADR and Control sequence in data for GET_TOC command adjusted to comply with Yellow Book.
+          Other corrections
+Changes from version 1.22 to version 1.30
+          Explanations added
+          Errors corrected
+Changes from version 1.30 to version 1.31
+          Errors corrected
+          Explanations added
+
+
+
+
+                                                        3
+                                          GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+                                                                    Contents
+1.      Outline..............................................................................................................................................5
+     1.1      System Configuration................................................................................................................5
+2.      Basics...............................................................................................................................................5
+     2.1      Terms and Symbols...................................................................................................................5
+     2.2      Disc Layout................................................................................................................................6
+3.      Communication Principle..................................................................................................................7
+     3.1      SPI Outline................................................................................................................................7
+     3.2      Signal Lines...............................................................................................................................7
+     3.3      Command Transfer Mechanism..............................................................................................10
+        3.3.1        Reset Conditions..............................................................................................................10
+           3.3.1.1          Power-On Reset or Hardware Reset........................................................................10
+           3.3.1.2          SPI Soft Reset Command and Protocol....................................................................11
+           3.3.1.3          ATA SRST.................................................................................................................11
+     3.4      ATA I/O Register......................................................................................................................12
+4       ATA Command Flow Sequence.....................................................................................................17
+     4.1      Flow of the command for PIO data transfer to host system....................................................17
+     4.2 Non-data Command Flow..........................................................................................................18
+5.      ATA Command (Task File Command)............................................................................................19
+6.      CD Drive.........................................................................................................................................21
+     6.1      CD Drive State Transition........................................................................................................21
+        6.1.1        CD Drive State Transition Diagram..................................................................................22
+        6.1.2        CD Drive State Transition Table.......................................................................................24
+7.      SPI Command Flow Sequence......................................................................................................25
+     7.1      Packet Command Flow For PIO DATA To Host......................................................................25
+     7.2      Transfer Packet Command Flow For PIO Data from Host......................................................28
+     7.3      DMA Command Flow..............................................................................................................30
+     7.4      Non-Data Command Flow.......................................................................................................31
+8.      SPI Packet Commands..................................................................................................................32
+     8.1      Command Packet Format.......................................................................................................33
+     8.2      Command Reference..............................................................................................................34
+
+
+
+
+                                                                              4
+                                 GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+1. Outline
+      This document describes the interface between the host and KATANA GD-ROM drive.
+1.1     System Configuration
+           Host interface
+            Electrical interface between host and GD block conforms to ATA-3 specifications.
+            (Software compatibility is not assured.)
+           CD-DA playback capability
+            CD-DA playback can be realized easily with commands from the host.
+           Data transfer
+            High-speed data transfer is possible (max. 16.6 MB/s).
+
+
+2. Basics
+2.1     Terms and Symbols
+        Terms used in this document are defined below.
+
+
+Term                         Meaning
+CD-DA                        Compact Disc-Digital Audio
+                             Standard media for recording digital audio information, defined by the 'Red Book'
+CD-ROM                       Compact Disc-Read Only Memory
+                             Standard media for recording digital audio and digital data, defined by ISO/IEC
+                             10149.
+Command packet               Structure used for transmitting commands from the host to SPI device.
+DMA                          Data transfer between peripheral ancillary equipment and the host memory without
+                             the intermediacy of the processor.
+Index                        Information that fragments CD-ROM tracks. A track can be allotted an index
+                             number from 1 to 99. The index numbers of a track start with 1 and are numbered
+                             consecutively.
+Lead-in area                 Area located before the first track on the disc. The main channel within the lead-in
+                             area is audio or 'null' data and it is recorded as track 00. TOC information is
+                             recorded in this area's subcode Q.
+Lead-out area                The disc's last information track area. The main channel within the lead-out area is
+                             audio or 'null' data and it is recorded as track AA (bcd).
+PIO                          Programmed Input/Output
+                             Data transfer mediated by the host processor.
+Sector                       Data contained in 1 frame (1/75 sec)
+Subcode                      Data other than main channel data recorded on a CD-ROM or CD-DA. The
+                             structure consists of eight data called P, Q, R, S, T, U, V, and W.
+TOC                          Table Of Contents
+                             Information that shows the disc type and start address of tracks. This information is
+
+
+
+                                                            5
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+                         recorded in the subcode Q.
+Track                    Information that fragments the disc, numbered from 1 to 99. The data within one
+                         track must be the same class. It is either CD-ROM or CD-DA.
+Frame          address Continuous number starting at 0 (absolute time point 00:00:00 on GD). 1:1
+(FAD)                    relationship to absolute time.
+Logical sector           Continuous sector (frame) unit number starting at 0 (absolute time point 00:02:00
+number (LSN)             on GD).
+                         Logical sector number = frame address - 150 (2 seconds)
+IDE                      Integrated Drive Electronics
+                         An interface originally designed for connecting hard drives to IBM PC/AT
+                         compatibles.
+ATA                      AT Attachment
+                         A set of hardware and software specifications for IDE, defined by the CAM
+                         (Common Access Method) committee.
+ATAPI                    ATA Packet Interface
+                         An expansion of the ATA standard for connecting CD-ROM drives, defined by the
+                         SFF (Small Form Factor) committee.
+SPI                      Protocol that supports the GD-ROM block.
+GD                       Gigabyte Disc
+                         Disc for KATANA use that consists of single-density and double-density areas.
+GD-ROM                   Gigabyte Disc-Read Only memory
+                         Area with data recorded in the double-density area of the KATANA disc.
+GD-DA                    Gigabyte Disc-Digital Audio
+                         Audio area recorded in the double-density area of the KATANA disc.
+Task file                A register file for controlling the KATANA GD-ROM block.
+
+                                                Table 2.1 Terms
+
+
+2.2     Disc Layout
+        Refer to the "GD-ROM Format Specifications Basics" and the "GD-ROM Format Specifications
+        Applications" supplied separately.
+
+
+
+
+                                                        6
+                                GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+3. Communication Principle
+      The host and GD drive are connected via an ATA interface. The communication protocol uses ATA
+      commands expanded by original commands.
+
+
+3.1     SPI Outline
+        The SPI standard matches the KATANA GD-ROM drive and in a unique way simplifies and expands
+        the ATAPI standard.
+
+
+3.2     Signal Lines
+           CS0- (Chip select 0)
+            Serves for selecting the command block register.
+            Note: This signal is known as "CS1FX-" in the industry.
+
+
+           CS1- (Chip select 1)
+            Serves for selecting the control block register.
+            Note: This signal is known as "CS3FX-" in the industry.
+
+
+           DA2, DA1, DA0 (Device address)
+            Specifies the register and data read/write port.
+
+
+           DASP- (Device active, device 1 present)
+            Time multiplexed signal which indicates whether the device is active and whether device 1 is
+            present.
+            The signal in this line is an open collector signal. However, the signal cannot be used by the host.
+
+
+           DD0 - DD15 (Device data)
+            Bidirectional data bus that can be used either as 8-bit or 16-bit bus.
+            The 8-bit LSB is used for 8-bit transfer (register etc.).
+
+
+           DIOR- (Device I/O read)
+            Read strobe signal from the host.
+            At the falling edge of this signal, the data on the DD0- DD7, DD8-DD15 data bus from the device
+            register or data port become valid. At the rising edge of this signal, the host latches on to the data.
+            Until latching is completed, the host cannot access the data.
+
+
+           DIOW- (Device I/O write)
+            Write strobe signal from the host.
+            At the falling edge of this signal, the data on the DD0- DD7, DD8-DD15 data bus from the device
+            register or data port are latched.
+            Until latching is completed, the device cannot access the data.
+
+
+
+
+                                                           7
+                        GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+   DMACK- (DMA acknowledge) (optional)
+    This signal is used by the host in response to DMARQ, for initiating a DMA transfer.
+
+
+   DMARQ- (DMA request) (optional)
+    This signal is used for DMA transfer between the host and this device. When data transfer is
+    possible, the device drives the signal.
+    The data transfer direction is controlled by the DIOR- and DIOW- commands.
+    This signal is used in handshaking with the DMACK- signal.
+    When no device is selected and when no DMA commands are being executed, the signal line is
+    always in the high- impedance (release) state.
+    When DMA transfer is being carried out, the signal is driven by the device.
+
+   INTRQ (Device interrupt)
+    Serves for issuing an interrupt to the host. The INTRQ signal has a hold function which asserts
+    the interrupt only when the device is selected and the host has cleared the nIEN bit in the device
+    control register.
+    When the nIEN bit is "1", or when the device is not selected, the INTRQ signal is in the high-
+    impedance state, regardless of the presence of the hold interrupt.
+    In the interrupt hold state, the following OR conditions are cleared.
+        RESET signal assertion
+        Device control register SRSRT bit reset
+        When host has written to command register
+        When host has read from command register
+    For PIO transfer, the INTRQ signal is asserted at the start of each transferred data. The data
+    block is normally a single sector, unless declared otherwise by a separate method.
+    For DMA transfer, the INTRQ signal is asserted only once, after the command has terminated.
+
+   IOCS16- (Device 16-bit I/O)
+    For PIO transfer in mode 0, 1, or 2, the IOCS16- signal indicates that the 16-bit data port is
+    already addressed and that the device can send and receive 16-bit data.
+    This is an open collector output.
+        In any PIO mode, the device supports only 16-bit data transfer. Therefore the IOCS16-
+           signal is always asserted.
+        During DMA mode transfer, the host uses the 16-bit DMA channel and the IOCS16- signal
+           is not asserted.
+    However, the signal cannot be used by the host.
+
+
+
+
+                                                 8
+                          GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+
+   IORDY (I/O channel ready)
+    When the device cannot comply with a data transfer request, the signal is negated in order to
+    expand the register access host transfer cycles.
+
+
+    When this signal is driven, it is valid only during the DIOR-/DIOW- cycle for the selected device.
+
+
+    When the IORDY signal is not negated, it is in the high- impedance state, because it is an open
+    collector signal.
+
+
+   RESET (Device reset)
+    This signal is issued by the host. It is asserted at the start of power-on, and the assert state is
+    maintained until the power supply level has stabilized. This is a tolerance interval until device
+    reset after power-on.
+   MCK (Main clock)
+    33.8688 MHz clock signal for AICA use.
+   BCLK (Bit clock)
+    Clock signal for fetching Digital Audio.
+   LRCK (Left right clock)
+    Digital Audio left/right discriminant signal.
+   SDTATA (Serial data)
+    Digital Audio data.
+   EMPH (Emphasis)
+    A High output signal is obtainable if preemphasis is applied to Digital Audio during playback or
+    scan playback. Should there be irregularities in the subcode Q data during playback, the value of
+    the previous time is retained and output. Low is output when power is turned ON, when reset,
+    when playback is stopped, when the lid is open and when no disc is inserted.
+
+
+
+
+                                                    9
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+3.3   Command Transfer Mechanism
+3.3.1 Reset Conditions
+      There are three types of reset conditions to which the SPI device responds.
+         Power-on reset or hardware reset
+          In the same way as executing the master/slave diagnosis protocol, the electrical circuit diagnosis
+          is executed and the default values are established.
+         SPI Soft Reset
+          When the SPI device receives a SPI Soft Reset command, the interface circuit is reset to an
+          interface that operates with the characteristics requested by Set Features.
+         ATA SRST
+          The device normally supplies the ATA PDIAG/DASP sequence and executes the task file
+          associated with the command when SRST is detected.
+          This does not cause an actual device reset. There are no startup, abort, or stop commands.
+
+
+      The order of the reset conditions listed above is also the priority order. Power-on or hard reset has
+      priority over SPI Soft Reset, and SPI Soft Reset has priority over ATA SRST. ATA SRST has priority
+      over all other states except those listed above.
+
+
+3.3.1.1   Power-On Reset or Hardware Reset
+          When the device is powered, an internal reset and test routine is carried out. When the device
+          detects a reset, the following actions are performed:
+             (1) All currently executing commands and I/O operations are cleared.
+             (2) The device is reset to the default condition.
+             (3) As after normal power-on reset, the operation mode of the device returns to a suitable initial
+                state.
+             (4) The task file register is initialized as follows.
+                Status = 00h, Error = 01h, Sector Count = 01h, Sector Number = 01h, Cylinder Low = 14h,
+                Cylinder High = EBh, Drive/Head = 00h
+                BSY = 0 following after any reset indicates that the task file register is already initialized for
+                the host.
+
+
+
+
+                                                          10
+                            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+3.3.1.2   SPI Soft Reset Command and Protocol
+          The SPI specifications require a software reset function. This serves as a recovery mechanism for
+          errors or other problems that cannot be removed by other methods.
+          A valid software reset must be able to return the microprocessor of the device from the busy or
+          hung-up state to the diagnosis state and a state where other commands can be performed.
+          Because the microprocessor is the reset target, it cannot be used as a part of the reset path.
+          Therefore the software reset is detected and decoded by the interface controller circuit and
+          returned to the microprocessor as a hardware signal. It can therefore be issued even when the
+          BSY bit is 1.
+
+
+          When the software reset command is detected, the following sequence is performed.
+             (1) The BUSY state is set. When the reset sequence in the device is completed, the BUSY
+                state is also cleared. This is the only status that is reported to the host during an SPI
+                Software Reset.
+             (2) The same information sequence as after power-on reset is performed and the task file is
+                initialized. As an exception, the DRV bit remains unchanged.
+
+
+
+
+3.3.1.3   ATA SRST
+          The ATA software reset mechanism SRST (device control register, bit 2) is not used for this
+          device.
+
+
+
+
+                                                     11
+                                  GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+3.4     ATA I/O Register
+        Communication between the device and the host occurs via the I/O register selected by the code
+        data on the signal from the host (CS0-, CS1-, DA2, DA1, DA0, DIOR-, DIOW-). Except for the data
+        register, all registers are read and written in byte units (8 bits).
+        The data register is always accessed in 16-bit words.
+
+                              Table 3.1 I/O Port Functions and Selection Addresses
+                    Addresses                                                      Functions
+ CS0-        CS1-      DA2          DA1       DA0             READ (DIOR-)                     WRITE (DIOW-)
+N            N         x            x         x        Data bus high imped              Not Used
+                                                                          Control Block Registers
+N            A         0            x         x        Data bus high imped              Not Used
+N            A         1            0         x        Data bus high imped              Not Used
+N            A         1            1         0        Alternate status                 Device control
+                                                                        Command Block Registers
+A            N         0            0         0        Data                             Data
+A            N         0            0         1        Error Register                   Features
+A            N         0            1         0        Interrupt Reason Register        Not used
+A            N         0            1         1        Sector Number                    Not used
+A            N         1            0         0        Byte Count Register              Byte Count Register
+                                                       bits 0-7                         bits 0-7
+A            N         1            0         1        Byte Count Register              Byte Count Register
+                                                       bits 8-15                        bits 8-15
+A            N         1            1         0        Drive Select                     Drive Select
+A            N         1            1         1        Status                           Command
+A            A         x            x         x        Invalid address                  Invalid address
+Logic conventions are:            A = signal asserted, N = signal negated, x = don't care
+
+
+           Status register
+            This register indicates the drive status. When the register is read, any pending interrupt signal is
+            cleared.
+            When bit 7 (BSY) is "0", the other bits are also valid and the command block can be accessed.
+            When the bit is "1", the other bits are invalid and the command block cannot be accessed.
+            However, in the case of special commands (NOP, Soft Reset command, etc.) access to the
+            command block is enabled even when this bit is "1".
+            Bit 7 (BSY) becomes valid 400 ns after a command is received.
+
+
+                  7           6         5         4      3         2           1           0
+
+
+
+                                                             12
+                            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+          BSY         DRDY          DF         DSC       DRQ       CORR       Reserved      CHECK
+
+
+    Bit 7 (BSY):            BSY is always set to "1" when the drive accesses the command block.
+    Bit 6 (DRDY):           Set to "1" when the drive is able to respond to an ATA command.
+    Bit 5 (DF):             Returns drive fault information.
+    Bit 4 (DSC):            Becomes "1" when seek processing is completed.
+    Bit 3 (DRQ):            Becomes "1" when preparations for data transfer between drive and host are
+                            completed. Information held in the Interrupt Reason Register becomes valid in
+                            the packet command when DRQ is set.
+    Bit 2 (CORR):           Indicates that a correctable error has occurred.
+    Bit 0 (CHECK):          Becomes "1" when an error has occurred during execution of the command
+                            the previous time.
+                            Error details can be determined by checking the sense key and error code.
+
+
+   Alternate Status Register
+    This register is the same as the status register, but it does not clear DMA status information when
+    it is accessed.
+
+
+           7          6             5          4          3        2          1             0
+           BSY        DRDY          DF         DSC        DRQ      CORR       Reserved      CHECK
+
+
+    For information on the meaning of the bits, refer to the explanation of the status register.
+
+
+   Command Register
+    Commands from the host are set in this register. For information on the meaning of commands,
+    refer to the Table 3.3.
+
+
+   Byte Count Register
+    This register serves for controlling the number of bytes sent from the host in response to the DRQ
+    commands.
+    It is used only in PIO mode. In DMA mode, the Byte Count Register contents are disregarded.
+    The register is set before a packet command is issued. The register determines the total transfer
+    amount     of     the    data       sent       in   response   to   one       data   group   transfer   command
+    (REC_MODE/SET_MODE, REQ_STAT, etc.).
+    For commands which require several DRQ interrupts (CD_READ, CD_READ2, etc.), the
+    expected data length is set in this register.
+    When any data are to be transferred, the device sets the number of bytes to be transferred by the
+    host in the Byte Count Register and then issues the DRQ interrupt. The contents of the register
+    do not change unless at least one word or more is transferred from the data register.
+
+
+
+
+                                                              13
+                      GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+
+   Data Register
+    This register is used for reading and writing during data transfer with the host. The register is
+    switchable between 8 and 16 bits. However, only 16-bit mode is supported because the host is
+    not using the IOCS-16 signal.
+
+
+   Device Control Register
+    Bit 2 (SRST) of this register is the reset switch from the host, but it is not used in the current
+    protocol. When wishing to perform a software reset, use the "Software Reset" command as
+    defined in the SPI protocol. Bit 1 (nIEN) determines whether the host interrupt is made valid or
+    not.
+
+
+                        7     6     5   4    3        2      1        0
+                        Reserved             1        SRST   nIEN     0
+
+
+    Bit 2 (SRST):      Software reset from host. The default is "0". Reset is performed when set to
+                       "1". However, because this is not used in this protocol use the "SPI Software
+                       Reset" command defined in SPI for performing a software reset.
+
+
+
+
+                                                 14
+                             GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+    Bit 1 (nIEN):             Sets the interrupt for the host. The default is "0". Invalid can be selected by
+                              setting this to "1".
+
+
+   Drive select register(ATA Drive/Head select register)
+                              7          6                   5        4      3       2   1       0
+                              1          Reserved 1                   0      LUN
+
+
+    Bit 0-3 (LUN):            Logical unit number to which the command is applied.
+    (This parameter is optional and reserved for future use.)
+
+
+   Error register
+    The completion status of the most recent command is set in this register, also at the end of hard
+    disk diagnosis. When the status register bit 0 is "1", an error has occurred, and the error content
+    is set in this register.
+
+
+                       7     6       5        4      3                2          1               0
+                            Sense Key                MCR              ABRT       EOMF            ILI
+
+
+    Bits 7 - 4:            Sense key. For details, refer to the Table 3.2. The Sense Key is only reflected in
+                           the SPI command mode, the same is true for ASC (Additional Sense Code),
+                           ASCQ (Additional Sense Code Qualifier).
+    Bit 3 (MCR):           Media change was requested and media have been ejected (ATA level).
+    Bit 2 (ABRT):          Drive is not ready and command was made invalid (ATA level).
+    Bit 1 (EOM):           Media end was detected (option).
+    Bit 0 (ILI):           Command length is not correct (option).
+
+
+   Features register
+    This register normally specifies the data transfer mode, but it can also be used for Set Features
+    parameters of the ATA command. When issuing commands accompanied by data transfer, such
+    as CD_READ, specify in this register whether data should be transferred by PIO or DMA at the
+    time of task file initialization.
+          Normal use (specify data transfer mode)
+                   7          6          5           4                3      2           1             0
+                   Reserve                                                                             DMA
+
+
+    Bit 0 (DMA): Send data for command in DMA mode.
+
+
+Use as parameter for Set Features command
+     7                           6        5              4            3      2               1         0
+
+
+
+                                                                 15
+                   GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+ Set(1)/
+                                              Feature Number
+ Clear(0)
+ Feature
+
+Bit 6 - 0 (Feature Number): Set transfer mode by setting to 3.
+
+
+
+
+                                            16
+                            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+    By writing "3" as Feature Number and issuing the Set Feature command, the PIO or DMA transfer
+    mode set in the Sector Count register can be selected.
+    The actual transfer mode is specified by the Sector Counter Register.
+
+
+   Interrupt reason register (Read Only)
+    7             6         5         4          3         2          1        0
+                                 Reserved                             IO       CoD
+    Bit 0 (CoD):            "0" indicates data and "1" indicates a command.
+    Bit 1 (IO):             "1" indicates transfer from device to host, and "0" from host to device.
+              IO            DRQ       CoD
+              0             1         1          Command packet can be received.
+              1             1         1          Message can be sent from device to host.
+              1             1         0          Data can be sent to host.
+              0             1         0          Data can be received from host.
+              1             0         1          Status register contains completion status.
+
+
+   Sector Count Register (Write Only)
+    7             6         5         4          3         2          1        0
+                      Transfer Mode                            Mode Value
+
+
+                        Transfer mode according to Sector Count Register value
+                        00000 00x         PIO Default Transfer Mode
+                        00001 xxx         PIO Flow Control Transfer Mode x
+                        00010 xxx         Single Word DMA mode x
+                        00100 xxx         Multi-Word DMA
+                        00011 xxx         Reserved (For Pseudo DMA mode)
+
+
+    This register is used in combination with the ATA command's Set Features command.
+
+
+   Sector Number Register (ATA Sector Number Register)
+    7             6         5         4          3         2          1        0
+                       Disc Format                               Status
+
+
+    The information obtained by this register is the same as the status data obtained with the
+    REQ_STAT command.
+    Disc Format becomes valid after the lid is closed and the UNIT ATTENTION state is entered via
+    the NOT READY state, or after the BSY bit becomes "0" following Soft Reset.
+    Status becomes valid after the power is turned ON and the UNIT ATTENTION state is entered via
+    the NOT READY state, or after the BSY bit becomes "0" following Soft Reset.
+
+
+                                                     17
+                 GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+The values of this register are invalid during issue of a command and during execution of a
+command.
+
+
+
+
+                                          18
+                          GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+       The modification timing of this register and the status modification timing caused by REQ_STAT
+       coincide internally but depending on the timing of the read out of the Sector Number Register and
+       the issue of the REQ_STAT command there may be times where they do not coincide.
+       Also, this register is updated unsyncronized with the host. For this reason, it may return unfixed
+       value if it is read at the timing of updating GD drive side. To avoid this, either read it again to
+       confirm value or use REQ_STAT command instead of this register.
+       For details on the Disc Format and Status, refer to the sections on GD Drive State Transition and
+       REQ_STAT.
+       Operation of this register differs from ATA specifications.
+
+                                    Table 3.2 Sense Key Definitions
+Sense key          Description
+0h                 No sense key information (NO SENSE). Indicates that no sense key information is
+                   present. This also applies when command execution was successful.
+1h                 Recovered error (RECOVERED ERROR). The last command has performed
+                   successful error recovery processing. Details can be obtained by checking the
+                   additional sense byte and the information field. If several error processing operations
+                   were performed for one command, the device reports the status of the last error
+                   processing operation.
+2h                 Not ready (NOT READY). Indicates that the device cannot be accessed.
+3h                 Media error (MEDIUM ERROR). Indicates that the command was terminated
+                   unsuccessfully due to a non-recoverable media defect or an error during reading or
+                   writing.
+                   This sense key may also returned by the device when it is not possible to distinguish
+                   between a media defect and a hardware defect (sense key 4).
+4h                 Hardware error (HARDWARE ERROR). During operation or self- diagnosis, an
+                   unrecoverable hardware error was detected (for example a controller failure, device
+                   failure, parity error etc.).
+5h                 Illegal request (ILLEGAL REQUEST). An illegal parameter was included in the
+                   command packet or in additional data for commands. When the device detects an
+                   illegal parameter in a command packet, it terminates the command without changing
+                   the media.
+                   When the device detects an illegal parameter in additional data for commands, the
+                   device may already have altered the media.
+                   When this sense key is reported, the command is not yet executed.
+6h                 Unit attention (UNIT ATTENTION). Indicates that removable media may have been
+                   replaced, or that the device was reset.
+7h                 Data protect (DATA PROTECT). Indicates that a write attempt was made on a
+                   protected block.
+
+
+
+                                                    19
+              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+8h-Ah   Reserved
+Bh      Aborted command (ABORTED COMMAND). Indicates that the device has aborted
+        the command. Recovery may be possible by re-executing the command.
+Ch-Fh   Reserved
+
+
+
+
+                                       20
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+4       ATA Command Flow Sequence
+4.1     Flow of the command for PIO data transfer to host system
+This class applies to the following command.
+           Identify Device
+Execution of this class of commands is accompanied by transfer of one or multiple data blocks from the
+device to the host. The following steps describe the process of PIO data transfer to the host system but the
+description does not encompass all the possible error conditions.
+
+
+a) The host continues to read the Status or Alternate Status Register until the BSY bit becomes "0".
+b) The host writes the necessary parameters for the commands to be issued to the Features, Sector Count,
+    Sector Number, Cylinder High, Cylinder Low, Device/Head Register.
+c) The host writes the command code to the Command Register.
+d) The device sets the BSY bit to "1" and completes the preparations for executing the command
+    containing the preparations for sending the first block of data to the host.
+e) When the data block is prepared, the device sets the DRQ bit (when error conditions occur, setting of the
+    DRQ bit is optional). If an error condition has occurred, the device sets an appropriate status and error bit
+    that corresponds to the error condition. Finally, the device asserts INTRQ after clearing the BYS bit.
+       Note: When the operation to set the BSY bit in step f) and clearing the BSY bit in step g) is
+              accomplished very fast, the host may not always notice that the BSY bit was set once.
+f) After polling the Alternate Status Register and waiting for the BSY bit to become "0", or after detecting
+    INTRQ, the host reads out and saves the contents of the Status Register.
+g) If the DRQ bit was set, the host reads out and transfers one block Data Register from the Data Register.
+    If an error condition has occurred in the status read-out of step h), the data transfer will not be legal.
+h) When the Status Register is read out, the device negates INTRQ. After read-out of one entire data block,
+    one of the following operations is executed.
+       - If status has been communicated to the host without any errors occurring in step h), and
+         transmission of further blocks is required, the device sets the BSY bit and repeats the above
+         sequence from step g).
+       - If an error status was reported during read-out of the status in step h), the device clears the DRQ bit
+         and completes the execution of the command.
+       - When the final block is transferred, the device clears the DRQ bit and completes the execution of
+         the command.
+
+
+
+
+                                                         21
+                             GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+4.2 Non-data Command Flow
+This class applies to the following commands:
+         NOP
+         Soft Reset
+         Execute Device Diagnostic
+         Set Features
+Execution of this class of commands is not accompanied by data transfer. The following steps describe the
+non-data transfer command process but the description does not encompass all the possible error
+conditions.
+
+
+      a) The host continues to read the Status or Alternate Status Register until the BSY bit becomes "0".
+      b) The host writes the necessary parameters for the commands to be issued to the Features,
+          Sector Count, Sector Number, Cylinder High, Cylinder Low, Device/Head Register
+      c) The host writes the command code to the Command Register
+      d) The device sets the BSY bit to "1" and executes the command. If an error has occurred during
+          execution of the command, the device sets an appropriate status and error bit that corresponds
+          to the error condition
+      e) When the command execution is completed, the device asserts INTRQ after the device has
+          cleared the BSY bit. At this point, execution of the command is completed.
+
+
+
+
+                                                      22
+                            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+5. ATA Command (Task File Command)
+     Indicates details regarding such commands out of the ATA specifications that are supported by this
+     device.
+     To issue a command, the device adds any required parameters, loads the command in a suitable
+     register in the command block, and writes the command code to the command register.
+     When a command is received, the device sets the BSY bit within 400 ns.
+     ATA commands that are accepted by the device are listed in Table 3.3. Other commands are
+     reserved and are not used.
+
+                                        Table 3.3 ATA Commands
+                     Command                                          Code
+
+                     Soft Reset                                        08h
+                     Execute Device Diagnostic                         90h
+                     NOP                                               00h
+                     Packet Command                                    A0h
+                     Identify Device                                   A1h
+                     Set Features                                      EFh
+
+
+        SPI Soft Reset     08h
+         Executes a software reset of the device. In contrast to other commands, this command can also
+         be received when BSY = 1.
+         When the device receives a "Soft Reset" command, the electrical circuits are initialized and the
+         default parameters are established.
+         When the device is currently stopped, disc motor rotation starts and the device is set to the ready
+         state. (See section "Software Reset Command and Protocol".)
+
+
+        Execute Drive Diagnostic 90h
+         This command initiates the self-diagnostic routine of the device.
+            (a) The device reports the result of the self-diagnostic routine.
+            (b) The device clears the BSY bit and issues an interrupt.
+         The error code written to the error register is an 8-bit code as shown below.
+
+
+
+                                          Table 3.4 Error Codes
+                                    Error Code                     Description
+                                        01h                          Normal
+                                        03h                     Data buffer error
+                                        04h                         ODC error
+                                        05h                         CPU error
+                                        06h                         DSC error
+
+
+
+                                                      23
+GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+            07h                        Other error
+
+
+
+
+                         24
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+          Set Features        EFh
+           This command controls the device interface timing and sets other protocol parameters. For this
+           device, only the transfer mode settings can be made.
+           1. Set 3 in the Set bit of the Feature Register and the Feature Number.
+           2. Specify the transfer mode in the upper 5 bits of the Sector Count Register and the mode
+              number in the lower 3 bits.
+           3. Execute the Set Features command.
+
+
+           This setting can be made individually for DMA mode and PIO mode.
+
+
+          NOP                 00h
+           This command enables device status access only for hosts with 16-bit register access. Like the
+           SPI Soft Reset command, this command can also be received when BSY = 1 and is provided to
+           terminate the command currently being executed. However, when the termination is performed
+           correctly, only the termination interrupt of this command is returned but it is necessary to pay
+           attention to the fact that if the device issued this command at the point when the command was
+           internally terminated, both the interrupt of the command being executed and the termination
+           interrupt are returned.
+           The device responds to commands that are not recognized by the following:
+               Setting "abort" in the error register
+               Setting an error in the status register
+               Clearing "busy" in the status register
+               Asserting the INTRQ signal
+
+
+          Packet Command A0h
+           For details, refer to the "SPI Packet Command" section.
+
+
+          Identify Device     A1h
+           Requests information about the connected drive.
+           Using the Identify Device command, the host can receive information from the device. Data
+           transfer by the Identify Device command is always conducted in the PIO mode.
+
+
+
+                             Table 3.5 Data returned by Identify Device command
+Byte                 Content
+
+0                    Manufacturer ID
+1                    Model ID
+2                    Version ID
+3-Fh                 Reserved
+10h-1Fh              Manufacturer name (16 ASCII characters)
+
+
+                                                          25
+                             GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+20h-2Fh             Model name (16 ASCII characters)
+30h-3Fh             Firmware version (16 ASCII characters)
+40h-4Fh             Reserved
+6. CD Drive
+6.1   CD Drive State Transition
+
+
+      (1) Status and CD drive state
+      The CD drive status can be checked with the REQ_STAT command or using the Sector Number
+      register.
+
+                                          Table 4.1 CD Drive States
+                   Status                                        Description
+           <BUSY>                     State transition
+           <PAUSE>                    Pause
+           <STANDBY>                  Standby (drive stop)
+
+           <PLAY>                     CD playback
+
+           <SEEK>                     Seeking
+
+           <SCAN>                     Scanning
+
+           <OPEN>                     Tray is open
+
+           <NODISC>                   No disc
+
+           <RETRY>                    Read retry in progress (option)
+
+           <ERROR>                    Reading of disc TOC failed (access denied after this)
+
+          The status becomes <STANDBY> when the disc is removed midway while it is rotating in the
+          condition where the lid is closed.
+
+
+
+
+                                                         26
+                           GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+6.1.1 CD Drive State Transition Diagram
+
+
+     (1) Normal state transition diagram
+        The normal state transition diagram is shown in Fig. 4.1.
+
+
+
+                        Fig. 4.1 CD Drive State Transition Diagram (normal)
+
+
+
+
+           (a) After startup, the drive switches to the <PAUSE> state at the 2-second, 0-frame point (FAD
+              = 150 = 96H) in the case of a CD. On a GD it switches to the <PAUSE> state at the 10
+              minute and 2-second, 0-frame point.
+           (b) During state transition (arrow lines), the internal state is the BUSY state.
+
+
+
+                                                     27
+                         GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+          (c) A "tray close" command is optional. If a tray close command is issued, the drive switches to
+             the <PAUSE> state via the <BUSY> state if a disc is inserted and after the drive has closed
+             the tray. If a disc is not inserted, it switches to the <NODISC> state via the <BUSY> state.
+
+
+  (2) Error state transition diagram
+     The error state transition diagram is shown in Fig. 4.2.
+
+
+
+
+                        Fig. 4.2 CD Drive State Transition Diagram (error)
+
+
+
+                                Table 4.2   Error State Description
+ State                                       Description                                    Internal state
+<RETRY>                  Retry successful: PLAY. Retry unsuccessful: error.                     SEEK
+
+
+
+
+                                                  28
+                             GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+  <ERROR>             Open the lid or the state does not change until the CD_OPEN                  PAUSE
+                                            command is issued.
+* Internal state indicates state equivalent to CD block operation.
+
+
+
+
+                                                      29
+                                     GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+6.1.2 CD Drive State Transition Table
+         The CD drive state transition table is shown below. For example, when the pause command is issued
+         in the play state, the pause state is entered.
+
+
+
+                                              Table 4.3 CD Drive State Transition
+        Operation                                                          Command
+                      Automatic
+State                               Initialization   Tray open     Play     Seek       Pause         Stop         Scan
+<BUSY>              Change occurs   <PAUSE>          <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<PAUSE>              <STANDBY> <PAUSE>               <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<STANDBY>                 -         <PAUSE>          <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<PLAY>                <PAUSE>       <PAUSE>          <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<SEEK>                <PAUSE>       <PAUSE>          <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<SCAN>                <PAUSE>       <PAUSE>          <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<OPEN>                    -         <PAUSE>          <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<NODISC>                  -         <NODISC>         <OPEN>      <NODISC> <NODISC> <NODISC>       <NODISC>     <NODISC>
+
+<RETRY>             Change occurs <PAUSE>            <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+<ERROR>                   -         <PAUSE>          <OPEN>       <PLAY>   <SEEK>    <PAUSE>     <STANDBY>      <SCAN>
+
+* "-" indicates no change.
+* In top-loading devices, the OPEN condition does not change even when a command is received.
+
+
+         (1) Commands issued in <BUSY> state
+             Commands can be accepted also in the <BUSY> state, but they may not be executed
+             immediately.
+             (However, the tray open command has priority.)
+             (If the BSY bit is set in the Status Register, no command is accepted.)
+
+
+         (2) Tray open/close
+             (a) The tray open command is in principle executed immediately under any condition.
+             (b) In units which are not designed for automatic opening/closing, the tray open/close command
+                    causes a <BUSY> state until the action is performed manually.
+             (c) In the <OPEN> condition, if no disc is inserted, the "NO DISC" state is entered when the tray
+                closes.
+
+
+         (3) Others
+             When an operation command (such as CD_OPEN, CD_SEEK [STOP, PAUSE]) is executed, it
+             may occur via the <BUSY> state.
+
+
+
+
+                                                                  30
+                                GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+7. SPI Command Flow Sequence
+7.1   Packet Command Flow For PIO DATA To Host
+      This class includes the following commands.
+         REQ_STAT
+         REQ_MODE
+         REQ_ERROR
+         GET_TOC
+         REQ_SES
+         CD_READ
+         CD_READ2
+         GET_SCD
+      For execution, an unknown number of data bytes is sent from the device to the host.
+
+
+      1. The host polls for the BSY = 0, DRQ = 0 condition, inputs the transfer mode, drive select and
+          other parameters in the "Features", "Byte Count" registers, and initializes the task file.
+      2. The host writes the packet command code (A0h) in the command register.
+      3. The device sets the BSY bit (within 400 ns) and prepares for command packet transfer.
+      4. When the device is ready to receive a command packet, it sets the CoD bit and clears the IO bit.
+          The DRQ bit must be made valid simultaneously or before making the BSY bit invalid.
+      5. When host polling verifies the DRQ bit, it writes a 12-byte (6-word) packet command to the data
+          register.
+      6. Device
+          (1) DRQ bit i[s cleared (when 12th byte was written).
+          (2) BSY bit is set.
+          (3) "Features" and "Byte Count" registers are read to determine parameters requested by the
+          host.
+          (4) Data transfer preparations are made.
+      7. When preparations are complete, the following steps are carried out at the device.
+          (1) Number of bytes to be read is set in "Byte Count" register.
+          (2) IO bit is set and CoD bit is cleared.
+          (3) DRQ bit is set, BSY bit is cleared.
+          (4) INTRQ is set, and a host interrupt is issued.
+      8. After checking INTRQ, the DRQ bit of the "Status" register is read, to determine whether the host
+          can continue to send commands.
+             DRQ = 0: Device has executed command.
+             DRQ = 1: Host must read data (distinct byte numbers in "Byte Count" register) via "Data"
+             register.
+             When host reads the "Status" register, the device makes the INTRQ bit invalid.
+      9. When the host has sent entire data, the device clears the DRQ bit. If more data are to be sent,
+          the device sets the BSY bit and repeats the above sequence from step 7.
+
+
+                                                         31
+                       GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+10.When the device is ready to send the status, it writes the final status to the "Status" register. CoD,
+   IO, DRDY are set (before making INTRQ valid), and BSY and DRQ are cleared.
+11. After verifying that INTRQ & DRQ = 0, read the Status register on the host. If the Check bit is set,
+   read the command completion status from the Error register.
+Note:   The DRQ signal is used by the device to indicate that it is ready for data transfer. It is cleared
+        after the last data byte has been sent.
+Note:   During data transmission, if data transmission amount is 0 in the command, DRQ=0 is
+        indicated in step 8 and termination is normal.
+
+
+
+
+                                                  32
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+
+          Host computer                                                                 ATAPI device
+                                                                           Clear BSY
+          Wait for BSY = 0, DRQ = 0
+          Initialize task file
+          Place packet command                                             Set BSY
+
+                                                                           Prepare command packet
+                                                                           Set CoD, clear BSY and IO
+          Wait for DRQ                               Make DRQ valid
+          Write command packet                                             Make DRQ invalid after 12th byte
+                                                                           Set BSY
+                                                                           Execute command
+                                                                           Set number of bytes in " Byte Count " register
+                                                                           Set DRQ and IO
+                                                                           Clear BSY and CoD
+                                                                           Make INTRQ valid
+          Wait for INTRQ
+          Read status                                                      Make INTRQ invalid
+          DRQ=1 (When 0, command terminates)
+          Read “Byte Count” register (number of bytes)
+          Transfer data byte                                               Set status in "Status" register
+                                                                           Set IO, CoD, DRDY
+                                                                           Clear DRQ,BSY
+          DRQ = 0 (command end)                                            Make INTRQ valid
+          Read status                                                      Make INTRQ invalid
+
+          When error has occurred, read "Error" register.
+
+Solid lines indicate control flow, dotted lines indicate operations caused by direct control changes. The diagram is only a
+rough visual representation. For details, see the preceding page.
+                                                                                                                  Loop if there
+                                Fig. 5.1 Packet Command Flow, PIO Data to Host                                    are more
+                                                                                                                  transfer data
+
+
+                                                                                                   Set BSY
+
+
+
+
+                                                            33
+                                GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+7.2   Transfer Packet Command Flow For PIO Data from Host
+      This class includes the following command.
+         SET_MODE
+      For execution, a known number of data bytes is sent from the host to the device.
+
+
+      1   The host polls for the BSY = 0, DRQ = 0 condition, inputs the transfer mode, drive select and
+          other parameters in the "Features", "Byte Count" registers, and initializes the task file.
+      2   The host writes the packet command code (A0h) in the command register.
+      3   The device sets the BSY bit (within 400 ns) and prepares for command packet transfer.
+      4   When the device is ready to receive a command packet, it sets the CoD bit and clears the IO bit.
+          The DRQ bit must be made valid simultaneously or before making the BSY bit invalid.
+      5   When host polling verifies the DRQ bit, it writes a 12-byte (6-word) packet command to the data
+          register.
+      6   Device
+          (1) DRQ bit is cleared (when 12th byte was written).
+          (2) BSY bit is set.
+          (3) "Features" and "Byte Count" registers are read to determine parameters requested by the
+          host.
+          (4) Data transfer preparations are made.
+      7   When preparations are complete, the following steps are carried out at the device.
+          (1) Number of bytes to be read is set in "Byte Count" register.
+          (2) IO bit is set and CoD bit is cleared.
+          (3) DRQ bit is set, BSY bit is cleared.
+          (4) INTRQ is set, and a host interrupt is issued.
+          The number of bytes normally is the byte number in the register at the time of receiving the
+          command, but it may also be the total of several devices handled by the buffer at that point.
+      8   After checking INTRQ, the DRQ bit of the "Status" register is read, to determine whether the host
+          can continue to send commands.
+          DRQ = 0: Device has executed command.
+          DRQ = 1: Host must read data (distinct byte numbers in "Byte Count" register) via "Data"
+          register.
+          When host reads the "Status" register, the device makes the INTRQ bit invalid.
+      9   When the host has sent entire data, the device clears the DRQ bit. If more data are to be sent,
+          the device sets the BSY bit and repeats the above sequence from step 7.
+      10 When the device is ready to send the status, it writes the final status to the "Status" register.
+          CoD, IO, DRDY are set (before making INTRQ valid), and BSY and DRQ are cleared.
+      11 After verifying that INTRQ & DRQ = 0, the host reads the "Status" register and reads the
+          command completion status from the "Error" register if required.
+      The DRQ signal is used by the device to indicate that it is ready for data transfer. It is cleared after
+      the last data byte has been sent.
+
+
+                                                         34
+                      GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Note:   During data transmission, if data transmission amount is 0 in the command, DRQ=0 is
+        indicated in step 8 and termination is normal.
+
+
+
+
+                                               35
+                                GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+          Host computer                                                                ATAPI device
+                                                                           Clear BSY
+          Wait for BSY = 0, DRQ = 0
+          Initialize task file
+          Place packet command                                                         Set BSY
+
+                                                                           Prepare command packet
+                                                                           Set CoD, clear BSY and IO
+          Wait for DRQ                                   Make DRQ valid
+          Write command packet                                             Make DRQ invalid after 12th byte
+                                                                           Set BSY
+                                                                           Execute command
+                                                                           Set number of bytes in "Byte Count" register
+                                                                           Set DRQ, clear BSY, CoD, IO
+                                                                           Make INTRQ valid
+          Wait for INTRQ
+          Read IRQ status                                         Make INTRQ invalid
+          DRQ = 1 (When 0, command terminates)
+          Read “Byte Count” register (number of bytes)
+          Transfer data byte
+                                                                           Set status in "Status" register
+                                                                           Set IO, CoD, DRDY
+                                                                           Clear DRQ and BSY
+          DRQ = 0 (command end)）                                           Make INTRQ valid
+          Read status
+                                                                           Make INTRQ invalid
+
+           When error has occurred, read "Error" register
+Solid lines indicate control flow, dotted lines indicate operations caused by direct control changes. The diagram is only a
+rough visual representation. For details, see the preceding page.。                                 Loop if there are more
+                                Fig. 5.2 Packet Command Flow, PIO Data from Host                   transfer data
+
+
+
+                                                                                                 Set BSY
+
+
+
+
+                                                             36
+                                GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+7.3   DMA Command Flow
+      This class includes the following commands.
+         CD_READ
+         CD_READ2
+      For execution, an unknown number of data bytes is sent from the host to the device.
+
+
+      1. The host polls for the BSY = 0, DRQ = 0 condition and initializes the task file for writing the
+          required parameters in the "Features" and "Byte Count" registers.
+      2. The host writes the packet command code (A0h) in the command register.
+      3. The device sets the BSY bit (within 400 ns) and prepares for command packet transfer.
+      4. When the device is ready to receive a command packet, it sets the CoD bit and clears the IO bit.
+          The DRQ bit must be made valid simultaneously or before making the BSY bit invalid.
+      5. When host polling verifies the DRQ bit, it writes a 12-byte (6-word) command to the data register.
+      6. Device
+          (1) DRQ bit is cleared (when 12th byte was written).
+          (2) BSY bit is set.
+          (3) "Features" and "Byte Count" registers are read to determine parameters requested by the
+          host.
+          (4) Preparations for data transfer are made.
+      7. When preparations are complete, the device sends several data packets using DMARQ/DMACK.
+          The packets must be managed by the device and possibly placed in its own buffer. This process
+          continues until all data are sent.
+      8. When the device is ready to send the status, it writes the final status (IO, CoD, DRDY set, BSY,
+          DRQ cleared) to the "Status" register before making INTRQ valid.
+          After checking INTRQ, the host reads the "Status" register to check the completion status.
+      Note:   During data transmission, if data transmission amount is 0 in the command, DMARQ/DMACK
+              is not carried out in step 7 but INTRQ is enabled and termination is normal.
+
+
+
+
+                                                         37
+                            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+7.4   Non-Data Command Flow
+      This class includes the following commands.
+         TEST_UNIT
+         CD_OPEN
+         CD_PLAY
+         CD_SEEK
+         CD_SCAN
+      No data transfer accompanies the issue of these commands.
+
+
+      This class includes commands such as Seek. For execution, no data bytes are sent.
+
+
+      1. The host polls for the BSY = 0, DRQ = 0 condition and initializes the task file for writing the
+          required parameters in the "Features" and "Byte Count" registers.
+      2. The host writes the packet command code (A0h) in the command register.
+      3. The device sets the BSY bit and prepares for command packet transfer.
+      4. When the device is ready to receive a command packet, it sets the CoD bit and clears the IO bit.
+          The DRQ bit must be made valid simultaneously or before making the BSY bit invalid.
+      5. When host polling verifies the DRQ bit, it writes a 12-byte (6-word) command to the data register.
+      6. The device sets the BSY bit and executes the command.
+      7. When the device is ready to send the status, it writes the final status (IO, CoD, DRDY set, BSY,
+          DRQ cleared) to the "Status" register before making INTRQ valid.
+      After checking INTRQ, the host reads the "Status" register to check the completion status.
+
+
+
+
+                                                     38
+                         GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+8. SPI Packet Commands
+
+                                     Table 6.1 List of Commands
+     Command             Function                                                  Op code
+     TEST_UNIT           Verify access readiness                                   00h
+     REQ_STAT            Get CD status                                             10h
+     REQ_MODE            Get various settings                                      11h
+     SET_MODE            Make various settings                                     12h
+     REQ_ERROR           Get error details                                         13h
+     GET_TOC             Get all TOC data                                          14h
+     REQ_SES             Get specified session data                                15h
+     CD_OPEN             Open tray                                                 16h
+     CD_PLAY             Play CD                                                   20h
+     CD_SEEK             Seek for playback position                                21h
+     CD_SCAN             Perform scan                                              22h
+     CD_READ             Read CD                                                   30h
+     CD_READ2            CD read (pre-read position)                               31h
+     GET_SCD             Get subcode                                               40h
+
+
+
+
+                                                   39
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+8.1    Command Packet Format
+
+
+Bit           7          6             5            4           3            2            1           0
+Byte
+0             Command code
+1             Command parameter
+2             Command parameter
+3             Command parameter
+4             Command parameter
+5             Command parameter
+6             Command parameter
+7             Command parameter
+8             Command parameter
+9             Command parameter
+10            Command parameter
+11            Command parameter
+          Command codes
+           The codes allotted to the various commands required to control the devices.
+          Command parameter
+           Transfer Length
+                    The transfer length field indicates the data length that ought to be transferred, and it
+                    normally indicates the block count. However, in the case of several commands, it
+                    indicates the transfer byte count defined during description of the command. For details,
+                    refer to the explanations of the individual commands.
+                    For commands with multiple byte transfers, the transfer length "0" indicates no transfer.
+           Allocation Length
+                    The allocation length field indicates the maximum length of the data that the host can
+                    receive. The allocation length "0" indicates no transfer. When the device has completed
+                    transfer of the allocated byte length, or when it has completed transfer of valid data to
+                    the host, it terminates data transfer. The allocation length is used to control the
+                    maximum data length that can be returned to the host.
+           Starting Address
+                    Indicates from which position among the entire data that data transfer should start. In
+                    some cases it may simply indicate the transfer starting address. For details, refer to the
+                    explanations of the individual commands.
+
+
+
+
+                                                        40
+                             GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+8.2    Command Reference
+Common to all CD blocks : Check access readiness
+Command name: TEST_UNIT (00h)
+Bit          7           6           5            4           3            2            1           0
+Byte
+0            0           0           0            0           0            0            0           0
+1            0           0           0            0           0            0            0           0
+2            0           0           0            0           0            0            0           0
+3            0           0           0            0           0            0            0           0
+4            0           0           0            0           0            0            0           0
+5            0           0           0            0           0            0            0           0
+6            0           0           0            0           0            0            0           0
+7            0           0           0            0           0            0            0           0
+8            0           0           0            0           0            0            0           0
+9            0           0           0            0           0            0            0           0
+10           0           0           0            0           0            0            0           0
+11           0           0           0            0           0            0            0           0
+       Operation:
+          Verifies that the device can be accessed.
+       Description:
+          This device does not report the check condition status. When this command is received, it reports
+          the GOOD status.
+          If the device cannot become operative or cannot be set to the ready state, the sense key reports
+          the "NOT READY" check condition.
+          When the host performs polling, this command is valid until the device becomes ready. It is
+          especially useful for checking the media.
+
+
+
+
+                                                      41
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+
+Common to all CD blocks : Get CD status
+Command name: REQ_STAT (10h)
+Bit           7           6             5              4           3         2            1           0
+Byte
+0             0           0             0              1           0         0            0           0
+1             0           0             0              0           0         0            0           0
+2             Starting Addres
+3             0           0             0              0           0         0            0           0
+4             Allocation Length
+5             0           0             0              0           0         0            0           0
+6             0           0             0              0           0         0            0           0
+7             0           0             0              0           0         0            0           0
+8             0           0             0              0           0         0            0           0
+9             0           0             0              0           0         0            0           0
+10            0           0             0              0           0         0            0           0
+11            0           0             0              0           0         0            0           0
+       Operation:
+           Gets current CD status information (status and report).
+       Description:
+           Starting Address (Byte 2)
+           Specifies start address of requested information. Must always be an even address.
+           Allocation Length (Byte 4)
+           Specifies data length of requested information. When allocation length is zero, no data are sent.
+CD status information
+Bit           7           6             5              4           3         2           1            0
+Byte
+0             0          0          0                  0           STATUS
+1             Disc Format                                          Repeat Count
+2             Address                                              Control
+3             TNO
+4             X
+5             FAD
+6             FAD
+7             FAD
+8             Max Read Error Retry Times
+9             0          0          0                  0           0         0           0            0
+       Description:
+          STATUS
+           00h        <BUSY>                State transition
+           01h        <PAUSE>               Pause
+           02h        <STANDBY>             Standby (drive stop)
+           03h        <PLAY>                CD playback
+           04h        <SEEK>                Seeking
+           05h        <SCAN>                Scanning
+           06h        <OPEN>                Tray is open
+           07h        <NODISC>              No disc
+
+
+
+                                                           42
+            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+08h   <RETRY>         Read retry in progress (option)
+09h   <ERROR>         Reading of disc TOC failed (state does not allow access)
+
+
+
+
+                                     43
+                            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+   Disc Format (Byte 1, Bit 7-4)
+Indicates the type of CD.
+      Bit7           Bit6              Bit5          Bit4               Disc Format
+       ０                ０               ０             ０         CD-DA
+       ０                ０               ０             １         CD-ROM
+       ０                ０               １             ０         CD-ROM XA, CD Extra
+       ０                ０               １             １         CD-I
+       １                ０               ０             ０         GD-ROM
+
+
+   Repeat Count (Byte 1, Bit 3 - 0)
+    Number of remaining repeat cycles. The information range is 0 to Eh (0 - 14 times), Fh becomes
+    unlimited repeat.
+
+
+   Control Address (Byte 2)
+    Control address byte of subcode Q (first byte)
+
+
+   TNO (Byte 3)
+    Subcode Q track number (binary value, not BCD)
+
+
+   X (Byte 4)
+    Subcode Q index number (binary value, not BCD)
+
+
+   FAD (Byte 5-7)
+    Frame address (based on subcode Q for CD-DA and header information for CD-ROM)
+Drive status and FAD
+    Drive status     Disc Format
+     <BUSY>          Undefined
+     <PAUSE>         Subcode value obtained when the head has moved to the head
+                     position for pausing <PAUSE> state.
+    <STANDBY>        Home position (96h)
+     <PLAY>          Head position before head travel, or the current head position.
+     <SEEK>          Head position before head travel.
+     <SCAN>          Head position before head travel, or current head position.
+     <OPEN>          Home position (96h)
+    <NODISC>         Home position (96h)
+    <RETRY>          Head position before head travel.
+    <ERROR>          Home position (96h)
+
+
+
+
+                                                     44
+                       GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+   Max Read Error Retry Times (Byte 8)
+    Indicates how many read retries were necessary.
+    This item is cleared (set to 0) when read.
+
+
+
+
+                                                 45
+                             GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Common to all CD blocks : Get mode information
+Command name: REQ_MODE (11h)
+Bit          7           6             5            4          3           2            1           0
+Byte
+0            0           0             0            1          0           0            0           1
+1            0           0             0            0          0           0            0           0
+2            Starting Addres
+3            0           0             0            0          0           0            0           0
+4            Allocation Length
+5            0           0             0            0          0           0            0           0
+6            0           0             0            0          0           0            0           0
+7            0           0             0            0          0           0            0           0
+8            0           0             0            0          0           0            0           0
+9            0           0             0            0          0           0            0           0
+10           0           0             0            0          0           0            0           0
+11           0           0             0            0          0           0            0           0
+       Operation:
+          Gets CD block mode information.
+       Description:
+          Starting Address (Byte 2)
+          Start address of requested information. Must always be an even address.
+          Allocation Length (Byte 4)
+          Data length of requested information. When allocation length is zero, no data are sent.
+
+
+Hardware information
+Bit          7           6             5            4          3           2           1            0
+Byte
+0            0          0              0            0          0           0           0            0
+1            0          0              0            0          0           0           0            0
+2            CD-ROM Speed
+3            0          0              0            0          0           0           0            0
+4-5          Standby Time
+6            0          0              Read         ECC        Read        0           0            Form2
+                                       Continuous   (Option)   Retry                                Read Retry
+7            0           0          0               0          0           0           0            0
+8            0           0          0               0          0           0           0            0
+9            Read Retry Times
+10-17        Drive Information (ASCII)
+18-25        System Version (ASCII)
+26-31        System Date (ASCII)
+
+
+
+
+                                                        46
+                        GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Description:
+   CD-ROM speed (byte 2)
+    CD-ROM data read rate
+                              Byte2              Speed
+                                 0           Maximum speed
+                                 1     Standard speed (option)
+                                 2             x2 (option)
+                                 3             x4 (option)
+                                 4             x6 (option)
+                                 5             x8 (option)
+                                 6            x10 (option)
+                                 7            x12 (option)
+    The default value of this item is 00h (max. speed).
+
+
+   Standby Time (Byte 4-5)
+    Time required to trigger change from pause to standby.
+    When the pause state continues for this interval, the unit switches to standby. The value is set as a
+    16-bit value with byte 4 as MSB and byte 5 as LSB.
+            Standby time value       Operation
+            ０                        Unlimited (no switch from pause to standby)
+            1FFFFh                  Switch to standby after specified number of seconds
+       Note: When this parameter is too large, the MTBF may be negatively affected.
+       Default is B4h (3 minutes).
+
+
+   Read Continuous (Byte 6, Bit 5)
+    This bit determines whether continuity or retry has priority during data transfer. When the bit is set
+    to "1", playback is carried out without delay due to error recovery. In this case, the data stream
+    may contain errors.
+    When the bit is set to "1", "Read Retry Times" and similar parameters are irrelevant.
+    The default value of this item is "0".
+
+
+   ECC (Byte 6, Bit 4) (Option)
+    When this bit is set to 1, retry is performed if an error has occurred during ECC processing.
+    (Valid only in Mode 1 or Mode 2, Form 1.)
+    The default value of this item is "1".
+
+
+   Read Retry (Byte 6, Bit 3)
+    When this bit is set to "1", read retry is carried out when a sector read error has occurred,
+    according to the "Read Retry Times" setting.
+
+
+
+                                                  47
+                        GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+    The default value of this item is "1".
+
+
+   Form 2 Read Retry (Byte 6, Bit 0)
+    When 1 is set for this bit, read retry is set for Mode 2, Form 2.
+    The default value of this item is "1".
+
+
+
+
+                                                 48
+                       GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+   Read Retry Times (Byte 9)
+    Same-sector read retry count for CD-ROM decoding. (Valid only in Mode 1 or Form 1.) Read retry
+    is not conducted when set to 0h.
+    Note:   When flag setting is "Form 2 Read Retry = 1" (Form 2 read retry ON), this applies also to
+            Form 2.
+    The default value of this item is "08h".
+
+
+   Drive Information (Byte 10 - 17) Read Only
+    Name of drive (ASCII).
+    This item can only be read.
+
+
+   System Version (Byte 18 - 25) Read Only
+    CD block version (ASCII).
+    This item can only be read.
+
+
+   System Date (Byte 26 - 31) Read Only
+    Updated date of CD block (ASCII).
+    This item can only be read
+
+
+
+
+                                                49
+                             GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Common to all CD blocks: Set mode
+Command name: SET_MODE (12h)
+Bit          7           6             5          4           3            2            1           0
+Byte
+0            0           0             0          1           0            0            1           0
+1            0           0             0          0           0            0            0           0
+2            Starting Addres
+3            0           0             0          0           0            0            0           0
+4            Allocation Length
+5            0           0             0          0           0            0            0           0
+6            0           0             0          0           0            0            0           0
+7            0           0             0          0           0            0            0           0
+8            0           0             0          0           0            0            0           0
+9            0           0             0          0           0            0            0           0
+10           0           0             0          0           0            0            0           0
+11           0           0             0          0           0            0            0           0
+       Operation:
+          Sets CD block mode information.
+       Description:
+          Starting Address (byte 2)
+          Start address of requested information. Must always be an even address.
+          Allocation Length (byte 4)
+          Data length of requested information. When allocation length is zero, no data are sent.
+
+
+          For information on the transfer data format, refer to the "REQ_MODE" section.
+          It is recommended to read the current parameters with "REQ_MODE" before using the
+          "SET_MODE" command. Read-only items are not included in the data setting alternatives.
+
+
+
+
+                                                      50
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Common to all CD blocks: Get error information
+Command name: REQ_ERROR (13h)
+Bit           7           6             5          4           3            2            1           0
+Byte
+0             0           0             0          1           0            0            1           1
+1             0           0             0          0           0            0            0           0
+2             0           0             0          0           0            0            0           0
+3             0           0             0          0           0            0            0           0
+4             Allocation Length
+5             0           0             0          0           0            0            0           0
+6             0           0             0          0           0            0            0           0
+7             0           0             0          0           0            0            0           0
+8             0           0             0          0           0            0            0           0
+9             0           0             0          0           0            0            0           0
+10            0           0             0          0           0            0            0           0
+11            0           0             0          0           0            0            0           0
+       Operation:
+           Requests transfer of device error information to the host.
+           This command must be issued so that the host can receive sense data indication error causes
+           whenever an error has been reported. When another command is issued, error information is
+           cleared.
+       Description:
+           Allocation Length (Byte 4)
+           Data length of requested information. When allocation length is zero, no data are sent.
+
+
+Error Information
+Bit           7           6             5          4           3            2           1            0
+Byte
+0             1           1             1          1           0            0           0            0
+1             0           0             0          0           0            0           0            0
+2             0           0             0          0           Sense Key
+3             0           0             0          0           0            0           0            0
+4-7           Command Specific Information
+8             Additional Sense Code
+9             Additional Sense Code Qualifier
+
+       Description:
+          Sense Key (Byte 2, Bits 3 - 0)
+           The sense key field contains general information on error status or exceptional state. The sense
+
+
+
+                                                       51
+                       GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+    key, additional sense code, and additional sense code qualifier provide hierarchically structured
+    information. This makes it possible to configure a top-down approach in the host for error and
+    exception processing.
+    For detailed information on the sense keys, refer to Table 3.2.
+
+
+   Command Specific Information (Byte 4 - 7)
+    This field contains information about the executed command. Details are described in the
+    sections on the respective commands.
+    If not defined by a command, the FAD where the error occurred is reported.
+
+
+   Additional Sense Code (Byte 8)
+    Additional Sense Code (ASC) field contains more detailed information about error and exception
+    conditions than the sense key field.
+    Refer to Appendix I for concrete information on the contents of Additional Sense Code.
+
+
+   Additional Sense Code Qualifier (Byte 9)
+    Additional Sense Code Qualifier (ASCQ) field contains additional information about the additional
+    sense code.
+    Refer to Appendix I for concrete information on the contents of Additional Sense Code Qualifier.
+
+
+
+
+                                                52
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Common to all CD blocks: Get all TOC data
+Command name: GET_TOC (14h)
+Bit          7            6            5           4           3            2            1           0
+Byte
+0            0            0            0           1           0            1            0           0
+1            0            0            0           0           0            0            0           Select
+2            0            0            0           0           0            0            0           0
+3            Allocation Length (MSB)
+4            Allocation Length (LSB)
+5            0            0            0           0           0            0            0           0
+6            0            0            0           0           0            0            0           0
+7            0            0            0           0           0            0            0           0
+8            0            0            0           0           0            0            0           0
+9            0            0            0           0           0            0            0           0
+10           0            0            0           0           0            0            0           0
+11           0            0            0           0           0            0            0           0
+       Operation:
+          Requests transfer of entire TOC (102 entries).
+       Description:
+          Select (Byte 1, Bit 0)
+          Selects the type of volume.
+                 0: Get TOC information from single-density area.
+                 1: Get TOC information from double-density area.
+
+
+          Allocation Length (Byte 4)
+          Data length of requested information. When allocation length is zero, no data are sent.
+
+
+Entire TOC information
+Bit          7            6            5           4           3            2           1            0
+Byte
+0~3          Track 1 information *1
+
+4~7          Track 2 information
+n~n+3        Track n information
+396~399      Start track information *2
+400403 End track information *3
+404407 Lead-out information *4
+
+
+
+
+                                                       53
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Track information *1
+Bit         7             6           5            4           3            2           1            0
+Byte
+0           Control                                            ADR
+1           FAD for track 1 start (MSB)
+2           FAD for track 1 start
+3           FAD for track 1 start (LSB)
+The track FFFFFFh does not exist the TOC.
+
+
+Start track information *2
+Bit         7             6           5            4           3            2           1            0
+Byte
+0           Control                                            ADR
+1           Start track number
+2           0
+3           0
+
+
+End track information *3
+Bit         7             6           5            4           3            2           1            0
+Byte
+0           Control                                            ADR
+1           End track number
+
+2           0
+3           0
+
+
+Lead-out information *4
+Bit         7             6           5            4           3            2           1            0
+Byte
+0           Control                                            ADR
+1           FAD for lead-out start (MSB)
+
+2           FAD for lead-out start
+3           FAD for lead-out start (LSB)
+For multi-session discs, this is the value for the last session.
+
+
+ADR (Byte 0, Bit 0 - 3)
+This item indicates the type of information encoded in the sub Q channel of the block for which a TOC
+entry was detected.
+ADR code      Description
+
+
+
+
+                                                       54
+                    GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+0h      No sub Q channel mode information
+1h      Sub Q channel indicates current position.
+        (Example: track, index, absolute address, relative address)
+2h      Sub Q channel indicates media catalog number.
+3h      Sub Q channel indicates ISRC code.
+4h~Fh   Reserved
+
+
+
+
+                                             55
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Control (Byte 0, Bit 4 - 7)
+This item indicates the type of track.
+Bit            If 0                                            If 1
+0              Audio data without pre-emphasis (CD-DA)         Audio data with pre-emphasis (CD-DA)
+               At-once recorded track (CD-ROM)                 Packet-recorded track (CD-ROM
+1              Digital copy prohibited                         Digital copy allowed
+
+2              Audio track                                     Data track
+3              2-channel audio                                 4-channel audio
+
+
+
+
+                                                       56
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Common to all CD blocks: Get specified session data
+Command name: REQ_SES (15h)
+Bit           7           6             5          4           3            2            1           0
+Byte
+0             0           0             0          1           0            1            0           1
+1             0           0             0          0           0            0            0           0
+2             Session Number
+3             0           0             0          0           0            0            0           0
+4             Allocation Length
+5             0           0             0          0           0            0            0           0
+6             0           0             0          0           0            0            0           0
+7             0           0             0          0           0            0            0           0
+8             0           0             0          0           0            0            0           0
+9             0           0             0          0           0            0            0           0
+10            0           0             0          0           0            0            0           0
+11            0           0             0          0           0            0            0           0
+       Operation:
+           Requests transfer of specified session information (on multi-session CD)
+       Description:
+           Session Number (Byte 2)
+           Session number (0 - 99)
+           Allocation Length (Byte 4)
+           Data length of requested information. When allocation length is zero, no data are sent.
+
+
+Entire TOC
+Bit           7           6             5          4           3            2           1            0
+Byte
+0             0           0             0          0           STATUS
+1             0           0             0          0           0            0           0            0
+2             Number of Session/Starting TNO
+3             Lead out FAD/Starting FAD
+4             Lead out FAD/Starting FAD
+5             Lead out FAD/Starting FAD
+       Description:
+          STATUS (Byte 0, Bit 0 - 3)
+           See description of CD status.
+          Number of Session/Starting TNO (byte 2)
+
+
+
+
+                                                       57
+                       GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+    When 00h is specified, the total number of sessions is returned.
+   Lead-out FAD/Starting FAD (Byte 3 - 5)
+    When 00h is specified, this indicates the lead-out starting FAD. When something else is specified,
+    the start FAD of the specified session is indicated.
+
+
+
+
+                                                58
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Common to all CD blocks: Open tray
+Command name: CD_OPEN (16h)
+Bit         7              6           5            4           3            2            1           0
+Byte
+0           0              0           0            1           0            1            1           0
+1           0              0           0            0           0            0            0           0
+2           0              0           0            0           0            0            0           0
+3           0              0           0            0           0            0            0           0
+4           0              0           0            0           0            0            0           0
+5           0              0           0            0           0            0            0           0
+6           0              0           0            0           0            0            0           0
+7           0              0           0            0           0            0            0           0
+8           0              0           0            0           0            0            0           0
+9           0              0           0            0           0            0            0           0
+10          0              0           0            0           0            0            0           0
+11          0              0           0            0           0            0            0           0
+       Operation:
+          Stops the CD drive and opens the tray.
+            Automatic (front-loading drive): CD block opens the tray automatically.
+            Manual (top-loading drive): busy state is invoked until opened manually.
+
+
+          Note:
+                   TOC and session information is initialized and returned to the no-data state.
+
+
+
+
+                                                        59
+                                   GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+CD drive: Play CD
+Command name: CD_PLAY (20h)
+Bit           7            6               5            4           3            2            1           0
+Byte
+0             0            0               1            0           0            0            0           0
+1             0            0               0            0           0            Parameter Type
+2             Starting Point
+3             Starting Point
+4             Starting Point
+5             0            0               0            0           0            0            0           0
+6             Reserve                                               Repeat Times
+7             0            0               0            0           0            0            0           0
+8             End Point
+9             End Point
+10            End Point
+11            0            0               0            0           0            0            0           0
+       Operation:
+           CD audio tracks are played back according to the playback parameters.
+           When this command is issued and executed for a section other than CD-DA, the playback
+           operation is performed but no sound is output (this is not recommended, as noise may be output).
+           Playable areas are limited to continuous areas within the disc's program area. If the play request's
+           starting frame address is equal to most peripherical lead-out start address, or exceeding is this, it
+           is regarded as an abnormal request.
+           Play operation stops if the lead-out area is reached during play. If repeated, play stops after one
+           operation.
+           If intermediate lead-out and lead-in areas are specified as start address on multi-section discs,
+           the actual start address becomes the start of the user program area following the specified start
+           address.
+           CD playback restart is only possible using this command from the play state, or a pause state
+           following this, or from scan state. In other states, this become an abnormal request.
+
+
+       Description:
+          Parameter Type (Byte 1, Bit 0 - 2)
+           Indicates the point parameter specification method.
+
+
+                    Bit2       Bit1         Bit0        Parameter Type
+                    0          0            1           FAD specified
+                    0          1            0           MSF specified
+
+
+
+                                                            60
+                          GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+           1          1            1           Start CD playback
+
+
+   Start Point (Byte 2 - 4)
+    Specifies the start point for CD audio playback.
+    The specification method depends on the parameter type.
+
+
+
+
+                                                   61
+                        GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+    FAD specified
+           Byte2      Start frame address (MSB)
+           Byte3      Start frame address
+           Byte4      Start frame address (LSB)
+
+
+    MSF specified
+           Byte2      Start time: minutes (binary 0 - 255)
+           Byte3      Start time: seconds (binary 0 - 59)
+           Byte4      Start time: frames (binary 0 - 74)
+
+
+   CD playback start
+    Bytes 2 - 4 are reserved.
+    CD playback starts from current point without changing the playback range and playback mode.
+    However, when restarting playback following a pause, playback may start from a position slightly
+    different from the pause position.
+
+
+   Repeat Times (Byte 6, Bit 0 - 3)
+    Specifies the number of repeats for playing a CD audio section.
+           Value           Description
+           0h              No repeat (one play only)
+           1h-Eh           Number of repeats (max. 14)
+           Fh              Endless repeat
+
+
+   End Point (Byte 8 - 10)
+    Specifies the end point for CD audio playback. The specification method depends on the
+    parameter type.
+    If "0" is specified as end point, playback continues until immediately before the lead-out section.
+    Also, if the lead-out address is set to the end point, or to an address with a higher value than that,
+    playback continues to the lead-out.
+
+
+    FAD specified
+           Byte2      End frame address (MSB)
+           Byte3      End frame address
+           Byte4      End frame address (LSB)
+
+
+    MSF specified
+           Byte2      End time: minutes (binary 0 - 255)
+           Byte3      End time: seconds (binary 0 - 59)
+
+
+
+                                                 62
+                        GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+           Byte4    End time: frames (binary 0 - 74)
+
+
+   CD playback start
+    Bytes 8 - 10 are reserved.
+
+
+
+
+                                                 63
+                                 GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+CD drive: Seek playback position
+Command name: CD_SEEK (21h)
+Bit           7             6             5           4           3            2            1           0
+Byte
+0             0          0                1           0           0          0              0           1
+1             0          0                0           0           Parameter Type
+2             Seek Point
+3             Seek Point
+4             Seek Point
+5             0          0                0           0           0            0            0           0
+6             0          0                0           0           0            0            0           0
+7             0          0                0           0           0            0            0           0
+8             0          0                0           0           0            0            0           0
+9             0          0                0           0           0            0            0           0
+10            0          0                0           0           0            0            0           0
+11            0          0                0           0           0            0            0           0
+       Operation:
+           Pickup moves to specified playback position and then goes into pause mode.
+           In the case of FAD/MSF, the Parameter Type specification is regarded as an abnormal request if
+           the seek address is smaller than the starting address (00:02:00) of the perimeter user program
+           area, or equal to the starting address of the perimeter user program area, or larger than this.
+       Description:
+          Parameter Type (Byte 1, Bit 0 - 2)
+           Indicates the point parameter specification method.
+                    Bit2        Bit1       Bit0       Parameter Type
+                    0           0          1          FAD specified
+                    0           1          0          MSF specified
+                    0           1          1          Stop playback (move to home position)
+                    1           0          0          Pause playback (seek position is unchanged)
+
+
+          Seek Point (Byte 2 - 4)
+           Specifies the start point.
+           The specification method depends on the parameter type.
+
+
+           FAD specified
+                    Byte2       Seek frame address (MSB)
+                    Byte3       Seek frame address
+                    Byte4       Seek frame address (LSB)
+
+
+           MSF specified
+                    Byte2       Seek time: minutes (binary 0 - 255)
+                    Byte3       Seek time: seconds (binary 0 - 59)
+                    Byte4       Seek time: frames (binary 0 - 74)
+
+
+          CD playback stop or CD playback pause
+           Bytes 2 - 4 are reserved.
+
+
+
+
+                                                          64
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+CD drive: Scan playback
+Command name: CD_SCAN (22h)
+Bit           7            6                5       4           3            2            1           0
+Byte
+0             0            0                1       0           0            0            1           0
+1             0            0                0       0           0            0            0           0
+2             0            0                0       0           0            0            0           Direction
+3             SPEED
+4             0            0                0       0           0            0            0           0
+5             0            0                0       0           0            0            0           0
+6             0            0                0       0           0            0            0           0
+7             0            0                0       0           0            0            0           0
+8             0            0                0       0           0            0            0           0
+9             0            0                0       0           0            0            0           0
+10            0            0                0       0           0            0            0           0
+11            0            0                0       0           0            0            0           0
+       Operation:
+           Causes CD scan playback. Continues until another CD drive command (play, seek) is issued.
+           When lead-in area or lead-out area is reached during scan, pause mode is activated.
+           This command is only accepted in the play state following the CD_PLAY command, or a pause
+           state following this, or from scan state. In other states, this become an abnormal request.
+
+
+       Description:
+          Direction (Byte 2, Bit 0)
+           Indicates the direction for scan playback .
+            0 = Fast-forward
+            1 = Fast-reverse
+          Speed (Byte 3)
+           Playback is carried out at the specified speed (x1 rotation times).
+           Speeds that can be specified
+                  Specified value      Playback speed
+                  0-2                  2x
+                  3-5                  5x
+                  6-9                  9x
+                  10-                  16x
+
+
+
+
+                                                         65
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+CD drive: CD data read
+Command name: CD_READ (30h)
+Bit            7           6            5            4            3          2            1          0
+Byte
+0              0           0            1            1            0         0             0          0
+1              Data Select                                        Expected Data Type                 Parameter
+                                                                                                     Type
+2              Starting Addres (MSB)
+3              Starting Addres
+4              Starting Addres (LSB)
+5              0           0         0               0            0          0            0          0
+6              0           0         0               0            0          0            0          0
+7              0           0         0               0            0          0            0          0
+8              Transfer Length (MSB)
+9              Transfer Length
+10             Transfer Length (LSB)
+11             0           0         0               0            0          0            0          0
+       Operation:
+           The specified data are read from the CD.
+           This is regarded as an abnormal request if the read starting address is smaller than the starting
+           address (00:02:00) of the user program area, or equal to the starting address of the perimeter
+           user program area, or larger than this.
+       Description:
+          Data Select (Byte 1, Bit 7 - 4)
+                    Bit7   Bit6              Bit5         Bit4
+                    Header Sub header        Data         Other
+
+
+           Selects the desired data by a combination of the above bits.
+           *   Data combinations must use a continuous area. For example, in a format that includes a
+               subheader, it is not possible to omit the subheader.
+           *   When the "Other" bit is selected, all data (2352 bytes) are output.
+           *   When Data Type is CD-DA, this specification is invalid, and 2352 bytes are always transferred.
+
+
+          Expected Data Type (Byte 1, Bit 3 - 1)
+           The expected sector type is used to limit information read by the host. If the requested sector
+           does not conform to the specified type, the command terminates with an error. It the disc is an XA
+           disc type, an error is generated if mode 2nonXA is specified.
+Bit3       Bit2     Bit1   Definition            Description
+0          0        0      Any type              No check for sector type.
+                                                 However, if reading of mode 2 track or Form 1/Form 2 is
+                                                 attempted in the case of a disc which is not a CD-ROM XA,
+                                                 the Mode 2 disc reading will fail.
+0          0        1      CD-DA                 CD-DA
+                                                 Error if sector other than CD-DA is read.
+0          1        0      Mode 1                Mode 1
+                                                 Error if sector other than 2048 byte (Yellow Book) is read
+0          1        1      Mode 2                Mode 2, Form 1 or Mode 2, Form 1
+                                                 Error if sector other than 2336 byte (Yellow Book) is read
+
+
+                                                         66
+                            GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+1       0      0        Mode 2, Form 1        Mode 2, Form 1.
+                                              Error if sector other than 2048 byte (Green Book) is read
+1       0      1        Mode 2, Form 2        Mode 2, Form 1
+                                              Error if sector other than 2324 byte (Green Book) is read
+1       1      0        Mode 2 Non XA         Mode 2 of non-CD-ROM XA disc
+                                              2336 bytes are read. No sector type check is performed
+
+
+    When Mode 2 has been specified, a Sub Header is also automatically transferred when data is
+    specified in Data Select. Also, when the data is Form 1, 28 bytes are added as dummy bytes for the
+    transmission and when the data is Form 2, 4 bytes are added as dummy bytes.
+    It should be noted that because sector type check is not performed the error correction function does
+    not work for the CD-ROM.
+
+
+       Parameter Type (Byte 1, Bit 0)
+               Bit0       Parameter Type
+               0          FAD specified
+               1          MSF specified
+
+
+       Start Point (Byte 2 - 4)
+        Specifies the start point for CD data read.
+        The specification method depends on the parameter type.
+
+
+        FAD specified
+               Byte2      Start frame address (MSB)
+               Byte3      Start frame address
+               Byte4      Start frame address (LSB)
+
+
+        MSF specified
+               Byte2      Start time: minutes (binary 0 - 255)
+               Byte3      Start time: seconds (binary 0 - 59)
+               Byte4      Start time: frames (binary 0 - 74)
+
+
+       Transfer Length (byte 8 - 10)
+        Specifies the number of sectors to be transferred.
+               Byte8      Number of transfer sectors (MSB)
+               Byte9      Number of transfer sectors
+               Byte10     Number of transfer sectors (LSB)
+
+
+
+
+                                                      67
+                                  GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+CD drive: CD data read 2
+Command name: CD_READ (31h)
+Bit            7             6            5            4            3           2            1          0
+Byte
+0              0             0            1            1            0           0            0          1
+1              Data Select                                          Expected Data Type                  Parameter
+                                                                                                        Type
+2              Starting Addres (MSB)
+3              Starting Addres
+4              Starting Addres (LSB)
+5              0             0            0            0            0           0            0           0
+6              Transfer Length (MSB)
+7              Transfer Length (LSB)
+8              Next Address (MSB)
+9              Next Address
+10             Next Address (LSB)
+11             0             0            0            0            0           0            0           0
+       Operation:
+           The specified data are read from the CD.
+           Because the pre-read position can be specified, next- access efficiency is improved. For the pre-
+           read position, no error is reported. An error occurring at the pre-read position is reported the next
+           time the pre-read position is specified with the read command.
+           This is regarded as an abnormal request if the starting address or the pre-read address is smaller
+           than the starting address (00:02:00) of the user program area, or it is equal to or larger than the
+           starting address of the perimeter user program area.
+
+
+       Description:
+          Data Select (Byte 1, Bit 7 - 4)
+                    Bit7         Bit6           Bit5        Bit4
+                    Header Sub header           Data        Other
+           Selects the desired data by a combination of the above bits.
+           *   Data combinations must use a continuous area. For example, in a format that includes a
+               subheader, it is not possible to omit the subheader.
+           *   When the "Other" bit is selected, all data (2352 bytes) are output.
+           *   When Data Type is CD-DA, this specification is invalid, and 2352 bytes are always transferred.
+
+
+          Expected Data Type (Byte 1, Bit 3 - 1)
+           The expected sector type is used to limit information read by the host. If the requested sector
+           does not conform to the specified type, the command terminates with an error. When the disc
+
+
+
+                                                           68
+                              GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+           type is XA, an error occurs if Mode 2 non XA is specified.
+Bit3       Bit2   Bit1     Definition           Description
+0          0      0        Any type             Sector type is not checked.
+                                                However, if reading of mode 2 track or Form 1/Form 2 is
+                                                attempted in the case of a disc which is not a CD-ROM XA,
+                                                the Mode 2 disc reading will fail.
+0          0      1        CD-DA                CD-DA
+                                                Error if sector other than CD-DA is read
+0          1      0        Mode 1               Mode 1
+                                                Error if sector other than 2048 byte (Yellow Book) is read
+0          1      1        Mode 2               Mode 2 Form 1 or Mode 2 Form1
+                                                Error if sector other than 2336 byte (Yellow Book) is read
+1          0      0        Mode 2, Form 1       Mode 2 Form 1
+                                                Error if sector other than 2048 byte (Green Book) is read
+1          0      1        Mode 2, Form 2       Mode 2 Form 1
+                                                Error if sector other than 2324 byte (Green Book) is read
+1          1      0        Mode 2 non XA        Mode 2 of non-CD-ROM XA disc
+                                                2336 bytes are read. No sector type check is performed
+       When Mode 2 has been specified, a Sub Header is also automatically transferred when data is
+       specified in Data Select. Also, when the data is Form 1, 28 bytes are added as dummy bytes for the
+       transmission and when the data is Form 2, 4 bytes are added as dummy bytes.
+       It should be noted that because sector type check is not performed the error correction function does
+       not work for the CD-ROM.
+
+
+          Parameter Type (Byte 1, Bit 0)
+           Determines how the point parameter is specified.
+                  Bit0      Parameter Type
+                  0         FAD specified
+                  1         MSF specified
+
+
+          Starting Address (Byte 2 - 4)
+           Specifies the start point for CD data read.
+           The specification method depends on the parameter type.
+
+
+           FAD specified
+                  Byte2     Start frame address (MSB)
+                  Byte3     Start frame address
+                  Byte4     Start frame address (LSB)
+
+
+           MSF specified
+                  Byte2     Start time: minutes (binary 0 - 255)
+                  Byte3     Start time: seconds (binary 0 - 59)
+                  Byte4     Start time: frames (binary 0 - 74)
+
+
+          Transfer Length (Byte 6 - 7)
+           Specifies the number of sectors to be transferred
+                  Byte6     Number of transfer sectors (MSB)
+
+
+
+                                                         69
+                       GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+           Byte7     Number of transfer sectors (LSB)
+
+
+   Next Address (Byte 8 - 10)
+    Specifies the address from which data are to be read after the current data are read.
+    The specification method depends on the parameter type.
+
+
+
+
+                                                70
+                 GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+FAD specified
+       Byte8    Start frame address (MSB)
+       Byte9    Start frame address
+       Byte10   Start frame address (LSB)
+
+
+MSF specified
+       Byte8    Start time: minutes (binary 0 - 255)
+       Byte9    Start time: seconds (binary 0 - 59)
+       Byte10   Start time: frames (binary 0 - 74)
+
+
+
+
+                                          71
+                                GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Subcode: Get subcode
+Command name: CD_SCD (40h)
+Bit            7            6             5          4            3            2            1           0
+Byte
+0              0            1          0             0            0         0               0           0
+1              0            0          0             0            Data Format
+2              0            0          0             0            0         0               0           0
+3              Allocation Length (MSB)
+4              Allocation Length (LSB)
+5              0            0          0             0            0            0            0           0
+6              0            0          0             0            0            0            0           0
+7              0            0          0             0            0            0            0           0
+8              0            0          0             0            0            0            0           0
+9              0            0          0             0            0            0            0           0
+10             0            0          0             0            0            0            0           0
+11             0            0          0             0            0            0            0           0
+       Operation:
+           Gets subcode information. Because the subcode information is updated approximately every 13.3
+           ms, the data may be wiped out unless the subcode is read out as fast as possible when subcode
+           is used. Other subcode information than that for Subcode Q does not comprise CRC check and is
+           therefore not very reliable.
+       Description:
+          Data Format (Byte 1, Bit 0 - 3)
+Specifies the requested subcode information.
+Data Format        Data type                                                              Number of transfer bytes
+0h                 All subcode information is transferred as raw data                     96
+1h                 Subcode Q data only                                                    12
+2-h                Media catalog number (UPC/bar code)
+3-h                International standard recording code (ISRC)
+4-Fh               Reserved
+
+
+(0) Format when all subcode information is transferred
+Byte
+0                                 Reserved
+1                                 Audio status
+2                                 Subcode data length (100 = 64h)
+3
+499                              Subcode
+During audio playback, Subcodes P-W corresponding to the main channel data being output are
+transferred.
+
+
+(1) Format for returning Q subcode data
+Byte                              7           6          5        4        3          2          1          0
+0                                 Reserved
+1                                 Audio status
+
+
+                                                             72
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+2                                  DATA Length MSB (0 = 0h)
+3                                  DATA Length LSB (14 = Eh)
+4                                  Control                                ADR
+513                               DATA-Q
+The Subcode Q value corresponding to the current head position is transferred.
+Depending on ADR, there are 3 modes for DATA-Q contents.
+
+
+            When ADR = 1
+Byte                             Description
+0                                Control                                  1(ADR)
+1                                TNO
+2                                X
+3-5                              Elapsed FAD within track
+6                                0           0       0          0         0         0         0          0
+7-9                              ＦＡＤ
+
+
+            TNO (Byte 1)
+             Indicates the track number.
+                00:   Lead-in track
+                01 - 99:
+                AA:   Lead-out track
+            X (Byte 2)
+                00:   Pause area
+                01 - 99:        Index number
+
+
+    Audio status
+    The audio status field indicates the audio playback operation status, as listed below. 13h and 14h
+    indicate the result of the preceding audio playback operation. This is reported only once. If no audio
+    playback operation is requested, the audio status returned by subsequent READ SUB-CHANNEL
+    commands is 15h. The audio status becomes 15h when reset operation, read operation or seek
+    operation is executed.
+Status                      Description
+00h                         Audio status byte not supported or invalid
+11h                         Audio playback in progress
+12h                         Audio playback paused
+13h                         Audio playback ended normally
+14h                         Audio playback ended abnormally (error)
+15h                         No audio status information
+
+
+
+
+                                                         73
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+(2) Media catalog number data format
+Byte                             7          6         5         4          3         2          1         0
+Byte
+0                                Reserved
+1                                Audio status
+2                                Data Length MSB (0 = 0h)
+3                                Data Length LSB (24 = 18h)
+4                                Format Code (02h)
+5                                0
+6                                0
+7                                0
+8                                MCVal Reserved (o)
+9                                N1 (Most significant)
+10                               N2
+11                               N3
+12                               N4
+13                               N5
+14                               N6
+15                               N7
+16                               N8
+17                               N9
+18                               N10
+19                               N11
+20                               N12
+21                               N13
+22                               ZERO
+23                               Aframe (Binary)
+
+
+       Description
+          MCVal (byte 8, bit 7) Media Catalog Number Data Valid
+           If the media catalog number field is valid, the MCVal bit is set to 1. If no media catalog number
+           exists, the MCVal bit is set to 0. MCVal bit is set to 0 if the drive fails to find the Media Catalog
+           Number.
+
+
+          Media Catalog Number (UPC/Bar Code) (byte 9 - 23)
+           The media catalog number field contains a number (ASCII code) that indicates the media type.
+           Values other than "0" in this field are controlled by Uniform Product Code Council and Europian
+           Article Number Council.
+           When all ASCII values in this field are "0", the media catalog number is not supported.
+           When the media catalog number is detected, the MCVal bit is set to "1". If the number cannot be
+           detected, the bit is set to "0", indicating that the media catalog number is not valid.
+           The media catalog number as reported by this command when the sub channel data format field
+           is "02h" uses the value from the block which includes the UPC/bar code Q sub channel data. (A
+           common code is used for all media.)
+           N1 - N13 are read from the Q channel in mode 2. The data are ASCII codes.
+
+
+
+
+                                                          74
+                               GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+(3) Track international standard recording code format (03h)
+Bit         7              6           5            4            3           2             1           0
+Byte
+0           Reserved (00h)
+1           Audio Status
+2           Data Length MSB (0 = 0h)
+3           Data Length LSB (24 = 18h)
+4           Format Code (03h)
+5           0
+6           0
+7           0
+8           TCVal      Reserved (0)
+9           Reserved (0)         I1：Country Code
+10          Reserved (0)         I2：(A – Z)
+11          Reserved (0)         I3：(Owner Code)
+12          Reserved (0)         I4：
+13          Reserved (0)         I5：(A - Z,0 – 9)
+14          Reserved (0)         1          1                    I6 (Years of Recording)
+15          Reserved (0)         1          1                    I7
+16          Reserved (0)         1          1                    I8 (Serial Number)
+17          Reserved (0)         1          1                    I9
+18          Reserved (0)         1          1                    I10
+19          Reserved (0)         1          1                    I11
+20          Reserved (0)         1          1                    I12
+21          ZERO
+22          Aframe
+23          Reserved (0)
+
+
+   TCVal (Byte 8, Bit 7)
+   When an international standard recording code (ISRC) exists, the TCVal bit is set to "1". When no
+   international standard recording code (ISRC) exists, the TCVal bit is set to "0", indicating that the track
+   international standard recording code format is not valid. For this value, data corresponding to the
+   current head position is transferred. Following head movement, TCVal becomes 0 until this data is
+   detected for the position to which the head has moved.
+
+
+   Track international standard recording code (byte 9 - 23)
+   The track international standard recording code is an international 12-byte ASCII code, followed by 3-
+   byte 30h data (ASCII code "0").
+
+
+
+
+                                                        75
+                         GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+Appendix I Additional Sense Codes
+               Sense                                                              Major reason
+ASC    ASCQ          Description
+               Key                                                                Drive Media Host
+00     00      0     No error to report
+00     00      B     No error to report (option)
+                     Error during drive playback operation. Drive operation is
+00     14      5                                                                   ◎      ◎
+                     stopped (option).
+02     00      3     Drive retry failed. Track could not be located.               ◎      ◎
+                     Drive is busy. This status is reported only when no
+                     command from host can be accepted (until the READY
+04     01      2
+                     state is established after the lid is closed or during
+                     execution of security check by command).
+09     00      4     Track jump was detected (option).                             ◎      ◎
+09     02      4     Focus servo error was detected.                               ◎      ○
+09     03      4     Spindle servo error was detected.                             ◎
+09     04      4     Laser power control error was detected (option).              ◎
+09     90      4     General servo error was detected.                             ◎      ○
+11     00      3     Unrecoverable error was detected.                              ○     ◎
+15     00      4     Seek operation failed (option).                               ◎      ◎
+                     Specified address mark ID could not be detected, but
+17     05      1     previous sector address mark was used for recovery. This ○           ◎
+                     error is not reported if PER bit is not set to "1" (option).
+                     Data were read with error correction. This error is not
+18     00      1                                                                    ○     ◎
+                     reported if PER bit is not set to "1" (option).
+                     Data were read with retry. This error is not reported if
+18     01      1                                                                    ○     ◎
+                     PER bit is not set to "1" (option).
+20     00      5     Unsupported command was received.                                         ◎
+21     00      5     Invalid address was specified.                                            ◎
+                     Command with invalid field was detected (Reserved bit is
+24     00      5                                                                               ◎
+                     not "0", etc.)
+26     00      5     Invalid parameter was detected.                                           ◎
+                     Disc is inserted at the time of power-on or hard reset. Or
+28     00      6     the lid was closed no matter whether a disc is inserted or
+                     not.
+                     No disc inserted at the time of power-on, reset or hard
+29     00      6     reset, or TOC cannot be read. Or soft reset from host no
+                     matter whether a disc is inserted or not.
+2C     01      5     Command not supported by inserted media was received.                     ◎
+                     Media operation command was received but no media is
+3A     00      2
+                     inserted.
+44     00      4     Internal hardware error was detected (option).                ◎
+                     New command was received while previous command
+4E     00      4                                                                               ◎
+                     was still executing.
+53     00      B     Load or eject operation failed (option).                      ◎
+57     00      2     TOC information could not be read from CD media.              ◎      ◎
+                     Lead-out area or data track was detected during playback
+63     00      5                                                                    ○     ○    ◎
+                     (option).
+64     00      5     CD media header mode is different from specified data.
+92     00      7     Lens or media contamination was detected (option).            ◎      ◎
+                     Error was detected and CD audio playback was stopped
+B9     00      B                                                                   ◎      ◎     ○
+                     (option).
+
+
+
+                                                  76
+                 GD-ROM Protocol SPI (Sega Packet Interface) Specifications Ver.1.30 12 Janualy 1999
+
+
+
+BF   00   B   Drive data buffer overflow (option)                                              ◎
+
+
+
+
+                                          77
+

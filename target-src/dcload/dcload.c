@@ -738,6 +738,7 @@ int main(void)
 
 	set_ip_from_file();
 
+	cdfs_pm_boot();
 	cdfs_redir_save(); /* will only save value once */
 	cdfs_redir_disable();
 
@@ -767,6 +768,11 @@ int main(void)
 		if (booted) {
 			disp_status("idle...");
 		}
+
+		// Say hello before going quiet. With a static IP this is the only frame
+		// we ever send unprompted, and without it nothing on the host can
+		// discover us -- see announce_presence() in net.c.
+		announce_presence();
 
 		bb->loop(1); // Identify that this bb->loop is the main loop for set_ip_dhcp()
 	}

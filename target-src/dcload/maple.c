@@ -51,7 +51,23 @@ void maple_wait_dma()
 */
 
 // Make GCC 32-byte align it in the .data section since GCC aligns the binary relative to 0x8c010000.
-__attribute__((aligned(32))) volatile unsigned char dmabuffer[MAPLE_DMA_SIZE]; // Here's a global array
+/*
+ * OUT OF THE LOW IMAGE ON PURPOSE.
+ *
+ * This used to be a 2 KB array in dcload's BSS, and it sat exactly where Sonic
+ * Adventure puts a stack: the title enters GD syscalls with SP = 0x8c00b9d0,
+ * which landed inside this buffer. Its stack then grows DOWN through the rest
+ * of dcload's state -- including `bb`, the adapter pointer -- and once that is
+ * clobbered dcload's next bb->loop() jumps through garbage, which is how the
+ * guest ends up executing at address zero.
+ *
+ * 0x8cfe8000 is what isoldr's own heap heuristic picks as free high RAM
+ * (ARCHITECTURE.md 10.2). Maple DMA only needs RAM the controller can write
+ * and 32-byte alignment, so it does not care where it lives.
+ */
+#define MAPLE_DMA_BUFFER_ADDR 0x8cfe8000U
+volatile unsigned char *const dmabuffer =
+	(volatile unsigned char *)MAPLE_DMA_BUFFER_ADDR;
 
 
 /*

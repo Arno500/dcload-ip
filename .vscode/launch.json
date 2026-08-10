@@ -1,0 +1,39 @@
+{
+  "configurations": [
+    {
+      "name": "(gdb) Joindre",
+      "type": "cppdbg",
+      "request": "launch",
+      "cwd": "${workspaceFolder}/target-src/dcload",
+      "program": "${workspaceFolder}/target-src/dcload/dcload",
+      "MIMode": "gdb",
+      "linux": {
+        "miDebuggerPath": "/opt/toolchains/dc/sh-elf/bin/sh-elf-gdb"
+      },
+      "externalConsole": true,
+      "stopAtConnect": true,
+      "miDebuggerServerAddress": "localhost:3263",
+      "filterStderr": true,
+      "setupCommands": [
+        {
+          "description": "Activer l'impression en mode Pretty pour gdb",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Définir la version désassemblage sur Intel",
+          "text": "-gdb-set disassembly-flavor intel",
+          "ignoreFailures": true
+        },
+        {
+          "text": "-gdb-set arch sh4",
+          "description": "Archi Dreamcast",
+        },
+        {
+          "text": "-gdb-set endian little",
+          "description": "Little endian"
+        },
+      ]
+    }
+  ]
+}

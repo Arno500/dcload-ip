@@ -25,6 +25,13 @@
 // This is the only function that needs to be exported
 void process_pkt(unsigned char *pkt);
 
+// Gratuitous ARP. Required for a static DREAMCAST_IP to be reachable at all --
+// see the comment on the definition in net.c before removing it.
+void announce_presence(void);
+
+/* UDP accounting, see net.c */
+extern unsigned int g_udp_ok, g_udp_cksum_bad, g_udp_unmatched;
+
 extern const unsigned char broadcast[6]; // Used in DHCP code
 
 extern __attribute__((aligned(32))) unsigned char raw_pkt_buf[RAW_TX_PKT_BUF_SIZE];

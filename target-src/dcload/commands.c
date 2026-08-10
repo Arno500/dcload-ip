@@ -25,13 +25,54 @@ unsigned int tool_version = 0;
 static unsigned int cached_dest = 0;
 static int payload1024 = 0;
 
+/*
+ * Transfer accounting, for the one read Sonic Adventure never completes.
+ * dcload survives that read (it merely times out), so unlike every earlier
+ * attempt these CAN be sampled live, during the 20 s the wait lasts. They
+ * localise the break: no LBIN means the request never produced one, PBIN
+ * accepted stuck below the expected count means packets are being lost or
+ * refused, and DBIN seen with incomplete==1 means the map has holes.
+ */
+unsigned int g_lbin_count = 0;
+unsigned int g_pbin_ok = 0;
+unsigned int g_pbin_rejected = 0;
+unsigned int g_dbin_count = 0;
+unsigned int g_dbin_incomplete = 0;
+unsigned int g_last_load_addr = 0;
+unsigned int g_last_load_size = 0;
+unsigned int g_last_pbin_addr = 0;
+unsigned int g_last_reject_addr = 0;
+/* The window that was actually in force when a part was refused, and the size
+ * the part claimed. Without these, a rejection cannot be told apart from a
+ * part that arrived before its own LoadBinary. */
+unsigned int g_last_reject_load = 0;
+unsigned int g_last_reject_end = 0;
+unsigned int g_last_reject_size = 0;
+unsigned int g_pbin_clamped = 0;
+
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
 // This giant array keeps track of how many kB have been received, relative to start address of the transmitted data's destination.
 // Each packet has a maximum payload size of 1440, and the nearest multiple of 1440 > 16MB is 16,784,640, which would be 11651 map indices.
 // 11651 is not a multiple of 8, but 11656 is, so we can just use that.
 // The multiple of 8 requirement is because memset_zeroes_64bit() is used as the only memset in this entire program, as it is the smallest way to set the most data.
-#define BIN_INFO_MAP_SIZE 11656
+/*
+ * SIZED FOR THE IN-GAME CASE, NOT THE UPLOAD.
+ *
+ * This was 11656 -- one entry per 1440-byte part of a full 16 MB transfer --
+ * and it put 11.6 KB of dcload right where Sonic Adventure puts its stack. The
+ * title calls GD syscalls with SP = 0x8c00b9d0, inside this image; its stack
+ * grows down through dcload's own state and eventually over `bb`, the adapter
+ * pointer, after which dcload's next bb->loop() is an indirect call through
+ * garbage and the guest executes at address zero. Shrinking the map is the
+ * cheapest large reduction of that overlap.
+ *
+ * 256 entries covers 368640 bytes in one LoadBinary. The largest transfer a
+ * running title asks for here is 215040. The initial upload is much bigger, so
+ * the HOST now splits it into several LoadBinary transfers -- see send_data()
+ * in dcload-ip-rs, which must stay in step with this number.
+ */
+#define BIN_INFO_MAP_SIZE 256
 // This used to be 16384 for 1024-byte payload size, but by doing it this way instead we can save almost 5kB from the file size and increase the data per packet by 1.4x.
 // We can also set a legacy check to use 1024-byte packets for compatibility with old versions of dc-tool (if for some reason someone needs that), although the maximum size
 // for such legacy uses would be limited to 11MB. I think the gains made with the new version are definitely worth it.
@@ -103,6 +144,9 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
 	bin_info.load_address = ntohl(command->address);
 	bin_info.load_size = ntohl(command->size);
+	g_lbin_count++;
+	g_last_load_addr = bin_info.load_address;
+	g_last_load_size = bin_info.load_size;
 
 	// Legacy check for versions < 2.0.0
 	if(DCTOOL_MAJOR < 2)
@@ -187,11 +231,50 @@ void cmd_partbin(command_t * command)
 	 * packet map index and corrupt memory. */
 	if (cmd_size == 0)
 	{
+		g_pbin_rejected++;
 		return;
 	}
-	if ((cmd_addr < load_start) || (cmd_end < cmd_addr) || (cmd_end > load_end))
+	if ((cmd_addr < load_start) || (cmd_end < cmd_addr))
 	{
+		/* Starts before the window, or the length wrapped. Nothing sane to do
+		 * with that. */
+		g_pbin_rejected++;
+		g_last_reject_addr = cmd_addr;
+		g_last_reject_load = load_start;
+		g_last_reject_end = load_end;
+		g_last_reject_size = cmd_size;
 		return;
+	}
+	if (cmd_addr >= load_end)
+	{
+		/* Entirely past the window: a straggler from a previous transfer. */
+		g_pbin_rejected++;
+		g_last_reject_addr = cmd_addr;
+		g_last_reject_load = load_start;
+		g_last_reject_end = load_end;
+		g_last_reject_size = cmd_size;
+		return;
+	}
+	if (cmd_end > load_end)
+	{
+		/*
+		 * CLAMP, DO NOT DROP.
+		 *
+		 * The part starts inside the window and runs past its end. Refusing it
+		 * outright throws away bytes the host believes it delivered: the map
+		 * entry never gets set, DoneBinary reports the hole, and the same
+		 * oversized part is resent and refused again. Measured on Sonic
+		 * Adventure's fatal read -- window (0x0cef7000, 16384), a part landing
+		 * at 0x0cefade0 whose end reaches 0x0cefb380, 896 bytes past -- and
+		 * every one of that chunk's twelve parts was lost this way.
+		 *
+		 * Taking the portion that fits is safe: the write is bounded by the
+		 * window the LoadBinary established, which is exactly the guarantee
+		 * this check exists to enforce.
+		 */
+		g_pbin_clamped++;
+		cmd_size = load_end - cmd_addr;
+		cmd_end = load_end;
 	}
 
 	// Thanks to packet buffer alignment, command->data is guaranteed to be 8-byte aligned.
@@ -237,9 +320,13 @@ void cmd_partbin(command_t * command)
 	}
 	if ((unsigned int)index >= BIN_INFO_MAP_SIZE)
 	{
+		g_pbin_rejected++;
+		g_last_reject_addr = cmd_addr;
 		return;
 	}
 	bin_info.map[index] = 1;
+	g_pbin_ok++;
+	g_last_pbin_addr = cmd_addr;
 }
 
 void cmd_donebin(ip_header_t * ip, udp_header_t * udp, command_t * command)
@@ -266,9 +353,12 @@ void cmd_donebin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		payload_size = 1440;
 	}
 
+	g_dbin_count++;
 	for(i = 0; i < map_index_verify; i++)
 		if (!bin_info.map[i])
 			break;
+	if (i != map_index_verify)
+		g_dbin_incomplete++;
 
 	if(i == map_index_verify)
 	{

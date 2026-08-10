@@ -20,6 +20,13 @@ __attribute__((aligned(32))) unsigned char raw_pkt_buf[RAW_TX_PKT_BUF_SIZE]; // 
 // The performance gains are well worth the 2 wasted bytes.
 __attribute__((aligned(2))) unsigned char * pkt_buf = &(raw_pkt_buf[2]);
 
+/* Where UDP datagrams go. A command that is received but matches nothing is
+ * indistinguishable, from every other counter, from one that never arrived --
+ * so count both sides of that fork explicitly. */
+unsigned int g_udp_ok = 0;
+unsigned int g_udp_cksum_bad = 0;
+unsigned int g_udp_unmatched = 0;
+
 static void process_broadcast(unsigned char *pkt) // arp request
 {
 	ether_header_t *ether_header = (ether_header_t *)pkt;
@@ -71,6 +78,63 @@ static void process_broadcast(unsigned char *pkt) // arp request
 			bb->tx(pkt, ETHER_H_LEN + ARP_H_LEN);
 		}
 	}
+}
+
+/*
+ * Announce ourselves on the wire (gratuitous ARP).
+ *
+ * WHY A LOADER HAS TO SPEAK FIRST. dcload used to transmit nothing at all
+ * until spoken to. With a static DREAMCAST_IP that is a deadlock, and it cost
+ * a whole debugging session to see it: the host's first packet is unicast, so
+ * it must ARP for us; on an emulated BBA, flycast's bridge does not even open
+ * its capture device until the GUEST has transmitted one frame; so the host's
+ * ARP never reaches us, we never reply, and the host's neighbour entry decays
+ * to Unreachable -- a state in which Windows discards the tool's datagrams
+ * while send() keeps reporting success. Nothing anywhere reports an error.
+ *
+ * DHCP hid this, because DISCOVER happens to be that first frame.
+ *
+ * One frame at boot breaks the cycle. Note this does not by itself create a
+ * neighbour entry on the host -- receivers refresh an existing entry from an
+ * unsolicited ARP but do not create one -- it makes us VISIBLE, after which
+ * the host's own ARP request gets through and is answered normally.
+ */
+void announce_presence(void)
+{
+	ether_header_t *ether = (ether_header_t *)pkt_buf;
+	arp_header_t *arp = (arp_header_t *)(pkt_buf + ETHER_H_LEN);
+	__attribute__((aligned(4))) unsigned int ip;
+	int i;
+
+	/* 0.x.x.x is DHCP-pending and 255.255.255.255 is the DHCP-failed marker;
+	 * announcing either would be a lie. */
+	if (((our_ip & 0xff000000) == 0) || (our_ip == 0xffffffff))
+	{
+		return;
+	}
+
+	ip = htonl(our_ip);
+
+	make_ether((unsigned char *)broadcast, bb->mac, ether);
+	ether->type[0] = 0x08;
+	ether->type[1] = 0x06;			/* ARP, not IP */
+
+	arp->hw_addr_space = 0x0100;		/* ethernet, byte-swapped */
+	arp->proto_addr_space = 0x0008;		/* IPv4, byte-swapped */
+	arp->hw_addr_len = 6;
+	arp->proto_addr_len = 4;
+	arp->opcode = 0x0100;			/* request, byte-swapped */
+
+	memcpy_16bit(arp->hw_sender, bb->mac, 6/2);
+	memcpy_16bit(arp->proto_sender, &ip, 4/2);
+	for (i = 0; i < 6; i++)
+	{
+		arp->hw_target[i] = 0;
+	}
+	/* sender == target is what makes it gratuitous */
+	memcpy_16bit(arp->proto_target, &ip, 4/2);
+
+	bb->tx(pkt_buf, ETHER_H_LEN + ARP_H_LEN);
 }
 
 static void process_icmp(ether_header_t *ether, ip_header_t *ip, icmp_header_t *icmp)
@@ -148,8 +212,10 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 	if (__builtin_expect(i != udp->checksum, 0))
 	{
 		/*    scif_puts("UDP CHECKSUM BAD\n"); */
+		g_udp_cksum_bad++;
 		return;
 	}
+	g_udp_ok++;
 
 	// Handle receipt of DHCP packets that are directed to this system
 	dhcp_pkt_t *udp_pkt_data = (dhcp_pkt_t*)udp->data;
@@ -247,6 +313,14 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		{
 			// This function does not return
 			cmd_reboot();
+		}
+
+		/* Received, checksummed, and matched nothing. Without this counter a
+		 * command that arrives but is not recognised is indistinguishable from
+		 * one that never arrived at all. */
+		if (pkt_match_id)
+		{
+			g_udp_unmatched++;
 		}
 	}
 }

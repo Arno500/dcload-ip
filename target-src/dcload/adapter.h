@@ -61,6 +61,18 @@ extern volatile unsigned char escape_loop;
 // If you want the loop to have a timeout, set this int to # of secs.
 // Else, leave it as zero. If loop times out, it will be set to -1 and need resetting.
 extern int timeout_loop;
+
+/* When > 0, bb->loop() runs at most this many poll iterations and returns.
+ * Used to flush the RX ring before starting a large burst -- see ReadSectors()
+ * in cdfs_syscalls.c for why an un-drained ring is not a harmless condition. */
+extern volatile int drain_iters;
+
+/* Diagnostics for the clock-free deadline in rtl_bb_loop. */
+extern unsigned int g_pmcr_backwards;
+extern unsigned int g_idle_polls_max;
+extern unsigned int g_rx_frames, g_rx_wraps, g_rx_hdr_defer, g_rx_copying;
+extern unsigned int g_rx_overflow, g_rx_reinit, g_rx_last_capr, g_rx_last_cbr, g_rx_polls;
+extern unsigned int g_rx_linkchange, g_rx_link_giveup, g_rx_underrun_ack;
 extern int loop_secs_elapsed;
 
 // All adapter drivers should use this shared buffer to receive.

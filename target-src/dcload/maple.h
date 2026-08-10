@@ -51,4 +51,4 @@ void *maple_docmd(int port, int unit, int cmd, int datalen, void *data);
 
 #define MAPLE_DMA_SIZE (1024 + 1024 + 4 + 4 + 4)
 
-extern __attribute__((aligned(32))) volatile unsigned char dmabuffer[MAPLE_DMA_SIZE];
+extern volatile unsigned char *const dmabuffer;   /* fixed high RAM, see maple.c */
