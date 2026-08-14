@@ -56,6 +56,20 @@
 /* Composite RX bits we check for while doing an RX interrupt */
 #define RT_INT_RX_ACK (RT_INT_RXFIFO_OVERFLOW | RT_INT_RXBUF_OVERFLOW | RT_INT_RX_OK)
 
+/*
+ * WHAT A CONSUMED FRAME MAY ACKNOWLEDGE -- AND WHAT IT MUST NOT.
+ *
+ * These bits are write-1-to-clear, so acknowledging RT_INT_RX_ACK per frame
+ * also clears both OVERFLOW bits. rtl_bb_rx() drains many frames per call
+ * while the poll loop samples RT_INTRSTATUS once per iteration, so an overflow
+ * raised during a drain was erased before anything could act on it: the
+ * recovery path in rtl_bb_loop() almost never ran, and g_rx_overflow counted a
+ * small fraction of the overflows that actually happened. Reception is the
+ * only thing a frame is evidence of; leave the ring-level conditions to the
+ * loop that knows how to handle them.
+ */
+#define RT_INT_RX_FRAME_ACK (RT_INT_RX_OK | RT_INT_RX_ERR)
+
 /* RTL8139C transmit status bits */
 #define RT_TX_CARRIER_LOST     0x80000000 /* Carrier sense lost */
 #define RT_TX_ABORTED          0x40000000 /* Transmission aborted */

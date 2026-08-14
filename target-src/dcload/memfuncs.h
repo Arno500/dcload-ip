@@ -80,6 +80,12 @@ static inline void CacheBlockWriteBack(unsigned char * __32_byte_base, unsigned 
 }
 
 // Invalidate cache only, don't write the blocks back
+//
+// The "memory" clobber is NOT decoration, and it was missing here while both
+// CacheBlockPurge and CacheBlockWriteBack above carry it. Without it the
+// compiler has no reason to believe an ocbi affects anything, so it is free to
+// move it across the very loads it is meant to make re-read from memory --
+// which is exactly how it is used on the BBA's DMA window in pktcpy().
 static inline void CacheBlockInvalidate(unsigned char * __32_byte_base, unsigned int __32_byte_count)
 {
 	unsigned int __32_byte_ptr = (unsigned int)__32_byte_base;
@@ -89,7 +95,7 @@ static inline void CacheBlockInvalidate(unsigned char * __32_byte_base, unsigned
 		asm volatile ("ocbi @%[ptr]\n"
 			: // outputs
 			: [ptr] "r" (__32_byte_ptr) // inputs
-			: // clobbers
+			: "memory" // clobbers memory -- see below
 		);
 
 		__32_byte_count -= 1;

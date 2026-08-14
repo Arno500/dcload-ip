@@ -768,6 +768,22 @@ static int rtl_bb_rx()
 #endif
 
 		}
+		else
+		{
+			/*
+			 * CONSUMED, NOT DELIVERED -- AND UNTIL NOW, UNCOUNTED.
+			 *
+			 * The frame advances cur_rx and increments g_rx_frames exactly like
+			 * a good one, but never reaches process_pkt. That makes this the one
+			 * place in the driver where a packet can vanish leaving no trace at
+			 * all: arrival accounting says it arrived, the host says it was
+			 * never acknowledged, and nothing in between disagrees. Whether that
+			 * ever happens is precisely what the residual upload loss needs to
+			 * answer, so record it and keep the status word that caused it.
+			 */
+			g_rx_status_drop++;
+			g_rx_last_bad_status = rx_status;
+		}
 
 		g_rx_frames++;
 
@@ -828,10 +844,10 @@ static int rtl_bb_rx()
 			// Wow, even QEMU emulates this "off by 16" thing here: https://github.com/qemu/qemu/blob/master/hw/net/rtl8139.c#L2532
 		}
 
-		// Ack it
+		// Ack it -- the RECEPTION, not the ring conditions. See RT_INT_RX_FRAME_ACK.
 		unsigned short i = nic16[RT_INTRSTATUS/2];
-		if (i & RT_INT_RX_ACK)
-			nic16[RT_INTRSTATUS/2] = RT_INT_RX_ACK;
+		if (i & RT_INT_RX_FRAME_ACK)
+			nic16[RT_INTRSTATUS/2] = RT_INT_RX_FRAME_ACK;
 
 		processed++;
 
@@ -843,6 +859,13 @@ static int rtl_bb_rx()
 		uint_to_string_dec(loop_difference1, (char*)uint_string_array);
 		draw_string(30, 412, uint_string_array, STR_COLOR);
 #endif
+	}
+
+	/* One G2 read per drain, not per frame, so this cannot pace what it
+	 * measures. Cumulative and saturating -- never written back. */
+	if (processed)
+	{
+		g_rx_missed = nic32[RT_RXMISSED/4] & 0x00ffffffU;
 	}
 
 	return processed;
@@ -872,6 +895,19 @@ unsigned int g_rx_polls = 0;		/* poll iterations, a liveness heartbeat */
 unsigned int g_rx_linkchange = 0;	/* entered the PHY-reset branch */
 unsigned int g_rx_link_giveup = 0;	/* a bounded link wait ran out */
 unsigned int g_rx_underrun_ack = 0;	/* underrun acked without touching the PHY */
+unsigned int g_rx_status_drop = 0;	/* frame consumed but never delivered */
+unsigned int g_rx_last_bad_status = 0;	/* the status word that caused the last one */
+/*
+ * RT_RXMISSED: THE CHIP'S OWN TALLY OF FRAMES IT THREW AWAY.
+ *
+ * This register was reset in rtl_init() and never read again, which left the
+ * one question that matters about a lost packet unanswerable: did the chip
+ * discard it for want of ring space, or did the CPU receive it and lose it
+ * afterwards? Every counter above is CPU-side, so all of them are blind to the
+ * first case by construction -- a frame the chip dropped was never a frame as
+ * far as they are concerned. 24 valid bits; writing clears it, so we only read.
+ */
+unsigned int g_rx_missed = 0;
 
 /* Spins before a link wait gives up. Large enough that a genuine
  * auto-negotiation completes, small enough that a dead link costs a blip
@@ -1109,10 +1145,32 @@ void rtl_bb_loop(int is_main_loop)
 			 * every frame delivered (dropped=0) while dcload's LBIN/PBIN/DBIN
 			 * counters sat frozen for the full 20 s syscall timeout.
 			 */
-			rtl_bb_rx();
-			if (nic8[RT_CHIPCMD] & 1)
+			int drained = rtl_bb_rx();
+
+			/*
+			 * REPUBLISH CAPR, EVEN WHEN NOTHING WAS DRAINED.
+			 *
+			 * An overflow means the chip already threw a frame away; what
+			 * decides whether it throws away the NEXT one is whether it has
+			 * been told the CPU caught up. rtl_bb_rx() writes CAPR once per
+			 * frame it consumes, so the one case that needs this most -- the
+			 * chip discarded everything and the ring reads back empty -- is
+			 * exactly the case where CAPR never got written at all.
+			 */
+			nic16[RT_RXBUFTAIL/2] = (unsigned short)((rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1));
+
+			/*
+			 * PROGRESS COUNTS AS RECOVERY. Testing RxBufEmpty alone is wrong
+			 * here now that this branch actually runs: during a burst upload a
+			 * fresh frame lands between the drain and the test almost every
+			 * time, so a healthy ring reads back non-empty and would be
+			 * re-initialised -- throwing away good frames and provoking the
+			 * retransmissions this path exists to avoid. Only a drain that
+			 * consumed NOTHING while the ring insists it is non-empty is a
+			 * genuine wedge.
+			 */
+			if (drained || (nic8[RT_CHIPCMD] & 1))
 			{
-				/* RxBufEmpty: the ring drained fine, just acknowledge. */
 				nic16[RT_INTRSTATUS/2] = RT_INT_RXBUF_OVERFLOW;
 			}
 			else
