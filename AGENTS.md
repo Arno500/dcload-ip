@@ -570,7 +570,7 @@ with `scripts/flycast-resume.py`. Anything touching `:3263` must end with a GDB
 | `dc-irqwatch.py` | interrupt activity. |
 | `dc-trap.py` | arms a `Z0` breakpoint, **with a self-test** — its own probe proves the BIOS ROM ignores flycast's `trapa` patch, so you cannot breakpoint address 0. |
 | `dc-catch-vector-write.sh` | host-side hardware watchpoint via `cdb.exe` on the GD vector. Carries a **positive control**: x64 data breakpoints are per-thread, so it treats dcload's own `cfs_redir` install as proof the watchpoint is live. No `SELFTEST-OK` means the result is meaningless, not that nobody wrote. |
-| `flycast-counters.sh` | reads the `dcdiag` patch in the flycast tree (Holly interrupts raised/acknowledged per bit, TA lists opened/closed/parameters, per list type) **at full speed**. Prefer this to `bp flycast!asic_RaiseInterrupt`, which costs a round trip per interrupt and drops VBlank from 60/s to 1.7/s — every rate measured under it is void. |
+| `flycast-counters.sh` | reads the `dcdiag` patch in the flycast tree (Holly interrupts raised/acknowledged per bit, TA lists opened/closed/parameters, per list type) **at full speed**. Prefer this to `bp flycast!asic_RaiseInterrupt`, which costs a round trip per interrupt and drops VBlank from 60/s to 1.7/s — every rate measured under it is void. **Verified absent 2026-08-14**: the patch is no longer in the flycast tree (`core/hw/holly/dcdiag.h` exists, but nothing includes it and neither build carries the symbols), so the script exits with "unexpected cdb output (0 values)". Re-apply and rebuild before relying on it — and note the DC-side counters below answer frame-rate questions on their own (§16). |
 | `sa-repeat.sh`, `sa-gdi-control.sh`, `flycast-transition.sh` | session drivers used during the Sonic Adventure work. |
 
 **You cannot trap a write as it happens under flycast.** Its GDB stub answers
@@ -675,10 +675,20 @@ result, prove the instrument still detects something.
   `target-src/dcload/commands.{c,h}`, `target-src/dcload/syscalls.{c,h}`. Both
   sides, in lock-step.
 - **Throughput** → `Makefile.cfg` (FIFO delays), `dc-tool.c`
-  (`PACKET_TIMEOUT`), and `GD_EMU_ASYNC` (§4.5). Note that upload packet loss
-  was measured **strictly periodic** (one packet in every 75–80, independent of
-  burst size) and therefore not congestion: do not tune the pacing further, it
-  does not move.
+  (`PACKET_TIMEOUT`), and `GD_EMU_ASYNC` (§4.5). Two corrections to what this
+  entry used to say, both paid for:
+  - It claimed upload loss was "strictly periodic and therefore not
+    congestion — do not tune the pacing further". **That was wrong.** The
+    periodicity was an artefact of the loss being invisible: dcload's overflow
+    bits were being cleared by its own per-frame interrupt acknowledge, so the
+    one counter that could have shown congestion read zero. `RT_RXMISSED`, the
+    chip's own tally, showed 887 dropped frames in a single upload. Closing the
+    loop with a `DoneBinary`-probed window took it to 7.
+  - **Latency and throughput are different problems here, and latency is the
+    one a running title feels.** A disc read blocks the game for its whole
+    duration, so the figure that matters is milliseconds per chunk, not KB/s.
+    Chasing KB/s would have missed the 39 ms of host-side `thread::sleep` that
+    was the actual stutter (§16).
 - **Base address / memory map** → `dcload.x`, `target-src/1st_read/loader.s`,
   `dcload-crt0.s`, `go.s`, `exception.S`, `cdfs_redir.s`, `commands.c`,
   `cdfs_syscalls.c` (`PM_BASE`), `maple.c` (buffer address),
@@ -722,6 +732,37 @@ What the DC side depends on:
   than accepting whatever packet arrives next.
 - Read-back verification (`DCLOAD_VERIFY_READS=1`) is described in §11 and
   `docs/read-back-verification.md`.
+- **Pacing on the runtime CDFS path must be a spin, never `thread::sleep`.**
+  dcload answers a disc read synchronously — it sits in `bb->loop()` until the
+  last `PBIN` lands — so every microsecond the host spends not sending is a
+  microsecond the **title is frozen**. `thread::sleep` on Windows rounds up to
+  the system timer tick, which turned three innocent-looking waits per 16 KB
+  chunk (`12 × sleep(1 ns)`, `sleep(1800 µs)`, `sleep(25 ms)`) into ~39 ms of
+  deliberate idling. Measured on Sonic Adventure, before and after removing
+  them, at the same point of the same boot:
+
+  | | before | after |
+  | --- | --- | --- |
+  | poll iterations per 16 KB chunk | 5301 | **179** |
+  | dcload's share of the machine | 35.6 % | **1.8 %** |
+  | title frozen per chunk | 45.6 ms (2.3 PAL frames) | **1.5 ms** |
+  | the title's own frame loop (`GetDrvStat`) | 45.0/s | **58.9/s** |
+
+  Almost none of it was the network: 16 KB at 100 Mbit is 1.3 ms of wire time.
+  `dc-tool` never had the problem because it busy-waits
+  (`while ((time_in_usec() - start) < rx_fifo_delay);`) and puts its only
+  `nanosleep` behind `SAVE_MY_FANS`, which is 0 by default. The Rust port
+  inherited the *idea* of a 1 ns yield from dc-tool's comment ("there's no
+  picosecond sleep, so this is about as good as it gets") without inheriting
+  its cost profile.
+- **`polls per chunk` is the calibration-free way to measure this.**
+  `g_rx_polls` only advances while dcload holds the CPU, so its ratio to
+  `g_cdfs_sync_chunks` is how hard the loader is spinning per unit of work,
+  with no clock needed — which matters because PMCR reads 0 while a game runs
+  (§11). `g_gd_idx_counts[2]` (ExecServer) and `[4]` (GetDrvStat) are called
+  once per frame by Sonic Adventure, so they *are* a frame-rate counter; and
+  `[3]` (InitSystem) must read exactly 1, which is a free check that you have
+  the array alignment right.
 
 ## 17. Sources of truth
 

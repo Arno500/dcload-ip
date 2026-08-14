@@ -359,7 +359,17 @@ if [[ $NO_RUST -eq 0 ]]; then
   # debug! lines, including one per ReadSector with its LBA and first 8 bytes --
   # the only way to see which sectors the host actually served:
   #   RUST_GLOBAL_ARGS=-v scripts/flycast-debug-loop.sh --skip-build
-  ps_ "\$argLine = '--host $DC_IP ${RUST_GLOBAL_ARGS:-} u-exec \"$BIN\" $EXTRA ${RUST_EXTRA_ARGS:-}'; Start-Process -FilePath '$RUST_EXE_WIN' -ArgumentList \$argLine -WorkingDirectory '$RUST_DIR_WIN' -RedirectStandardOutput '$LOG_OUT_WIN' -RedirectStandardError '$LOG_ERR_WIN'" >/dev/null
+  # RUST_ENV is a space-separated list of KEY=VALUE set in the launched
+  # process's environment. Several of dcload-ip-rs' knobs are env vars rather
+  # than flags, and Start-Process inherits the PowerShell session's environment,
+  # so this is the only way to reach them without editing the Rust source:
+  #   RUST_ENV=DCLOAD_VERIFY_READS=1 scripts/flycast-debug-loop.sh --skip-build
+  #   RUST_ENV="DCLOAD_RT_BURST=1 DCLOAD_RT_DELAY_US=500" ...
+  RUST_ENV_PS=""
+  for kv in ${RUST_ENV:-}; do
+    RUST_ENV_PS="$RUST_ENV_PS\$env:${kv%%=*} = '${kv#*=}'; "
+  done
+  ps_ "$RUST_ENV_PS\$argLine = '--host $DC_IP ${RUST_GLOBAL_ARGS:-} u-exec \"$BIN\" $EXTRA ${RUST_EXTRA_ARGS:-}'; Start-Process -FilePath '$RUST_EXE_WIN' -ArgumentList \$argLine -WorkingDirectory '$RUST_DIR_WIN' -RedirectStandardOutput '$LOG_OUT_WIN' -RedirectStandardError '$LOG_ERR_WIN'" >/dev/null
 
   rust_pid_probe() {
     RUST_PID=$(ps_ "(Get-Process dcload-ip-rs -ErrorAction SilentlyContinue).Id" | tr -d '\r' | head -1)
