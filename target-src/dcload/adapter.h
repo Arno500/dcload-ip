@@ -1,6 +1,15 @@
 #ifndef __ADAPTER_H__
 #define __ADAPTER_H__
 
+#include "hiram.h"
+
+// Build the HIT-0300 LAN Adapter driver alongside the BBA one. Set from the
+// Makefile; the default here is only for a build that does not pass it.
+// Dropping it saves about 2 KB of image -- see the Makefile's size section.
+#ifndef WITH_LAN_ADAPTER
+#define WITH_LAN_ADAPTER 1
+#endif
+
 // Raw receive buffer array size
 // 1514 bytes is not a multiple of 8.
 // Ethernet header (14) + ip header (20) + udp header (8) + command struct (12) = 54 bytes before command->data

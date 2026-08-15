@@ -322,6 +322,38 @@ void PMCR_Stop(unsigned char which);
 // Disable counter(s) (without clearing)
 void PMCR_Disable(unsigned char which);
 
+// Whole seconds spanned by a difference of two counter readings.
+//
+// This exists to keep libgcc's 64-bit divider out of the image. A plain
+// "delta / PMCR_TICKS_PER_SECOND" on a 64-bit value emits a call to
+// __udivdi3, which drags in __udiv_qrnnd_16, __clz and the 256-byte
+// __clz_tab -- about 840 bytes, for two call sites that both want a small
+// second count. dcload's image size is a correctness property, not a
+// nicety (see AGENTS.md 4.6), so 840 bytes of divider is not affordable.
+//
+// The identity used is exact: floor(floor(d / 256) / (D / 256)) ==
+// floor(d / D) for any D that is a multiple of 256, and (d >> 8) is a
+// 32-bit quantity for any delta below 2^40 ticks -- 5497 seconds, far past
+// every wait this loader arms. Above that, saturate: a counter that has run
+// that long has certainly passed whatever timeout the caller is testing.
+//
+// The remaining division is by a compile-time constant, so the compiler
+// turns it into a multiply-high and a shift; no libgcc call is emitted.
+#define PMCR_TICKS_PER_SECOND 200000000U
+
+_Static_assert((PMCR_TICKS_PER_SECOND % 256U) == 0U,
+	"PMCR_TICKS_PER_SECOND must be a multiple of 256 for PMCR_Delta_Seconds");
+
+static inline unsigned int PMCR_Delta_Seconds(unsigned long long int delta)
+{
+	if(delta >> 40)
+	{
+		return 0xffffffffU;
+	}
+
+	return (unsigned int)(delta >> 8) / (PMCR_TICKS_PER_SECOND / 256U);
+}
+
 // TODO TEMP
 unsigned long long int PMCR_RegRead(unsigned char which);
 

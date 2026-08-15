@@ -537,6 +537,7 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	}
 }
 
+#if WITH_MAPLE
 void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
 	char *res;
@@ -562,7 +563,9 @@ void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN + i, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
 	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN + i);
 }
+#endif /* WITH_MAPLE */
 
+#if WITH_PMCR_CMD
 // The 6 performance counter control functions are:
 /*
 	// (I) Clear counter and enable
@@ -761,6 +764,7 @@ void cmd_pmcr(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN + i, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
 	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN + i);
 }
+#endif /* WITH_PMCR_CMD */
 
 /*
 // command_t struct here For reference

@@ -194,6 +194,34 @@ SECTIONS
   . = ALIGN(32 / 8);
   _end = .;
   PROVIDE (end = .);
+
+  /* Large buffers that must NOT live inside the loader image.
+   *
+   * Everything above this point sits between 0x8c004000 and _end, and a
+   * retail title puts a stack in exactly that hole -- Sonic Adventure enters
+   * the GD syscalls with SP = 0x8c00b9d0 and grows down. The gap between
+   * _end and that SP is the whole margin, so a kilobyte of BSS here is a
+   * kilobyte a title's stack no longer has. See AGENTS.md 4.6.
+   *
+   * .hiram is placed at a fixed high-RAM address instead, next to the Maple
+   * DMA buffer maple.c already puts at 0x8cfe8000 (2 KB, so this starts one
+   * page clear of it). NOLOAD keeps it out of dcload.bin -- objcopy -O
+   * binary skips it -- and out of _end, while the symbols stay in the ELF so
+   * scripts/dc-peek.py can still resolve them by name.
+   *
+   * Nothing zeroes this region: dcload-crt0.s clears _edata.._end only. Put
+   * an object here only if it is written before it is read.
+   *
+   * This is outside the `ram` MEMORY region on purpose, so it is not subject
+   * to the region's length and does not trip the overflow ASSERT below. */
+  .hiram 0x8cfe9000 (NOLOAD) :
+  {
+    __hiram_start = .;
+    *(.hiram)
+    *(.hiram.*)
+    __hiram_end = .;
+  }
+
   /* Stabs debugging sections.  */
   .stab 0 : { *(.stab) }
   .stabstr 0 : { *(.stabstr) }

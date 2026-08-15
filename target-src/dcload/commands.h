@@ -24,6 +24,18 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 
 #define COMMAND_LEN  12
 
+// Host-facing extras that a session which is only running a title never uses.
+// Both are set from the Makefile; the defaults here are for a build that does
+// not pass them. Turning one off removes its handler AND its dispatch arm in
+// net.c, so the command is simply not answered -- see the Makefile's size
+// section for why an unused kilobyte is worth removing.
+#ifndef WITH_MAPLE
+#define WITH_MAPLE 1
+#endif
+#ifndef WITH_PMCR_CMD
+#define WITH_PMCR_CMD 1
+#endif
+
 extern unsigned int tool_ip;
 extern unsigned char tool_mac[6];
 extern unsigned short tool_port;
@@ -44,7 +56,11 @@ void cmd_sendbinq(ip_header_t * ip, udp_header_t * udp, command_t * command);
 void cmd_sendbin(ip_header_t * ip, udp_header_t * udp, command_t * command);
 void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command);
 void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command);
+#if WITH_MAPLE
 void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command);
+#endif
+#if WITH_PMCR_CMD
 void cmd_pmcr(ip_header_t * ip, udp_header_t * udp, command_t * command);
+#endif
 
 #endif

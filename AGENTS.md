@@ -27,7 +27,7 @@ UDP:
 Fork of KallistiOS' `dcload-ip`, overhauled by Moopthehedgehog, maintained by
 Mickaël Cardoso (SiZiOUS) and contributors. License **GPLv2** (`COPYING`).
 
-Version is `2.0.3`, in `Makefile.cfg` **only** — both Makefiles consume it as
+Version is `2.0.4`, in `Makefile.cfg` **only** — both Makefiles consume it as
 `-DDCLOAD_VERSION`. (`README.md` still says 2.0.2 and `CHANGES` stops at 2.0.1;
 they lag, `Makefile.cfg` is authoritative.)
 
@@ -189,6 +189,7 @@ relocate or reorder code behind your back:
 | `packet.c/.h` | packet builder/parser; `bswap.h` supplies `ntohl`/`htons`. |
 | `net.c/.h` | ARP/ICMP/UDP glue, adapter detection, `announce_presence()`. |
 | `adapter.c/.h` | abstract BBA / LAN-Adapter driver interface (`bb`). |
+| `hiram.h` | `HIRAM_BUF` — the attribute that puts a buffer in `.hiram` (high RAM) instead of BSS, and the argument for doing so. Read it before adding any large buffer. |
 | `rtl8139.c/.h` | BBA driver, including the RX ring (§4.8). |
 | `lan_adapter.c/.h` | LAN Adapter driver. |
 | `dhcp.c/.h` | IPv4 DHCP client with the retry counter the README explains. |
@@ -202,11 +203,25 @@ relocate or reorder code behind your back:
 
 ### 4.3 Build flags
 
-There is exactly **one** flag in `target-src/dcload/Makefile`:
+`target-src/dcload/Makefile` carries one tracing flag and a block of size
+knobs. The size knobs all buy the same thing — distance under a launched
+title's stack (§4.6) — so they are listed with what they cost:
 
 | Flag | Default | What it does |
 | --- | --- | --- |
 | `GD_TRACE` | `0` | Trace the GD request/answer contract to the host console (`dcload-ip-rs` displays it). **Off by default because each traced event is a full UDP round trip**, which perturbs the very timing you are measuring — with caller tracing on, Sonic Adventure fires ~120 events/s and stops booting. See `cdfs_syscalls.c`. |
+| `DCLOAD_GC_SECTIONS` | `1` | `-ffunction-sections -fdata-sections -Wl,--gc-sections`. No behavioural change; the only symbols it drops today are genuinely dead (`memmove`, `memcmp`, `PMCR_RegRead`, a shadowed `loop_secs_elapsed` global). |
+| `PKT_BUFS_IN_HIRAM` | `1` | Put `raw_pkt_buf` and `raw_current_pkt` (1536 B each) in the `.hiram` NOLOAD section at `0x8cfe9000` instead of BSS. **−3088 B of `_end` (3072 B of buffer plus alignment), more than every other knob combined.** `hiram.h` states the trade. |
+| `WITH_LAN_ADAPTER` | `1` | Build the HIT-0300 LAN Adapter driver. 0 → BBA only, `adapter_detect()` stops probing for it. −2040 B. |
+| `WITH_MAPLE` | `1` | Serve `MAPL` and build `maple.c`. −640 B. |
+| `WITH_PMCR_CMD` | `1` | Serve `PMCR`. Does **not** remove `perfctr.c` — dcload uses counter 1 itself for the DHCP lease and the adapter loop timeouts. −808 B. |
+| `DCLOAD_LTO` | `0` | `-flto`. −1856 B. **Off on purpose**: it inlines across translation units, which changes the depth of the C frame the GD coroutine parks into a 96-long buffer (§4.5), and it makes `lto-wrapper` discard the `-Wa` options so the `*.asm` listings (§6) stop being produced. Neither is checkable at build time — if you turn it on, read `g_gd_park_longs` on a real boot before trusting the build. |
+
+Measured with `_end` from `dcload.map`, one knob at a time from the defaults.
+Stock (everything off, buffers in BSS) is `_end = 0x8c00b588`; the defaults
+above are `0x8c00a558`; `DCLOAD_LTO=1 WITH_LAN_ADAPTER=0 WITH_MAPLE=0
+WITH_PMCR_CMD=0` is `0x8c009068`, which is 10600 B of margin under Sonic
+Adventure's syscall SP against the stock 1096.
 
 One more, a `#define` in `rtl8139.c` rather than the Makefile (override with `-D`):
 
@@ -226,10 +241,11 @@ Pinned by `dcload.x`: `ram (rwx) : ORIGIN = 0x8c004000, LENGTH = 0xb400`.
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` is the `0xdeadbeef` magic, `+8` the syscall trampoline pointer — the ABI the example programs use. |
-| `0x8c00b508` | `_end` (current). The whole loader, code and BSS, is below this. Sonic Adventure enters GD syscalls with `SP = 0x8c00b9d0` and grows *down* — that is the margin §4.6 is about, and it is what any addition spends. |
+| `0x8c00a558` | `_end` (current, default knobs — §4.3). The whole loader, code and BSS, is below this. Sonic Adventure enters GD syscalls with `SP = 0x8c00b9d0` and grows *down* — that is the margin §4.6 is about, and it is what any addition spends. |
 | `0x8c00f400` | `_stack`, **and** the VBR handed to the game, **and** the base of `exception` (`-Ttext=0x8c00f400`), **and the BIOS VBR on this machine**. |
 | `0x8c010000` | the game's load address. `exception.bin` (2048 B) ends before it; total footprint `0xc000`, exactly the hole between the BIOS syscall area and 1ST_READ.BIN. |
-| `0x8cfe8000` | Maple DMA buffer, deliberately outside the loader image (§4.6). |
+| `0x8cfe8000` | Maple DMA buffer (2 KB), deliberately outside the loader image (§4.6). Hard-coded in `maple.c`. |
+| `0x8cfe9000` | `.hiram` — the two 1536-byte packet buffers, also outside the image. Placed by `dcload.x`, `NOLOAD`, so it costs nothing in `dcload.bin` and nothing in `_end`; `dcload-crt0.s` zeroes it explicitly because BSS zeroing no longer covers it. Empty when `PKT_BUFS_IN_HIRAM=0`. Put a new large buffer here — mark it `HIRAM_BUF`, see `hiram.h` — rather than in BSS. |
 | `0x8cf0c000` | post-mortem block (`PM_BASE`, `cdfs_syscalls.c`). **Advisory only** — at the low base nothing caps a title's allocator there, and Sonic Adventure re-claims it. The caveat is written at the definition. |
 
 Two link-time asserts guard this, and they are the whole safety net:
@@ -333,15 +349,37 @@ Adventure boot and play (1624 reads served, no reset):
    was the buffer the SP actually landed in. That address is isoldr's own
    free-high-RAM heuristic.
 
+A later pass took `_end` from `0x8c00b588` to `0x8c00a558` at default settings
+— margin 1096 B → 5240 B — with no feature removed. In order of weight:
+
+3. **Both packet buffers left BSS** for `.hiram` at `0x8cfe9000` (§4.4),
+   −3088 B. They were the last large objects in the image, and BSS is the part
+   of the image *closest* to a descending stack.
+4. **The 64-bit division went away** (`PMCR_Delta_Seconds`, `perfctr.h`), −928 B.
+   Two call sites divided a perf-counter delta by 200000000 to get seconds;
+   at `-Os` GCC emitted a call to `__udivdi3`, which pulled in
+   `__udiv_qrnnd_16`, `__clz` and the 256-byte `__clz_tab`. **Watch for this
+   whenever a `long long` meets a `/` or `%`** — it is the one construct that
+   can add most of a kilobyte to this image from a single line, and nothing in
+   the build warns about it. Check with `sh-elf-nm dcload | grep libgcc`-ish
+   symbol names, or `grep libgcc dcload.map`.
+5. **`--gc-sections`**, −160 B — and it is also the check that tells you when
+   something has become dead.
+
+The remaining knobs (§4.3) trade features for another ~4.5 KB.
+
 So, when adding anything to the DC side:
 
 - **Footprint is a correctness property, not a nicety.** Check `_end` in
   `dcload.map` after any change that adds state. isoldr's network build is
-  13 KB; we are ~25 KB and filling a hole a title expects to own.
-- Prefer putting large buffers **outside the image** (high RAM) over growing
-  BSS.
+  13 KB; we are ~21 KB of image and filling a hole a title expects to own.
+- Prefer putting large buffers **outside the image** — mark them `HIRAM_BUF`
+  (`hiram.h`) and they land in `.hiram` — over growing BSS.
 - Keep small hot state — `bb` above all — as far as possible from where a
-  title's stack roams.
+  title's stack roams. Note this is **not** where `bb` sits today: it is the
+  last object in BSS, so it is the first thing a descending stack reaches.
+  That is inherited link order, not a decision; ordering BSS deliberately is
+  free and has never been done.
 - A guard is cheap: latching the SP seen at syscall entry and counting it when
   it falls inside `[0x8c004000, _end)` would have found this in minutes.
 
@@ -512,6 +550,10 @@ the copy cannot go stale.
   `s` symbols). These are build output — never hand-edit them; `make clean`
   removes them. Some are large (`commands.asm` ~69 KB, `syscalls.asm` ~52 KB,
   `dcload.asm` ~54 KB, `cdfs_syscalls.asm` ~46 KB); ignore their size.
+  **`DCLOAD_LTO=1` suppresses them** — `lto-wrapper` discards `-Wa` options —
+  so the Makefile stops asking for them in that configuration rather than
+  emitting a warning per file. If the listings are what you came for, build
+  without LTO.
 - `.gitignore` covers `*.o *.bin *.lzo *.srec *.exe *.elf *.asm *.map` plus the
   example programs and the DC ELF, at the top level only — so intermediates do
   get committed from subdirectories sometimes.
@@ -767,6 +809,19 @@ result, prove the instrument still detects something.
     the CPU context is not cleared on the way. To tell a null jump from an
     exception, check for flycast's `[BBA-DIAG]` line in `Do_Exception` (verify
     the string is in the shipped binary, not just in the source).
+15. **Dividing a `long long`.** One `/` on a 64-bit value costs ~840 bytes of
+    libgcc (`__udivdi3` + `__udiv_qrnnd_16` + `__clz` + a 256-byte
+    `__clz_tab`), silently, in an image where §4.6 says bytes are correctness.
+    `-Os` prefers the libcall even when the divisor is a constant. Use
+    `PMCR_Delta_Seconds()` for counter deltas, or shift the value into 32 bits
+    first; `grep libgcc target-src/dcload/dcload.map` says whether anything is
+    pulling it back in.
+16. **Putting a new large buffer in BSS.** Mark it `HIRAM_BUF` (`hiram.h`) and
+    it costs nothing in `_end`. A `HIRAM_BUF` object is zeroed by
+    `dcload-crt0.s` like BSS, but it is **not** covered by 1st_read's
+    `0x8c004000`–`0x8c010000` zero-fill, and it is in RAM a title's allocator
+    could conceivably claim — put a buffer there, not a flag someone else
+    writes.
 
 ## 15. Where to look first
 
@@ -790,7 +845,8 @@ result, prove the instrument still detects something.
     was the actual stutter (§16).
 - **Base address / memory map** → `dcload.x`, `target-src/1st_read/loader.s`,
   `dcload-crt0.s`, `go.s`, `exception.S`, `cdfs_redir.s`, `commands.c`,
-  `cdfs_syscalls.c` (`PM_BASE`), `maple.c` (buffer address),
+  `cdfs_syscalls.c` (`PM_BASE`), `maple.c` (buffer address), `hiram.h` +
+  `dcload.x`'s `.hiram` (the packet buffers),
   `target-src/dcload/Makefile` (`exception -Ttext=`), plus `scripts/dc-peek.py`.
   Substitute on code lines only — the prose in comments records measurements
   made at older bases, and rewriting it would falsify the record. The link step

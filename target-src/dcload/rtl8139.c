@@ -1447,7 +1447,7 @@ void rtl_bb_loop(int is_main_loop)
 				start = now;
 				g_pmcr_backwards++;
 			}
-			unsigned int loop_secs_elapsed = (unsigned int)((now - start)/200000000);
+			unsigned int loop_secs_elapsed = PMCR_Delta_Seconds(now - start);
 			if(prev_loop_elapsed != loop_secs_elapsed)
 			{
 				if(dhcp_attempts > 1) // Don't show a counter yet if it's the first attempt

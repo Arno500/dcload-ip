@@ -719,7 +719,7 @@ void la_bb_loop(int is_main_loop)
 		if(timeout_loop > 0)
 		{
 			PMCR_Read(DCLOAD_PMCR, loop_measure);
-			unsigned int loop_secs_elapsed = (unsigned int)((*(unsigned long long int*)loop_measure - *(unsigned long long int*)loop_start)/200000000);
+			unsigned int loop_secs_elapsed = PMCR_Delta_Seconds(*(unsigned long long int*)loop_measure - *(unsigned long long int*)loop_start);
 			if(prev_loop_elapsed != loop_secs_elapsed)
 			{
 				if(dhcp_attempts > 1) // Don't show a counter yet if it's the first attempt

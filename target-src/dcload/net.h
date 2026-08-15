@@ -1,6 +1,8 @@
 #ifndef __NET_H__
 #define __NET_H__
 
+#include "hiram.h"
+
 // Raw transmit buffer array size
 // 1514 bytes is not a multiple of 8.
 // Ethernet header (14) + ip header (20) + udp header (8) + command struct (12) = 54 bytes before command->data

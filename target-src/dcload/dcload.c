@@ -766,7 +766,9 @@ int main(void)
 	cdfs_redir_save(); /* will only save value once */
 	cdfs_redir_disable();
 
+#if WITH_MAPLE
 	maple_init();
+#endif
 
 	if (!booted) {
 		disp_info();

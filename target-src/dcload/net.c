@@ -14,8 +14,10 @@ static void process_mine(unsigned char *pkt);
 
 const unsigned char broadcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
-// Packet transmit buffer
-__attribute__((aligned(32))) unsigned char raw_pkt_buf[RAW_TX_PKT_BUF_SIZE]; // Here's a global array. Global packet transmit buffer.
+// Packet transmit buffer. HIRAM_BUF keeps its 1536 bytes out of the loader
+// image, where they would otherwise sit directly in the path of a title's
+// stack -- see hiram.h and AGENTS.md 4.6.
+HIRAM_BUF __attribute__((aligned(32))) unsigned char raw_pkt_buf[RAW_TX_PKT_BUF_SIZE]; // Here's a global array. Global packet transmit buffer.
 // Need to offset the packet by 2 for the command->data after headers to always be aligned to 8 bytes
 // The performance gains are well worth the 2 wasted bytes.
 __attribute__((aligned(2))) unsigned char * pkt_buf = &(raw_pkt_buf[2]);
@@ -262,19 +264,23 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		// (except reboot)
 		make_ether(ether->src, ether->dest, (ether_header_t *)pkt_buf);
 
+#if WITH_MAPLE
 		// Next likely to be called most often (e.g. during maple <--> PC comms)
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_MAPLE, 4/4)))
 		{
 			cmd_maple(ip, udp, command);
 			pkt_match_id = 0;
 		}
+#endif
 
+#if WITH_PMCR_CMD
 		// Next likely to be called most often (e.g. using PC to do perf counting)
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_PMCR, 4/4)))
 		{
 			cmd_pmcr(ip, udp, command);
 			pkt_match_id = 0;
 		}
+#endif
 
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_DONEBIN, 4/4)))
 		{

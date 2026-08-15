@@ -9,6 +9,8 @@
 
 	.extern _edata
 	.extern _end
+	.extern __hiram_start
+	.extern __hiram_end
 	.extern _stack
 	.extern _main
 
@@ -119,6 +121,29 @@ start_l:
 	bt	start_l
 no_bss:
 
+! zero out .hiram
+!
+! Those buffers used to live in BSS, so every user of them was written against
+! a zeroed buffer. They sit outside _edata.._end now only because keeping them
+! out of the image is what gives a launched title's stack its margin (see
+! dcload.x and hiram.h) -- that is a placement decision, and it must not
+! quietly become a semantic one. Cost: eight instructions, once, at boot.
+!
+! Empty when the buffers are built into BSS instead (PKT_BUFS_IN_HIRAM=0):
+! __hiram_start == __hiram_end and this falls straight through.
+	mov.l	hiram_start_k,r0
+	mov.l	hiram_end_k,r1
+	cmp/eq r0,r1
+	bt	no_hiram
+	mov	#0,r2
+
+hiram_l:
+	mov.l	r2,@r0
+	add	#4,r0
+	cmp/hi r0,r1
+	bt	hiram_l
+no_hiram:
+
 ! Treat denormals as 0, round to nearest, disable FPU exceptions, FR = PR = SZ = 0
 	mov.l set_fpscr_k, r1
 	mov #4,r4
@@ -152,6 +177,10 @@ edata_k:
 	.long	_edata
 end_k:
 	.long	_end
+hiram_start_k:
+	.long	__hiram_start
+hiram_end_k:
+	.long	__hiram_end
 main_k:
 	.long	_main
 setup_cache_k:
