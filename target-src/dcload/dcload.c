@@ -83,7 +83,8 @@ static volatile unsigned char dont_renew = 0;
 static char *mac_string = "de:ad:be:ef:ba:be";
 static char *ip_string = "000.000.000.000"; // Reserve this much memory for max-size IP address
 
-static const char *waiting_string = "Waiting for IP..."; // Waiting for IP indicator. 15 visible characters to match IP address string's visible 15 characters
+static const char *warm_string = " (Warm Start)"; // Adapter adopted, not re-initialized
+static const char *waiting_string = "Waiting for IP...";// Waiting for IP indicator. 15 visible characters to match IP address string's visible 15 characters
 static const char *dhcp_mode_string = " (DHCP Mode)"; // Indicator that DHCP is active
 static const char *dhcp_timeout_string = " (DHCP Timed Out!)"; // DHCP timeout indicator
 static const char *dhcp_lease_string = "DHCP Lease Time (sec): "; // DHCP lease time
@@ -273,6 +274,12 @@ void disp_info(void)
 
 	ip_to_string(our_ip, ip_string);
 	draw_string(30, 126, ip_string, STR_COLOR);
+	// Say which path ran. Without this, the fast case and the slow case look
+	// identical on screen and the only difference is how long you waited.
+	if(g_warm_start)
+	{
+		draw_string(210, 126, warm_string, STR_COLOR);
+	}
 
 	booted = 1;
 }
@@ -735,6 +742,23 @@ int main(void)
 
 	for(start = 0; start < 6; start++)
 		uchar_to_string_hex(bb->mac[start], mac_string + start*3);
+
+	/*
+	 * A warm-started adapter hands us the address the previous instance was
+	 * answering on. Take it BEFORE set_ip_from_file(), which keeps an address
+	 * that is already set and only falls back to DREAMCAST_IP otherwise. That
+	 * is what stops a chainloaded instance from sitting at "Waiting for IP..."
+	 * re-running DHCP over a link that never dropped.
+	 *
+	 * Note what this does NOT carry: the lease. dhcp_lease_time is 0 in a
+	 * fresh image, so the renewal branch of set_ip_dhcp() stays out of the
+	 * way and the inherited address is held like a static one, for as long as
+	 * this instance runs.
+	 */
+	if (g_warm_ip)
+	{
+		our_ip = g_warm_ip;
+	}
 
 	set_ip_from_file();
 

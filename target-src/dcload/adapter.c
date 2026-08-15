@@ -34,3 +34,11 @@ int adapter_detect() {
 
 	return 0;
 }
+
+void adapter_handoff_save(unsigned int ip)
+{
+	if (bb == &adapter_bba)
+	{
+		rtl_handoff_save(ip);
+	}
+}

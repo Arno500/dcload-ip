@@ -46,9 +46,68 @@ static volatile unsigned char rtl_link_up = 0;
 static volatile unsigned char rtl_is_copying = 0;
 
 static void rtl_reset(void);
+static void rtl_read_mac(void);
 static void rtl_init(void);
 static void pktcpy(unsigned char *dest, unsigned char *src, unsigned int n);
 static int rtl_bb_rx(void);
+
+/*
+ * WARM START: ADOPT AN ADAPTER A PREVIOUS DCLOAD ALREADY BROUGHT UP.
+ *
+ * Chainloading dcload from dcload re-runs adapter_detect(), and the cold path
+ * is brutal: rtl_bb_detect() powers GAPS DOWN, rtl_bb_init() powers it back up,
+ * clears the whole 32 KB SRAM, soft-resets the chip twice and then RESTARTS
+ * AUTO-NEGOTIATION (BMCR 0x9200). The link therefore drops and comes back,
+ * which costs a second or two on its own -- and much more when the switch
+ * takes its time forwarding again, because every link-change event that
+ * arrives before auto-negotiation has completed sends rtl_bb_loop() through
+ * the PHY-reset branch, which restarts auto-negotiation ONE MORE TIME. That
+ * loop is what makes a second instance occasionally take a very long time to
+ * become usable, and it is why its DHCP DISCOVERs go out into a link that is
+ * not forwarding yet: the on-screen state stays "Waiting for IP..." while
+ * uploads work anyway (commands are matched on the MAC, and our_ip is then
+ * taken from the packet's own destination -- see cmd_loadbin()).
+ *
+ * None of that work is needed when the adapter is ALREADY running: the
+ * previous instance left the chip configured, the link negotiated and the
+ * switch forwarding. So look at the hardware before touching it, and if it
+ * still carries the exact configuration rtl_init() writes, adopt it instead.
+ *
+ * The check has to happen in rtl_bb_detect(), before the "GAPS off" write --
+ * once that has gone out there is no way back except the full cold init.
+ */
+#ifndef RTL_WARM_START
+#define RTL_WARM_START 1
+#endif
+
+#if RTL_WARM_START
+static int rtl_warm_usable(void);
+static void rtl_warm_adopt(void);
+#endif
+
+/*
+ * Where the outgoing instance leaves its IP address for the incoming one.
+ *
+ * This lives in the BBA's own 32 KB SRAM, not in Dreamcast RAM, and that is
+ * the point: a chainload usually goes through a loader that zero-fills the
+ * region dcload lives in, and crt0 zeroes BSS on top of that, so no RAM
+ * address is safe by construction. The adapter's SRAM is untouched by any of
+ * it, and it is wiped by exactly the events that must invalidate the handoff
+ * anyway -- a cold rtl_bb_init() (which memsets all 32 KB) and a power cycle.
+ *
+ * Offset 0x5000 is in the gap the driver leaves: the RX ring is 16 KB + 16 at
+ * offset 0 and may spill ~1.5 KB past its end (nowrap), so it ends by 0x4600,
+ * and the four TX descriptors start at 0x6000.
+ */
+#define RTL_HANDOFF_OFF   0x5000
+#define RTL_HANDOFF_MAGIC 0x44435753U	/* 'DCWS' */
+
+/* Non-zero when this instance adopted a running adapter instead of
+ * initialising one. */
+unsigned char g_warm_start = 0;
+/* The address the previous instance was using, 0 if there was none to
+ * inherit. Consumed by main() before set_ip_from_file(). */
+unsigned int g_warm_ip = 0;
 
 // 8, 16, and 32 bit access to G2 addresses
 static vuc * const g28 = REGC(0xa1000000);
@@ -84,6 +143,16 @@ int rtl_bb_detect(void)
 		global_bg_color = BBA_BG_COLOR;
 		installed_adapter = BBA_MODEL;
 
+#if RTL_WARM_START
+		/* Look BEFORE turning anything off -- the two writes below are the
+		 * point of no return. */
+		if (rtl_warm_usable())
+		{
+			g_warm_start = 1;
+			return 0;
+		}
+#endif
+
 		g232[0x1414/4] = 0x00000000; // Set this to 0 first thing
 		g232[0x1418/4] = 0x5a14a500; // Ensure GAPS is off
 
@@ -104,12 +173,13 @@ static void rtl_reset(void)
 	while (nic8[RT_CHIPCMD] & RT_CMD_RESET);
 }
 
-static void rtl_init(void)
+/* Read MAC address */
+// Don't need to do anything with the eeprom if we're just reading it, so this
+// costs nothing and needs no reset -- which is what lets the warm path share it.
+static void rtl_read_mac(void)
 {
 	unsigned int tmp;
 
-	/* Read MAC address */
-	// Don't need to do anything with the eeprom if we're just reading it.
 	tmp = nic32[RT_IDR0];
 	rtl.mac[0] = tmp & 0xff;
 	rtl.mac[1] = (tmp >> 8) & 0xff;
@@ -119,6 +189,11 @@ static void rtl_init(void)
 	rtl.mac[4] = tmp & 0xff;
 	rtl.mac[5] = (tmp >> 8) & 0xff;
 	memcpy(adapter_bba.mac, rtl.mac, 6);
+}
+
+static void rtl_init(void)
+{
+	rtl_read_mac();
 
 	/* Soft-reset the chip to clear any garbage from power on */
 	rtl_reset();
@@ -385,9 +460,148 @@ static void rtl_init(void)
 	nic32[RT_RXCONFIG/4] |= 0x0000000a;
 }
 
+/*
+ * IS THIS ADAPTER STILL THE ONE A PREVIOUS DCLOAD SET UP?
+ *
+ * Every value tested here is one rtl_init() writes and nothing else does. A
+ * chip that has been reset -- and a chip that has just been powered on, which
+ * is the same thing as far as its registers are concerned -- reads back zero
+ * for the buffer addresses, the interrupt mask and the command register, so a
+ * cold adapter cannot pass this by accident. The point is not to be clever
+ * about it: anything that does not match exactly falls through to the full
+ * cold init, which is always correct and merely slower.
+ *
+ * Only the RXCONFIG accept bits are excused, because cmd_execute() calls
+ * bb->stop() (which clears them) on its way out -- reception being off is the
+ * NORMAL state to inherit, and rtl_warm_adopt() turns it back on.
+ */
+#if RTL_WARM_START
+static int rtl_warm_usable(void)
+{
+	unsigned int i;
+
+	/* GAPS still powered and still mapping the SRAM where we left it. */
+	if (!(g232[0x1418/4] & 1))
+		return 0;
+	if (g232[0x1428/4] != 0x01840000)
+		return 0;
+
+	/* The chip's buffers, exactly as rtl_init() programmed them. */
+	if (nic32[RT_RXBUF/4] != 0x01840000)
+		return 0;
+	for (i = 0; i < 4; i++)
+	{
+		if (nic32[RT_TXADDR0/4 + i] != (0x01846000 + i*0x800))
+			return 0;
+	}
+
+	/* Ring geometry, DMA burst and IFG. TXCONFIG's other bits are the
+	 * hardware revision ID, which is read-only -- mask down to what we set. */
+	if ((nic32[RT_RXCONFIG/4] & ~0x0000000fU) != 0x00004980)
+		return 0;
+	if ((nic32[RT_TXCONFIG/4] & 0x03000700U) != 0x03000100)
+		return 0;
+
+	/* The RX status bits must still be observable, and RX/TX still enabled. */
+	if (nic16[RT_INTRMASK/2] != RT_INT_RX_ACK)
+		return 0;
+	if ((nic8[RT_CHIPCMD] & (RT_CMD_RX_ENABLE | RT_CMD_TX_ENABLE))
+		!= (RT_CMD_RX_ENABLE | RT_CMD_TX_ENABLE))
+		return 0;
+
+	/*
+	 * And the link must actually be up and negotiated -- not renegotiating it
+	 * is the whole point. BMSR's link bit is latched low (it reports a link
+	 * that has dropped SINCE the last read), so read it twice and believe the
+	 * second one.
+	 */
+	(void)nic16[RT_MII_BMSR/2];
+	if ((nic16[RT_MII_BMSR/2] & 0x24) != 0x24)
+		return 0;
+
+	return 1;
+}
+
+/*
+ * Take over a running adapter. Everything here is state that lived in the
+ * PREVIOUS instance's memory and is therefore gone; the chip itself needs
+ * nothing.
+ */
+static void rtl_warm_adopt(void)
+{
+	unsigned int cbr;
+
+	rtl_read_mac();
+
+	/* Inherit the previous instance's address, if it left one. */
+	if ((mem32[RTL_HANDOFF_OFF/4] == RTL_HANDOFF_MAGIC)
+		&& (mem32[RTL_HANDOFF_OFF/4 + 1] == ~mem32[RTL_HANDOFF_OFF/4 + 2]))
+	{
+		g_warm_ip = mem32[RTL_HANDOFF_OFF/4 + 1];
+	}
+
+	/*
+	 * DISCARD WHAT IS QUEUED IN THE RING -- IT IS NOT ADDRESSED TO US.
+	 *
+	 * The previous instance's read pointer is gone, so the alternative is to
+	 * recover it from CAPR and process the backlog. Do not: the host
+	 * retransmits a command whose acknowledgement it never saw, so the frame
+	 * most likely to be sitting there is a duplicate of the very EXEC that
+	 * started us -- and cmd_execute() runs it, because `running` is 0 in a
+	 * fresh image. That is an infinite reload loop. Jumping CAPR to the chip's
+	 * own write pointer throws the backlog away and leaves both sides agreeing
+	 * on an empty ring.
+	 */
+	cbr = nic16[RT_RXBUFHEAD/2];
+	rtl.cur_rx = (unsigned short)((cbr & (RX_BUFFER_LEN - 1)) & ~3U);
+	nic16[RT_RXBUFTAIL/2] = (unsigned short)((rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1));
+	rtl.cur_tx = 0; /* rtl_bb_tx() waits on OWN, so any descriptor is safe to start from */
+
+	/* Conditions raised during someone else's session are not ours to act on. */
+	nic16[RT_INTRSTATUS/2] = 0xffff;
+	nic32[RT_RXMISSED/4] = 0;
+
+	/* Undo the bb->stop() cmd_execute() did on the way out. This is the one
+	 * line of rtl_init() a warm start genuinely needs. */
+	nic32[RT_RXCONFIG/4] |= 0x0000000a;
+}
+#endif /* RTL_WARM_START */
+
+/*
+ * Leave our address where the next instance can find it (see the handoff
+ * comment at the top of this file). Called just before a program is started,
+ * because that is the only moment another dcload can be about to take over.
+ * Writing it costs three longwords and means nothing to a game.
+ */
+void rtl_handoff_save(unsigned int ip)
+{
+	/* Nothing worth handing over, and nothing that would survive being
+	 * inherited: 0.x.x.x is DHCP-pending and 255.255.255.255 is DHCP-failed. */
+	if (((ip & 0xff000000U) == 0) || (ip == 0xffffffffU))
+	{
+		return;
+	}
+
+	// According to KOS source we gotta wait for G2 FIFO to be empty by checking
+	// this bit before reading from/writing to G2. So do that here.
+	while((*(volatile unsigned int*)0xa05f688c) & 0x20U);
+
+	mem32[RTL_HANDOFF_OFF/4 + 1] = ip;
+	mem32[RTL_HANDOFF_OFF/4 + 2] = ~ip;
+	mem32[RTL_HANDOFF_OFF/4] = RTL_HANDOFF_MAGIC; /* magic last: it validates the pair */
+}
+
 int rtl_bb_init(void)
 {
 	int i;
+
+#if RTL_WARM_START
+	if (g_warm_start)
+	{
+		rtl_warm_adopt();
+		return 0;
+	}
+#endif
 
 	// The BBA uses the range 0x01840000-0x0184ffff for TX and RX (with usage above
 	// 0x01848000 apparently for GAPS DMA), plus the 2 bytes at 0x0183fffc for... something
@@ -938,8 +1152,14 @@ void rtl_bb_loop(int is_main_loop)
 			disp_info();
 		}
 
-		// Need to wait for a link change before it's OK to do anything
-		rtl_link_up = 0;
+		/*
+		 * Need to wait for a link change before it's OK to do anything --
+		 * EXCEPT on a warm start, where the link never went down and no such
+		 * event is ever coming. rtl_warm_usable() has already read BMSR and
+		 * required both link and auto-negotiation, so the answer is known.
+		 * Waiting anyway would gate set_ip_dhcp() forever.
+		 */
+		rtl_link_up = g_warm_start;
 	}
 
 	if (timeout_loop > 0)

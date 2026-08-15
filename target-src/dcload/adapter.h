@@ -51,6 +51,19 @@ typedef struct {
 // Detect which adapter we are using and init our structs.
 int adapter_detect();
 
+/*
+ * Hand the current network state to whatever is about to be started, so that a
+ * chainloaded dcload can adopt the adapter instead of re-initialising it.
+ * BBA only; a no-op on the LAN Adapter, which has nowhere to put it.
+ * See the warm-start comment at the top of rtl8139.c.
+ */
+void adapter_handoff_save(unsigned int ip);
+
+/* Non-zero when this instance adopted an already-running adapter, and the
+ * address it inherited from the previous instance (0 if none). */
+extern unsigned char g_warm_start;
+extern unsigned int g_warm_ip;
+
 // The configured adapter, to be used in all other funcs.
 extern adapter_t * bb;
 extern adapter_t adapter_la;

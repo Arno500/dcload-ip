@@ -131,6 +131,11 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 		if (cmd_size>>1)
 			cdfs_redir_enable();
 
+		/* If what we are starting turns out to be another dcload, this is the
+		 * only chance to tell it what address we were answering on -- see the
+		 * warm-start comment in rtl8139.c. A game will simply never look. */
+		adapter_handoff_save(our_ip);
+
 		running = 1;
 
 //		CacheBlockPurge((void*)0x0c004000, 1536);

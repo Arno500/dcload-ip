@@ -36,8 +36,8 @@
 // https://www.iana.org/assignments/bootp-dhcp-parameters/bootp-dhcp-parameters.xhtml#message-type-53
 // Some of them are implemented in dhcp.h by virtue of KOS.
 
-#define DHCP_DEST_PORT 67
-#define DHCP_SOURCE_PORT 68
+// DHCP_DEST_PORT (67, the server) and DHCP_SOURCE_PORT (68, us) live in dhcp.h
+// now -- net.c needs them to tell a DHCP reply from any other UDP datagram.
 
 // DHCP Discover & Request packets are 342 bytes
 // Old versions of Windows apparently used 576-byte frames, but we ain't old Windows!
@@ -61,6 +61,14 @@ static uint32 kos_net_dhcp_get_32bit(dhcp_pkt_t *pkt, uint8 opt, int len); // Re
 static unsigned int dhcpoffer_server_ip_from_pkt = 0; // LE
 static unsigned int dhcpoffer_ip_from_pkt = 0; // LE
 static unsigned int dhcpoffer_xid = 0; // BE
+/* The transaction ID we last put on the wire, exactly as it appears in the
+ * packet (BE). Kept because a reply cannot be recognised as ours otherwise --
+ * the ID used to be generated inside kos_net_dhcp_fill_options() and thrown
+ * away. See handle_dhcp_reply(). */
+static unsigned int dhcp_my_xid = 0; // BE
+
+unsigned int g_dhcp_replies = 0;
+unsigned int g_dhcp_not_ours = 0;
 
 volatile unsigned int dhcp_lease_time = 0; // LE
 static unsigned int renewal_increment = 0;
@@ -156,7 +164,46 @@ static void build_send_dhcp_packet(unsigned char kind)
 // Steps 2 & 4 are handled here, and this is called from net.c
 int handle_dhcp_reply(unsigned char *routersrcmac, dhcp_pkt_t* pkt_data, unsigned short len)
 {
-	int msg_type = kos_net_dhcp_get_message_type(pkt_data, len);
+	int msg_type;
+
+	g_dhcp_replies++;
+
+	/*
+	 * IS THIS REPLY EVEN ADDRESSED TO US?
+	 *
+	 * It used to be enough that a datagram carried BOOTREPLY, and the OFFER
+	 * branch below then adopted whatever it found -- server address, offered
+	 * address, AND transaction ID. On a real network that is a race, because
+	 * DHCP replies are frequently BROADCAST and the BBA is configured to
+	 * accept broadcasts: any other machine on the LAN completing a lease while
+	 * the Dreamcast is waiting hands us ITS offer. dcload then requests an
+	 * address belonging to somebody else, under somebody else's transaction
+	 * ID, and the ACK it finally gets for its own request is REJECTED by the
+	 * xid test further down. Nothing escapes the wait loop, so the whole
+	 * retry counter has to expire before another DISCOVER goes out -- which is
+	 * exactly the symptom: replies arrive, are visibly ignored, and only a
+	 * later attempt (that happened to be quiet) succeeds.
+	 *
+	 * The two tests below are the standard ones (RFC 2131 s4.4.1) and they are
+	 * cheap. xid alone would nearly do it; chaddr makes it decisive, because a
+	 * server echoes our own hardware address back and nobody else's reply can.
+	 *
+	 * A rejected reply deliberately returns -1: it must NOT set escape_loop in
+	 * process_udp(), so the wait continues and the real reply -- which is
+	 * usually already on its way -- is taken the moment it lands.
+	 */
+	if(pkt_data->xid != dhcp_my_xid)
+	{
+		g_dhcp_not_ours++;
+		return -1;
+	}
+	if(memcmp_16bit_eq(pkt_data->chaddr, bb->mac, 6/2))
+	{
+		g_dhcp_not_ours++;
+		return -1;
+	}
+
+	msg_type = kos_net_dhcp_get_message_type(pkt_data, len);
 
 	if(msg_type == DHCP_MSG_DHCPOFFER) // DHCP OFFER is 342 bytes
 	{
@@ -424,6 +471,10 @@ static int kos_net_dhcp_fill_options(unsigned char *bbmac, dhcp_pkt_t *req, uint
 
 			reqip = our_ip;
 		}
+
+		/* Remember what we are about to ask under, for handle_dhcp_reply().
+		 * All three branches above have just set req->xid. */
+		dhcp_my_xid = req->xid;
 
 		memcpy(req->chaddr, bbmac, DHCP_HLEN_ETHERNET);
     //memset(req->chaddr + DHCP_HLEN_ETHERNET, 0, sizeof(req->chaddr) - DHCP_HLEN_ETHERNET);

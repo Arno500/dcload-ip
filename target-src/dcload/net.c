@@ -218,8 +218,17 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 	g_udp_ok++;
 
 	// Handle receipt of DHCP packets that are directed to this system
+	/*
+	 * PORTS FIRST. A BOOTREPLY byte where the payload happens to start is not
+	 * evidence of anything -- broadcast chatter on a home LAN (NetBIOS, SSDP,
+	 * mDNS) reaches us too, and every one of those datagrams used to be run
+	 * through the DHCP option parser. A reply from a DHCP server always comes
+	 * from 67 and lands on 68; nothing else does.
+	 */
 	dhcp_pkt_t *udp_pkt_data = (dhcp_pkt_t*)udp->data;
-	if(__builtin_expect(udp_pkt_data->op == DHCP_OP_BOOTREPLY, 0)) // DHCP ACK or DHCP OFFER
+	if(__builtin_expect((ntohs(udp->dest) == DHCP_SOURCE_PORT)
+		&& (ntohs(udp->src) == DHCP_DEST_PORT)
+		&& (udp_pkt_data->op == DHCP_OP_BOOTREPLY), 0)) // DHCP ACK or DHCP OFFER
 	{
 		if(!handle_dhcp_reply(ether->src, udp_pkt_data, udp_data_length)) // -8 because udp->length includes 8-byte udp header
 		{ // -1 is true in C

@@ -208,6 +208,12 @@ There is exactly **one** flag in `target-src/dcload/Makefile`:
 | --- | --- | --- |
 | `GD_TRACE` | `0` | Trace the GD request/answer contract to the host console (`dcload-ip-rs` displays it). **Off by default because each traced event is a full UDP round trip**, which perturbs the very timing you are measuring — with caller tracing on, Sonic Adventure fires ~120 events/s and stops booting. See `cdfs_syscalls.c`. |
 
+One more, a `#define` in `rtl8139.c` rather than the Makefile (override with `-D`):
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `RTL_WARM_START` | `1` | Adopt a BBA a previous dcload already brought up instead of re-initialising it (§4.9). Set to 0 to always take the cold path; costs ~512 B of image. |
+
 `EXCEPTION_SECONDS`, `DREAMCAST_IP` and `VERSION` reach the compile from
 `Makefile.cfg`. Everything else that used to be a Makefile flag is now a
 constant in `cdfs_syscalls.c` (§4.5) — the `%.o` rules depend on both Makefiles,
@@ -220,7 +226,7 @@ Pinned by `dcload.x`: `ram (rwx) : ORIGIN = 0x8c004000, LENGTH = 0xb400`.
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` is the `0xdeadbeef` magic, `+8` the syscall trampoline pointer — the ABI the example programs use. |
-| `0x8c00b2a8` | `_end` (current). The whole loader, code and BSS, is below this. |
+| `0x8c00b508` | `_end` (current). The whole loader, code and BSS, is below this. Sonic Adventure enters GD syscalls with `SP = 0x8c00b9d0` and grows *down* — that is the margin §4.6 is about, and it is what any addition spends. |
 | `0x8c00f400` | `_stack`, **and** the VBR handed to the game, **and** the base of `exception` (`-Ttext=0x8c00f400`), **and the BIOS VBR on this machine**. |
 | `0x8c010000` | the game's load address. `exception.bin` (2048 B) ends before it; total footprint `0xc000`, exactly the hole between the BIOS syscall area and 1ST_READ.BIN. |
 | `0x8cfe8000` | Maple DMA buffer, deliberately outside the loader image (§4.6). |
@@ -394,6 +400,97 @@ arrives. Measured: the poll loop fell from ~45000 iterations per 0.3 s to
 **one** per 0.26 s while frames froze — dcload nominally in `bb->loop()` but
 never looking at the ring again. Both waits are now capped by
 `RTL_LINK_SPIN_LIMIT`.
+
+### 4.9 Warm start — chainloading dcload from dcload
+
+Uploading a new dcload from a running one and `EXEC`ing it re-runs
+`adapter_detect()`, and the cold path is **not** a formality: `rtl_bb_detect()`
+powers GAPS down, `rtl_bb_init()` powers it back up, clears the 32 KB SRAM,
+soft-resets the chip twice and **restarts auto-negotiation** (`BMCR 0x9200`).
+The link drops and comes back, which costs seconds by itself — and much more
+when a link-change event lands before auto-negotiation has finished, because
+`rtl_bb_loop()`'s PHY-reset branch then restarts auto-negotiation *again*. That
+is the second instance that "sometimes takes very long", sends its DHCP
+DISCOVERs into a link that is not forwarding yet, and sits on
+`Waiting for IP...` while uploads work anyway (commands are matched on the
+**MAC**, and `our_ip` is then taken from the packet's own destination — see
+`cmd_loadbin()`; that is also why the host can still reach a DC that never got
+a lease).
+
+So dcload now looks at the adapter before touching it:
+
+- **`rtl_warm_usable()` runs inside `rtl_bb_detect()`, before the "GAPS off"
+  write** — after that write the only way back is the full cold init. It
+  compares GAPS enable/SRAM base, `RXBUF`, all four `TXADDR`, `RXCONFIG`
+  (accept bits excused: `cmd_execute()` calls `bb->stop()` on the way out),
+  `TXCONFIG` masked to the bits we set, `INTRMASK`, `CHIPCMD`, and requires
+  BMSR link + auto-negotiation. A chip that has been reset — or powered on —
+  reads zero for most of those, so a cold adapter cannot pass by accident.
+  Anything that does not match falls through to the cold path.
+- **`rtl_warm_adopt()` replaces `rtl_bb_init()`**: re-read the MAC (a register
+  read, no reset), jump `CAPR` to the chip's own `CBR` to **discard the ring
+  backlog**, reset `cur_tx`, clear stale `INTRSTATUS`/`RXMISSED`, and re-enable
+  the RX accept bits. Discarding matters: the host retransmits a command whose
+  ack it never saw, so the frame most likely sitting there is a duplicate of
+  the `EXEC` that started us — and `cmd_execute()` runs it, because `running`
+  is 0 in a fresh image. That is an infinite reload loop.
+- **`rtl_bb_loop()` must not clear `rtl_link_up` on a warm start.** No link
+  change is coming, and `set_ip_dhcp()` is gated on that flag.
+
+**The IP travels in the adapter's SRAM, not in RAM.** `rtl_handoff_save()`
+(called from `cmd_execute()`, once, just before `go()`) writes magic + IP +
+complement at GAPS offset `0x5000`, and `rtl_warm_adopt()` reads it back into
+`g_warm_ip`, which `main()` applies **before** `set_ip_from_file()`. No RAM
+address would do: a chainload goes through a loader that zero-fills
+`0x8c004000`–`0x8c010000` and `crt0` zeroes BSS on top of that. `0x5000` is in
+the gap the driver leaves — the ring is 16 KB + 16 at offset 0 and may spill
+~1.5 KB past its end (nowrap), ending by `0x4600`; the TX descriptors start at
+`0x6000`. It is wiped by exactly the events that must invalidate it: a cold
+`rtl_bb_init()` (which memsets all 32 KB) and a power cycle.
+
+What it deliberately does **not** carry is the DHCP lease. `dhcp_lease_time` is
+0 in a fresh image, so the renewal branch stays out of the way and the
+inherited address is held like a static one for as long as that instance runs.
+On screen the IP is followed by `(Warm Start)`, which is the only way to tell
+the fast path from the slow one without timing it.
+
+BBA only — the LAN Adapter has nowhere to put the handoff and always takes the
+cold path. `adapter_handoff_save()` is the neutral entry point in `adapter.c`.
+
+### 4.10 DHCP: a reply is not ours just because it is a reply
+
+Two filters, both added because the loader was acting on other people's DHCP
+traffic. **This only bites on a real network** — an emulated bridge sees none
+of it, which is why it survived so long.
+
+1. **Ports, in `process_udp()`.** The DHCP branch used to be entered on
+   `data[0] == BOOTREPLY` alone, so every broadcast datagram on the LAN
+   (NetBIOS, SSDP, mDNS) went through the DHCP option parser. A server reply
+   comes from 67 and lands on 68; nothing else does.
+2. **xid and chaddr, in `handle_dhcp_reply()`.** The OFFER branch adopted
+   whatever it was handed — server address, offered address **and transaction
+   ID**. DHCP replies are frequently broadcast and the BBA accepts broadcasts,
+   so any other machine on the LAN completing a lease while the Dreamcast waits
+   handed us *its* offer. dcload then requested an address belonging to someone
+   else under someone else's xid, and the ACK for its own request failed the
+   xid test — nothing set `escape_loop`, so **the entire retry counter had to
+   expire before another DISCOVER went out**. Replies arriving and being
+   visibly ignored, with only a later (quiet) attempt succeeding, is that bug.
+   The xid we sent is now kept in `dhcp_my_xid`; it used to be generated inside
+   `kos_net_dhcp_fill_options()` and thrown away, which is why no such check
+   was possible before.
+
+A rejected reply returns -1 on purpose: `process_udp()` only escapes the wait
+loop on 0, so the wait continues and the real reply is taken as soon as it
+lands. `g_dhcp_replies` / `g_dhcp_not_ours` (§11) say whether this is happening
+on a given network — and on real hardware they are readable with
+`dc-tool-ip -d out.bin -a <addr> -s 8`, since dcload answers `SBIN` from inside
+the DHCP wait.
+
+Untouched, and worth knowing: a NAK still restarts `dhcp_go()` **recursively**
+(bounded by `DHCP_NAK_NEST_MAX = 5`, after which DHCP is disabled outright).
+That was reachable from a *foreign* NAK before the checks above; now only our
+own can trigger it.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
@@ -586,7 +683,9 @@ title is spinning on), `g_gd_park_longs`, `g_cdfs_read_retries` /
 `g_pbin_rejected` / `g_pbin_clamped`, `g_last_load_addr` / `_size`,
 `g_last_reject_*`, and the RX set in `rtl8139.c` (`g_rx_frames`, `g_rx_polls`,
 `g_rx_wraps`, `g_rx_overflow`, `g_rx_reinit`, `g_rx_linkchange`,
-`g_rx_link_giveup`, `g_rx_hdr_defer`, `g_rx_last_capr` / `_cbr`). The
+`g_rx_link_giveup`, `g_rx_hdr_defer`, `g_rx_last_capr` / `_cbr`), plus
+`g_dhcp_replies` / `g_dhcp_not_ours` (§4.10 — DHCP traffic seen against DHCP
+traffic that was somebody else's). The
 post-mortem block at `PM_BASE` survives a reboot but is no longer out of a
 title's reach — treat it as advisory.
 

@@ -188,9 +188,20 @@ typedef struct __attribute__((packed, aligned(4))) {
 
 #define DHCP_H_LEN 236
 
+/* The two well-known ports. A reply from a server has src 67 and dest 68;
+ * net.c uses that to decide whether a datagram is DHCP at all. */
+#define DHCP_DEST_PORT 67
+#define DHCP_SOURCE_PORT 68
+
 extern volatile unsigned int dhcp_lease_time;
 extern unsigned char dhcp_nest_counter_maxed;
 extern unsigned int dhcp_attempts;
+
+/* BOOTREPLYs seen, and how many of them belonged to some other machine.
+ * A non-zero second number is the whole story behind a DHCP handshake that
+ * kept timing out on a busy LAN -- see handle_dhcp_reply(). */
+extern unsigned int g_dhcp_replies;
+extern unsigned int g_dhcp_not_ours;
 
 int handle_dhcp_reply(unsigned char *routersrcmac, dhcp_pkt_t *pkt_data, unsigned short len);
 int dhcp_go(unsigned int *dhcp_ip_address_buffer);
