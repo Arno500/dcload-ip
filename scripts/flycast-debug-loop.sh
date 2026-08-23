@@ -9,6 +9,7 @@
 #
 # Presets (mirror /mnt/e/Nextcloud/Projets/Dreamcast/dcload-ip-rs/.zed/debug.json):
 #   sa-pal    Sonic Adventure v1.003 PAL       (default, host 192.168.1.130)
+#   sa2-pal   Sonic Adventure 2 v1.008 PAL     (host 192.168.1.130)
 #   sa-intl   Sonic Adventure International    (host 192.168.1.64)
 #   sa-cdi    Sonic Adventure CDI              (host 192.168.1.64)
 #   crazy-taxi
@@ -102,6 +103,25 @@ finally:
 }
 
 # ---- 1. Build + package (skip with --skip-build once dcload.cdi is already current) ----
+#
+# DCLOAD_IP forces DREAMCAST_IP for this build. It defaults to a STATIC address
+# because DHCP does not complete under flycast's BBA bridge on this machine:
+# measured, the guest sends its DISCOVER (the bridge opens its capture device at
+# ~2.7 s, which only happens once the guest has transmitted) and never gets a
+# lease, so the console stays unreachable and every host->DC ARP goes
+# unanswered. A static IP also means dcload's gratuitous ARP is the first frame
+# out, which is exactly what the neighbour-warming step below needs.
+#
+# Makefile.cfg ships 0.0.0.0 (DHCP) on purpose for real hardware -- that setting
+# is not touched here; this is a command-line override, which GNU make gives
+# precedence over the assignment in Makefile.cfg and propagates to sub-makes.
+# Set DCLOAD_IP=dhcp to build the tree's own setting instead.
+#
+# The override needs a `make clean` when it CHANGES: DREAMCAST_IP reaches the
+# compiler as a -D with no dependency on any file, so an incremental make keeps
+# the old objects and silently produces a loader with the previous address
+# (AGENTS.md 14.6). The stamp file below is what makes that decidable.
+DCLOAD_IP="${DCLOAD_IP:-192.168.1.130}"
 if [[ $SKIP_BUILD -eq 0 ]]; then
   echo "[build] source environ.sh && make"
   # shellcheck disable=SC1091
@@ -110,7 +130,63 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   set +u
   source /opt/toolchains/dc/kos/environ.sh
   set -u
-  make -C "$REPO" >/tmp/dcload-build.log 2>&1 || { echo "BUILD FAILED, see /tmp/dcload-build.log" >&2; exit 1; }
+
+  MAKE_IP_ARG=()
+  if [[ "$DCLOAD_IP" != "dhcp" ]]; then
+    MAKE_IP_ARG=("DREAMCAST_IP=$DCLOAD_IP")
+    echo "[build] forcing DREAMCAST_IP=$DCLOAD_IP"
+  fi
+  # Extra make variables for this build, e.g. to bisect a size knob:
+  #   DCLOAD_MAKE_ARGS="PKT_BUFS_IN_HIRAM=0" scripts/flycast-debug-loop.sh
+  # Folded into the stamp below, so switching them forces the same clean the
+  # IP does. Most of these knobs DO have a file dependency (the %.o rules
+  # depend on the Makefile), but relying on that per-knob is exactly the kind
+  # of thing that is wrong once and then costs a session of testing an image
+  # that was never rebuilt.
+  # shellcheck disable=SC2206
+  MAKE_EXTRA=(${DCLOAD_MAKE_ARGS:-})
+  if [[ ${#MAKE_EXTRA[@]} -gt 0 ]]; then
+    echo "[build] extra make args: ${MAKE_EXTRA[*]}"
+  fi
+  STAMP="$REPO/target-src/dcload/.built-ip"
+  STAMP_WANT="$DCLOAD_IP ${DCLOAD_MAKE_ARGS:-}"
+  if [[ "$(cat "$STAMP" 2>/dev/null || echo none)" != "$STAMP_WANT" ]]; then
+    echo "[build] build settings changed since last build -- make clean"
+    make -C "$REPO" clean >/dev/null 2>&1 || true
+  fi
+  # The per-base loader set the host chainloads into, BEFORE the main build:
+  # `make loaders` links each base in turn in the same directory and restores
+  # the default build on the way out, so running it first leaves a consistent
+  # tree for mkdcdisc to package.
+  #
+  # It must be built with the SAME DREAMCAST_IP as the CD image. A chainloaded
+  # loader is a fresh image with no memory of the previous instance's address
+  # except what the BBA's SRAM carries (and that path is only taken on real
+  # hardware), so a loader compiled for a different address simply disappears
+  # off the network mid-session. The override propagates to the sub-make
+  # through MAKEFLAGS.
+  if [[ "${LOADERS:-1}" == "1" ]]; then
+    echo "[build] make loaders (per-base dcload set)"
+    make -C "$REPO/target-src/dcload" "${MAKE_IP_ARG[@]}" "${MAKE_EXTRA[@]}" loaders \
+      >/tmp/dcload-loaders.log 2>&1 \
+      || { echo "LOADERS BUILD FAILED, see /tmp/dcload-loaders.log" >&2; exit 1; }
+  fi
+
+  make -C "$REPO" "${MAKE_IP_ARG[@]}" "${MAKE_EXTRA[@]}" >/tmp/dcload-build.log 2>&1 || { echo "BUILD FAILED, see /tmp/dcload-build.log" >&2; exit 1; }
+  echo "$STAMP_WANT" > "$STAMP"
+
+  # Deploy the loader set and the game database where the host tool looks.
+  # Not target/debug/loaders: `cargo clean` would take it out and the next run
+  # would silently lose every relocation.
+  echo "[package] deploying loaders + game database to $CDI_DEST_DIR/loaders"
+  # Mirror, do not merge: an ELF for a base that has been dropped from
+  # LOADER_BASES must not survive here and go on being chainloaded.
+  rm -rf "$CDI_DEST_DIR/loaders"
+  mkdir -p "$CDI_DEST_DIR/loaders"
+  cp "$REPO"/target-src/dcload/loaders/*.elf "$CDI_DEST_DIR/loaders/" 2>/dev/null || true
+  python3 "$REPO/scripts/make-preset-db.py" --out "$CDI_DEST_DIR/loaders/game-presets.tsv" \
+    >/tmp/dcload-presets.log 2>&1 \
+    || { echo "PRESET DB GENERATION FAILED, see /tmp/dcload-presets.log" >&2; exit 1; }
 
   echo "[package] mkdcdisc"
   /opt/toolchains/dc/mkdcdisc/build/mkdcdisc -B "$REPO/target-src/1st_read/1st_read.bin" -N \
@@ -195,6 +271,20 @@ else
     echo "[flycast] re-adding LogToFile=yes to emu.cfg (flycast drops it on exit)"
     sed -i 's/^\[log\]$/[log]\nLogToFile = yes/' "$FLYCAST_DIR/emu.cfg"
   fi
+  # ENABLE_GDB_SERVER=ON in the CMake cache is necessary but NOT sufficient:
+  # Debug.GDBEnabled in emu.cfg is the runtime half, and flycast rewrites
+  # emu.cfg on a clean exit -- it was found set back to `no`, which looks
+  # exactly like a build without the feature (:3263 never opens, every
+  # dc-peek/dc-screen instrument is unavailable, and the script's own resume
+  # step warns instead of failing). Re-assert it on every launch.
+  if ! grep -q '^Debug.GDBEnabled = yes' "$FLYCAST_DIR/emu.cfg" 2>/dev/null; then
+    echo "[flycast] re-enabling Debug.GDBEnabled in emu.cfg"
+    if grep -q '^Debug.GDBEnabled' "$FLYCAST_DIR/emu.cfg" 2>/dev/null; then
+      sed -i 's/^Debug.GDBEnabled = .*/Debug.GDBEnabled = yes/' "$FLYCAST_DIR/emu.cfg"
+    else
+      sed -i '0,/^Debug\./s//Debug.GDBEnabled = yes\nDebug./' "$FLYCAST_DIR/emu.cfg"
+    fi
+  fi
   echo "[flycast] launching"
   ps_ "Start-Process -FilePath '$FLYCAST_EXE_WIN' -ArgumentList '$CDI_DEST_WIN' -WorkingDirectory '$FLYCAST_DIR_WIN'" >/dev/null
 
@@ -245,12 +335,18 @@ fi
 #         doesn't need one (rare). ----
 DC_IP="$HOST_OVERRIDE"
 if [[ -z "$DC_IP" ]]; then
-  case "$GAME" in
-    sa-pal) DC_IP="192.168.1.130" ;;
-    *) DC_IP="192.168.1.64" ;;
-  esac
-  echo "[net] assuming DC_IP=$DC_IP (known-stable DHCP lease for this MAC.\
+  if [[ "$DCLOAD_IP" != "dhcp" ]]; then
+    # The loader was compiled with this address, so there is nothing to guess.
+    DC_IP="$DCLOAD_IP"
+    echo "[net] DC_IP=$DC_IP (compiled into this build, not a DHCP lease)"
+  else
+    case "$GAME" in
+      sa-pal|sa2-pal) DC_IP="192.168.1.130" ;;
+      *) DC_IP="192.168.1.64" ;;
+    esac
+    echo "[net] assuming DC_IP=$DC_IP (known-stable DHCP lease for this MAC.\
  Override with --host if the router gave a different one; use 'arp -a' diff otherwise)"
+  fi
 fi
 echo "DC_IP=$DC_IP"
 
@@ -331,6 +427,10 @@ if [[ $NO_RUST -eq 0 ]]; then
       IMG="$DL\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!].gdi"
       # No --gdb flag: the restored server starts its GDB stub unconditionally.
       EXTRA="-d \"$IMG\"" ;;
+    sa2-pal)
+      BIN="$DL\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\1ST_READ.BIN"
+      IMG="$DL\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!]\\Sonic Adventure 2 v1.008 (2001)(Sega)(PAL)(M5)[!].gdi"
+      EXTRA="-d \"$IMG\"" ;;
     sa-intl)
       BIN="$DL\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\USA\\1ST_READ.BIN"
       IMG="$DL\\Sonic Adventure v1.003 (1999)(Sega)(PAL)(M5)[!]\\USA\\Sonic Adventure International v1.003 (1999)(Sega)(NTSC)(JP)(M5)[!].gdi"
@@ -349,6 +449,25 @@ if [[ $NO_RUST -eq 0 ]]; then
     *) echo "Unknown --game preset: $GAME" >&2; exit 1 ;;
   esac
 
+  # Build the host tool too unless told not to. Forgetting this is the same trap
+  # as a stale CDI (see step 1b): the run looks normal and exercises the
+  # PREVIOUS binary. cargo.exe is reachable from WSL and produces the Windows
+  # .exe the launch below needs; a WSL-native `cargo` would build an ELF that
+  # Start-Process cannot run. Set RUST_BUILD=0 to skip.
+  RUST_EXE_WSL="/mnt/e/Nextcloud/Projets/Dreamcast/dcload-ip-rs/target/$RUST_PROFILE/dcload-ip-rs.exe"
+  if [[ "${RUST_BUILD:-1}" == "1" ]]; then
+    echo "[rust] cargo build ($RUST_PROFILE)"
+    CARGO_ARGS=(build)
+    [[ "$RUST_PROFILE" == "release" ]] && CARGO_ARGS+=(--release)
+    ( cd /mnt/e/Nextcloud/Projets/Dreamcast/dcload-ip-rs && cargo.exe "${CARGO_ARGS[@]}" ) \
+      >/tmp/dcload-rs-build.log 2>&1 \
+      || { echo "RUST BUILD FAILED, see /tmp/dcload-rs-build.log" >&2; tail -30 /tmp/dcload-rs-build.log >&2; exit 1; }
+  fi
+  if [[ ! -f "$RUST_EXE_WSL" ]]; then
+    echo "ERROR: $RUST_EXE_WSL does not exist (RUST_PROFILE=$RUST_PROFILE)." >&2
+    exit 1
+  fi
+
   echo "[rust] launching dcload-ip-rs ($GAME, host $DC_IP)"
   # RUST_EXTRA_ARGS is appended to the subcommand, which is where dcload-ip-rs
   # wants its flags (`u-exec <bin> -d <image> --verify-reads`, not before
@@ -365,6 +484,9 @@ if [[ $NO_RUST -eq 0 ]]; then
   # so this is the only way to reach them without editing the Rust source:
   #   RUST_ENV=DCLOAD_VERIFY_READS=1 scripts/flycast-debug-loop.sh --skip-build
   #   RUST_ENV="DCLOAD_RT_BURST=1 DCLOAD_RT_DELAY_US=500" ...
+  # Where the host finds the per-base loaders and the game database. Both were
+  # deployed in step 1; the host also accepts --loader-dir / --game-db.
+  RUST_ENV="DCLOAD_LOADER_DIR=${CDI_DEST_WIN%\\*}\\loaders ${RUST_ENV:-}"
   RUST_ENV_PS=""
   for kv in ${RUST_ENV:-}; do
     RUST_ENV_PS="$RUST_ENV_PS\$env:${kv%%=*} = '${kv#*=}'; "

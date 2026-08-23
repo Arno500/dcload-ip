@@ -1,4 +1,14 @@
-/* Sega Dreamcast linker script */
+/* Sega Dreamcast linker script -- TEMPLATE.
+ *
+ * This file is not fed to ld. The Makefile runs it through the C preprocessor
+ * to produce dcload.x, substituting DCLOAD_BASE, DCLOAD_STACK and
+ * DCLOAD_HIRAM. Edit this file; dcload.x is build output and gitignored.
+ *
+ * The reason it is generated at all: the loader's base address is per-game
+ * (DreamShell's `memory` field -- see the header of target-src/dcload/Makefile),
+ * and ld offers no way to override a MEMORY region's ORIGIN from the command
+ * line. --defsym reaches symbols only, and ORIGIN is exactly what has to move.
+ */
 
 OUTPUT_FORMAT("elf32-shl", "elf32-shl",
 	      "elf32-shl")
@@ -8,9 +18,13 @@ ENTRY(start)
 /* Do we need any of these for elf?
    __DYNAMIC = 0;    */
 
+/* The region runs from the base to the stack top, so the image and the
+ * loader's own descending stack share it and the ASSERTs at the bottom are
+ * what keeps them apart. At the stock base that is 0x8c004000..0x8c00f400,
+ * exactly the length this line used to carry as a literal. */
 MEMORY
 {
-  ram (rwx) : ORIGIN = 0x8c004000, LENGTH = 0xb400
+  ram (rwx) : ORIGIN = DCLOAD_BASE, LENGTH = DCLOAD_STACK - DCLOAD_BASE
 }
 
 SECTIONS
@@ -213,14 +227,30 @@ SECTIONS
    * an object here only if it is written before it is read.
    *
    * This is outside the `ram` MEMORY region on purpose, so it is not subject
-   * to the region's length and does not trip the overflow ASSERT below. */
-  .hiram 0x8cfe9000 (NOLOAD) :
+   * to the region's length and does not trip the overflow ASSERT below.
+   *
+   * The two paragraphs above describe the LOW family, where the loader is
+   * below 1ST_READ.BIN and 0x8cfe8000/0x8cfe9000 are as far from it as RAM
+   * allows. For a base in high RAM those addresses are inside the image, so
+   * DCLOAD_HIRAM follows the base instead (base + 0xc000); see the layout
+   * table in target-src/dcload/Makefile. */
+  .hiram DCLOAD_HIRAM (NOLOAD) :
   {
     __hiram_start = .;
     *(.hiram)
     *(.hiram.*)
     __hiram_end = .;
   }
+
+  /* The base, as a symbol, so C code can name the loader's own start address
+   * without re-stating it as a literal. commands.c needs it for the reboot
+   * entry point and for the console-enable word the launched program reads at
+   * base+4; cmd_version reports it to the host, which is how the host decides
+   * whether the running loader is already at the address the next title wants.
+   *
+   * PROVIDE + a leading underscore because the SH ELF C ABI prefixes C symbols
+   * with one: this is `dcload_base` in C. */
+  PROVIDE (_dcload_base = ORIGIN(ram));
 
   /* Stabs debugging sections.  */
   .stab 0 : { *(.stab) }
@@ -257,7 +287,11 @@ SECTIONS
   .debug_varnames  0 : { *(.debug_varnames) }
 /*  .stack 0x8c00f400 : { _stack = .; *(.stack) }*/
   /* These must appear regardless of  .  */
-_stack = 0x8c00f400;
+/* The LOADER's own stack top, which is not the same thing as the stack handed
+ * to a launched title: that one is always the BIOS VBR (go.s), whereas this
+ * one follows the loader into high RAM when the base does. At the stock base
+ * the two coincide, which is why this was one constant for so long. */
+_stack = DCLOAD_STACK;
 
 /* ASSERT triggers when condition is FALSE */
 /* Stack calculation will wrap around if ram region overflows, so only one

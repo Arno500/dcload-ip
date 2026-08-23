@@ -50,6 +50,7 @@ Makefiles include `Makefile.cfg` and `Makefile.hostdetect` from the repo root.
 ├── .vscode/                # sh-elf-gdb attach config to :3263
 ├── host-src/tool/          # the only host code; produces dc-tool-ip
 ├── target-src/dcload/      # the main DC binary → dcload.bin + exception.bin
+│   └── loaders/           # `make loaders` output: one ELF per base (§4.11)
 ├── target-src/1st_read/    # CD bootstrap → scrambled 1st_read.bin
 ├── target-inc/             # header-only include path (no Makefile of its own)
 ├── example-src/            # 3 demo .bin programs uploaded with dc-tool -x
@@ -146,9 +147,18 @@ make distclean                # also *.bin
   pacing for dc-tool → dcload. Raise `TIME` by ~100 µs at a time if you see
   `link change…` mid-transfer (BBA) or the LAN adapter hanging. Presets are in
   the file's comment block.
-- `DREAMCAST_IP = 192.168.1.130` — **static, on purpose**. Any `0.x.x.x`
-  switches to DHCP. See §4.7 on reachability, and §14.6 (`make clean` is
-  mandatory after changing it).
+- `DREAMCAST_IP = 0.0.0.0` — DHCP, since `0.x.x.x` is what selects it. A
+  static address is the other supported mode and is what the debug loop uses:
+  `scripts/flycast-debug-loop.sh` defaults to `DCLOAD_IP=192.168.1.130` and
+  passes it as `make DREAMCAST_IP=…`, so the file's value is only the default
+  for a hand-run `make`. See §4.7 on reachability (a static address is
+  unreachable without `announce_presence()`), and §14.6 (`make clean` is
+  mandatory after changing it — `target-src/dcload/.built-ip` is the stamp
+  that makes that decidable, and it is only written by the debug-loop script).
+  **The loader set must be built with the same address as the CD image**: a
+  chainloaded loader inherits the previous instance's IP only through the
+  BBA's SRAM (§4.9), a path that does not exist under flycast, so a mismatched
+  set simply disappears off the network mid-session.
 
 ## 4. The Dreamcast binary (`target-src/dcload`)
 
@@ -180,9 +190,9 @@ relocate or reorder code behind your back:
 
 | File | Role |
 | --- | --- |
-| `dcload-crt0.s` | start of day: stack, **VBR install**, zero BSS (`_edata`..`_end`, one contiguous range), call `main`. Also holds the fixed jump table and the `0xdeadbeef` magic the example programs check. |
+| `dcload-crt0.s` | start of day: stack, zero BSS (`_edata`..`_end`, one contiguous range), call `main`. Also holds the fixed jump table and the `0xdeadbeef` magic the example programs check. |
 | `dcload.c` | `main`: adapter detection, DHCP retry, lease-time perfcounter, video background, the command loop, `announce_presence()`. |
-| `go.s` / `go.h` | the handoff to a launched game — SR, CCR, entry. **Read its header before touching it** (§4.7). |
+| `go.S` / `go.h` | the handoff to a launched game — SR, CCR, entry. **Read its header before touching it** (§4.7). |
 | `disable.s` / `disable.h` | turns off the SH4 cache (must run from P2). |
 | `startup_support.c` | BSS zeroing helpers and C++ constructors. |
 | `video.s` / `video.h` | on-screen status output (Marcus Comstedt's `video.s`). |
@@ -236,15 +246,19 @@ so editing either does trigger a rebuild.
 
 ### 4.4 Memory map
 
-Pinned by `dcload.x`: `ram (rwx) : ORIGIN = 0x8c004000, LENGTH = 0xb400`.
+Pinned by `dcload.x`, which is **generated** from `dcload.x.in` by the C
+preprocessor: `ram (rwx) : ORIGIN = DCLOAD_BASE, LENGTH = DCLOAD_STACK -
+DCLOAD_BASE`. At the default base that is `ORIGIN = 0x8c004000, LENGTH =
+0xb400`, exactly what the file used to carry as literals. The base is a
+build variable now because it is **per-game** — see §4.11.
 
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` is the `0xdeadbeef` magic, `+8` the syscall trampoline pointer — the ABI the example programs use. |
-| `0x8c00a558` | `_end` (current, default knobs — §4.3). The whole loader, code and BSS, is below this. Sonic Adventure enters GD syscalls with `SP = 0x8c00b9d0` and grows *down* — that is the margin §4.6 is about, and it is what any addition spends. |
-| `0x8c00f400` | `_stack`, **and** the VBR handed to the game, **and** the base of `exception` (`-Ttext=0x8c00f400`), **and the BIOS VBR on this machine**. |
+| `0x8c00a588` | `_end` (current, default knobs — §4.3). The whole loader, code and BSS, is below this. Sonic Adventure enters GD syscalls with `SP = 0x8c00b9d0` and grows *down* — that is the margin §4.6 is about, and it is what any addition spends. |
+| `0x8c00f400` | `_stack`, **and** the VBR handed to the game, **and** the base of `exception` (`-Ttext=$(DCLOAD_GUEST_VBR)`), **and the BIOS VBR on this machine**. The last three do **not** move with the base; `_stack` does (§4.11). |
 | `0x8c010000` | the game's load address. `exception.bin` (2048 B) ends before it; total footprint `0xc000`, exactly the hole between the BIOS syscall area and 1ST_READ.BIN. |
-| `0x8cfe8000` | Maple DMA buffer (2 KB), deliberately outside the loader image (§4.6). Hard-coded in `maple.c`. |
+| `0x8cfe8000` | Maple DMA buffer (2 KB), deliberately outside the loader image (§4.6). From `DCLOAD_MAPLE`, defaulted in `maple.c`. **A low loader's buffers being here is why a direct chainload to a `0x8cfe8000` base fails — §4.11 item 4.** |
 | `0x8cfe9000` | `.hiram` — the two 1536-byte packet buffers, also outside the image. Placed by `dcload.x`, `NOLOAD`, so it costs nothing in `dcload.bin` and nothing in `_end`; `dcload-crt0.s` zeroes it explicitly because BSS zeroing no longer covers it. Empty when `PKT_BUFS_IN_HIRAM=0`. Put a new large buffer here — mark it `HIRAM_BUF`, see `hiram.h` — rather than in BSS. |
 | `0x8cf0c000` | post-mortem block (`PM_BASE`, `cdfs_syscalls.c`). **Advisory only** — at the low base nothing caps a title's allocator there, and Sonic Adventure re-claims it. The caveat is written at the definition. |
 
@@ -274,7 +288,9 @@ Why this base, in order of weight:
 
 `crt0` still installs VBR explicitly at boot even though the BIOS VBR now
 points at the right place — keep it, so the next relocation does not
-reintroduce a silent reset loop.
+reintroduce a silent reset loop. (Verified 2026-08-15: it does **not**. The only
+`ldc … ,vbr` in the tree is in `go.s`/`go.S`, so dcload itself runs on whatever
+VBR the bootstrap left. This paragraph describes an intent, not the code.)
 
 ### 4.5 GD-ROM emulation: a server task, on isoldr's model
 
@@ -530,6 +546,138 @@ Untouched, and worth knowing: a NAK still restarts `dhcp_go()` **recursively**
 That was reachable from a *foreign* NAK before the checks above; now only our
 own can trigger it.
 
+### 4.11 The base is per-game, and the host moves the loader
+
+The addresses above are the **default**. DreamShell's preset database answers
+"where must the loader be for this title" per game, in its `memory` field, and
+the values it uses are:
+
+| address | presets | |
+| --- | --- | --- |
+| `0x8c004000` | 593 | the stock base — and the one homebrew needs |
+| `0x8c001100` | 196 | `…_MIN_GINSU`. **Not supported — see below** |
+| `0x8cfe8000` | 119 | `…_HIGH`. **Sonic Adventure 2 is here** |
+| `0x8c000100` | 80 | `…_MIN`. **Not supported — see below** |
+| `0x8ce00000` | 16 | `ISOLDR_DEFAULT_ADDR` |
+
+**The two bases below 0x8c004000 are not built, and that is 276 of the 1026
+presets — coverage is 732/1026, not 98 %.** An image based there overwrites the
+BIOS syscall area (`0x8c000000`–`0x8c003fff`), which is precisely why the stock
+base is where it is, and this loader depends on that area: `video.s`'
+`_get_font_address` reads the pointer at `0x8c0000b4` and **jumps through it**,
+once per string drawn — including the `receiving data...` that `cmd_loadbin`
+draws during the very upload destroying it. Measured on a
+`0x8ce00000 → 0x8c000100` chainload: the upload dies with "No DoneBinary
+response received" and the loader is then executing in the empty 4 KB above its
+own `_stack` with PR inside `raw_current_pkt`. Supporting them means giving up
+the on-screen display for those bases (isoldr's `low`/`syscalls` option is its
+answer to the same problem); `loaders::known_unsupported()` on the host reports
+the reason instead of asking for an ELF that would brick the session.
+
+So `DCLOAD_BASE` is a build variable (`target-src/dcload/Makefile`, which
+carries the layout table), `make loaders` builds one self-contained ELF per
+base into `target-src/dcload/loaders/`, and the **host** picks and chainloads
+one before it uploads a title (§16).
+
+Four things this must not break, each of which is why the design is shaped the
+way it is:
+
+1. **`0x8c004000` stays the default and stays what the CD image boots.** The
+   magic at base+4 and the syscall trampoline at base+8 are read as literals by
+   every KOS program and by `example-src/`. A loader anywhere else is invisible
+   to them, so nothing moves unless a preset asks.
+2. **The register state handed to a title does not follow the loader.** isoldr
+   sets VBR and SP to `0x8c00f400` for every title from every `memory` value
+   (`startup.s`, `_boot_vbr` / `_boot_stack` are constants; only the NAOMI path
+   overrides them). `DCLOAD_GUEST_VBR` is that address, `exception.bin` is
+   linked there whatever the base, and each loader ELF carries it as a
+   `.guestvbr` section so uploading the ELF puts the vector table there too.
+   The loader's *own* stack (`_stack` = `DCLOAD_STACK`) is what moves.
+3. **Two layout families.** LOW (base < `0x8c010000`) is the stock layout
+   untouched. HIGH places everything relative to the base, because `0x8cfe8000`
+   and `0x8cfe9000` are *inside* the image when the base is `0x8cfe8000`:
+   `+0xb000` stack top, `+0xc000` `.hiram`, `+0xd000` Maple DMA.
+4. **A low loader's buffers are at `0x8cfe8000`/`0x8cfe9000`, and that is what
+   makes a direct chainload to `0x8cfe8000` fail.** Measured: the new image is
+   written straight through the running loader's packet buffers, the transfer
+   still reports success, the new loader comes up and runs — correct PC, correct
+   SP — and is **deaf**. Nothing reports an error anywhere. The host goes via
+   `0x8ce00000` instead; §16 has the rule.
+
+No address is written twice: `DCLOAD_BASE`/`DCLOAD_STACK`/`DCLOAD_HIRAM`/
+`DCLOAD_MAPLE` reach the linker script, the C sources and the exception
+handler's link address from the Makefile, and C code names the base through
+`_dcload_base` (`PROVIDE`d from `ORIGIN(ram)`) rather than restating it — §14.11
+is the bug that rule exists to prevent. `make -C target-src/dcload config
+DCLOAD_BASE=…` prints the resulting layout.
+
+### 4.12 A title can switch the adapter off, and one does
+
+**Sonic Adventure 2 powers the BBA's GAPS bridge down during `main`, using
+exactly the two words `rtl_bb_detect()` uses for the same purpose.** It is not
+trying to use the adapter: `0x8c1380a0` probes all four G2 slot windows
+(`0xa1000400`, `0xa1000800`, `0xa1001400`, `0xa1001800`) for the `"GAPS"`
+signature -- reading four bytes and consulting `SB_ISTERR` bit `0x08000000` to
+tell "nothing there" from "something answered" -- and parks every expansion
+device it finds:
+
+| SA2 | `rtl_bb_detect()` |
+| --- | --- |
+| `0xa1001414 <- 0x00000000` | `g232[0x1414/4] = 0x00000000;` |
+| `0xa1001418 <- 0x5a14a500` | `g232[0x1418/4] = 0x5a14a500;` |
+
+The value is *computed* (`0x5a00a500 | ((base & 0xff00) << 8)`), which is why
+searching the binary for it finds nothing.
+
+The symptom is total and silent: every NIC register then reads back through a
+dead bridge, so dcload is deaf with **nothing logged at either end** -- black
+screen, zero packets, zero exceptions, zero disc reads, and the title itself
+running perfectly well. It cost a fortnight, and cannot be reproduced under
+flycast. Sonic Adventure does nothing of the kind (verified: `"GAPS"` and
+`0x5a14a500` appear zero times in its 6.7 MB `1ST_READ.BIN`), which is why
+every measurement that compared the two titles came back clean.
+
+**The fix is on the host, and it prevents rather than recovers.** The probe
+compares four bytes against `"GAPS"`, and that comparison constant is the single
+choke point for all four slots: change it and every probe fails, nothing is
+parked, and the path the title takes is the ordinary one for a console with an
+empty expansion port -- which any such title must already support.
+`gaps_probe_patches()` in the Rust host (§16) finds it **by content**, needing no
+per-title knowledge: a 4-aligned `"GAPS"` corroborated by a slot-window literal
+within 4 KB. Measured: Sonic Adventure 2 has exactly one of each, `0x248` apart;
+Sonic Adventure's 6.7 MB has neither. On by default, `--no-gaps-guard` to leave
+the title as shipped.
+
+**A DC-side recovery was tried and does not work.** `rtl_gaps_rearm()` re-armed
+the bridge from the top of `rtl_bb_loop()`/`rtl_bb_tx()`. Re-arming the bridge
+alone is not enough -- `rtl_bb_init()` waits after `0x1418` for "the chip to
+powerup and **load its config from its EEPROM**", so the RTL8139 is not gated off
+the bus, it is *powered off* and comes back with PCI config, registers and PHY
+all reset. A full cold `rtl_bb_init()` does succeed (measured on console:
+auto-negotiation completed in 6520089 poll iterations), and the loader is still
+deaf, because `rtl_bb_tx()` never returns afterwards. Both of its hardware waits
+-- Holly's G2 FIFO at `0xa05f688c` and the descriptor's OWN bit -- are
+**unbounded**, in violation of §4.8. That code was removed; if it is revisited,
+bound those two first.
+
+**isoldr has nothing to borrow here, and that is checked, not assumed.** It
+calls `bba_init()` exactly once (`kos/net/core.c:342`), touches `0x1418` only
+inside `gaps_init()`, and never re-tests the bridge in `bba_tx()` or anywhere
+else -- SA2 would switch its net backend off exactly as it switched ours off.
+It never had to care, for two reasons: that backend is not functional in the
+tree (`broadband_adapter.c` lines 293-381 are `#if 0`, and isoldr's own
+`ARCHITECTURE.md` says "ne le prenez pas comme référence -- prenez `sd`"), and
+its working transports are not on the G2 expansion port at all -- SD is the
+SH4's own SCI/SCIF (`0xffe00000`/`0xffe80000`), IDE is G1
+(`0xa05f7018`/`0xa05f7080`). The preset database agrees: its three directories
+are `cd`, `ide` and `sd`, 6164 presets, and there is no `net` one. **isoldr's
+"perfect compatibility" with SA2 is immunity by construction, not a technique.**
+
+The general lesson is worth more than the fix: **a title owns the machine, and
+"the loader is fine, look at the counters" assumes the counters can still be
+read**. When every instrument goes quiet at once and the title is visibly alive,
+suspect the transport's power, not its logic.
+
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
 `loader.s` + `disable.s` are linked at `-Ttext=0x8c010000` (the BIOS's 1st_read
@@ -554,6 +702,10 @@ the copy cannot go stale.
   so the Makefile stops asking for them in that configuration rather than
   emitting a warning per file. If the listings are what you came for, build
   without LTO.
+- **`target-src/dcload/dcload.x` is generated** from `dcload.x.in` by the C
+  preprocessor (§4.4). Edit the `.in`; the `.x` is build output, gitignored,
+  and removed by `make clean`. `target-src/dcload/loaders/` is likewise build
+  output, from `make loaders`, and is removed by `make distclean`.
 - `.gitignore` covers `*.o *.bin *.lzo *.srec *.exe *.elf *.asm *.map` plus the
   example programs and the DC ELF, at the top level only — so intermediates do
   get committed from subdirectories sometimes.
@@ -698,7 +850,8 @@ with `scripts/flycast-resume.py`. Anything touching `:3263` must end with a GDB
 
 | Script | What it answers |
 | --- | --- |
-| `dc-peek.py <symbol\|0xaddr>` | read guest memory, resolving symbols from the ELF. Never hard-code a counter address — adding a counter shifts `.data` and the values become plausible nonsense. |
+| `dc-peek.py <symbol\|0xaddr>` | read guest memory, resolving symbols from the ELF. Never hard-code a counter address — adding a counter shifts `.data` and the values become plausible nonsense. **Pass `--base 0x8cfe8000` (or `--elf …`) after a relocation**, or every symbol resolves into an image the console is not running; its identity check catches that rather than printing plausible nonsense. |
+| `dc-counters.py <ip>` | **the same counters, on real hardware.** Everything else here talks to flycast's GDB stub, which does not exist on a console; this asks dcload itself with `SBIQ`, which it answers from inside `bb->loop()` without touching the screen. One round trip for the whole set. It asks the loader where it lives first (VERS carries the base) **and compares 256 bytes of its code against the ELF**, refusing to decode on any mismatch. Both checks are needed and the second is the one that earns its keep: the base only proves *where*, and two builds of the same base put the same counter at different addresses (§14.19). `--repeat N --interval S` prints deltas; `--raw addr len` hex-dumps anything. Symbols come from `sh-elf-nm`, so `source environ.sh` first. |
 | `dc-sample.py` | poll a table of counters at a fixed rate, print deltas. |
 | `dc-track.py` | continuous sampling that **re-attaches per sample**, because flycast halts the guest while a debugger stays connected — a held connection freezes what you are watching. |
 | `dc-freeze.py` | snapshot everything during a freeze. |
@@ -822,6 +975,33 @@ result, prove the instrument still detects something.
     `0x8c004000`–`0x8c010000` zero-fill, and it is in RAM a title's allocator
     could conceivably claim — put a buffer there, not a flag someone else
     writes.
+17. **Chainloading a loader over the running one's packet buffers.** A low
+    loader keeps `raw_pkt_buf`, `raw_current_pkt` and the Maple DMA buffer at
+    `0x8cfe8000`/`0x8cfe9000`, *outside* its image — so uploading a loader
+    based at `0x8cfe8000` writes the new image straight through the buffers the
+    upload itself is arriving in. Measured: the transfer reports success, the
+    new loader boots and runs with a correct PC and stack, and is deaf; nothing
+    logs an error at either end. `loaders::live_footprint()` in the Rust host
+    is what knows this, and it returns a **list** of ranges for that reason.
+18. **Believing a black screen is yours.** Sonic Adventure renders a near-black
+    frame (max pixel value 6) while streaming megabytes and running its frame
+    loop at 60 Hz. Verified 2026-08-15 by three controls: the same frame CRC
+    with and without this session's changes, the same CRC with
+    `PKT_BUFS_IN_HIRAM=0`, and **the same screen booting the GDI directly in
+    flycast with no dcload at all** (`scripts/sa-gdi-control.sh`). Run that
+    control before spending a session on a display symptom — it is the only one
+    that can tell a loader bug from an emulator one.
+19. **Reading a counter against a different build of the same base.** The
+    loaders deployed next to the Rust host and the ones in
+    `target-src/dcload/loaders/` are separate artefacts, and `make loaders`
+    does not deploy. Measured 2026-08-16: the deployed set was eight bytes off
+    the tree's in `.data`, so every counter read back **believable and wrong** —
+    `g_dbin_count` reported 201392128, which is `0x0c010000`, a LoadBinary
+    address one slot away. Nothing detects this from the values; matching the
+    *base* does not detect it either, since both builds are linked at the same
+    place. `dc-counters.py` now compares 256 bytes of code before decoding
+    (§11) — an instrument that cannot prove it is looking at the right image
+    reports fiction with full confidence.
 
 ## 15. Where to look first
 
@@ -843,14 +1023,21 @@ result, prove the instrument still detects something.
     duration, so the figure that matters is milliseconds per chunk, not KB/s.
     Chasing KB/s would have missed the 39 ms of host-side `thread::sleep` that
     was the actual stutter (§16).
-- **Base address / memory map** → `dcload.x`, `target-src/1st_read/loader.s`,
-  `dcload-crt0.s`, `go.s`, `exception.S`, `cdfs_redir.s`, `commands.c`,
-  `cdfs_syscalls.c` (`PM_BASE`), `maple.c` (buffer address), `hiram.h` +
-  `dcload.x`'s `.hiram` (the packet buffers),
-  `target-src/dcload/Makefile` (`exception -Ttext=`), plus `scripts/dc-peek.py`.
-  Substitute on code lines only — the prose in comments records measurements
-  made at older bases, and rewriting it would falsify the record. The link step
-  (`--no-undefined` plus the `dcload.x` asserts) catches inconsistencies.
+- **Base address / memory map** → `target-src/dcload/Makefile` **first**: it is
+  the one place the four addresses are chosen, and it carries the layout table
+  (§4.11). Then `dcload.x.in` (the generated `dcload.x` is output),
+  `target-src/1st_read/loader.s` + its Makefile (which asks dcload for the
+  addresses through `print-base` / `print-guest-vbr` / `print-zero-end`),
+  `dcload-crt0.s`, `go.S`, `exception.S`, `commands.c` (`_dcload_base`),
+  `maple.c`, `hiram.h`, and on the host side `src/loaders.rs` in the Rust
+  server, whose `live_footprint()` mirrors the same table.
+  **Do not add a literal.** Everything derives from `DCLOAD_BASE`; a literal
+  that had drifted from what the linker chose is §14.11, and it rebooted the
+  machine with no breadcrumb. Substitute on code lines only — the prose in
+  comments records measurements made at older bases, and rewriting it would
+  falsify the record. The link step (`--no-undefined` plus the `dcload.x`
+  asserts) catches inconsistencies inside the image, but **not** a host that
+  disagrees about where the loader is: that failure is silent (§4.11 item 4).
 - **GD read path** → `cdfs_syscalls.c` and `cdfs_redir.s` headers first, then
   `commands.c` (`cmd_partbin` / `cmd_donebin` and the `bin_info` window).
 - **Anything that must work while a game runs** → check `_end` in
@@ -870,6 +1057,47 @@ A separate, faster host implementation lives outside this repo at
 `/mnt/e/Nextcloud/Projets/Dreamcast/dcload-ip-rs/` (mainly `src/dispatch.rs`).
 It is the host side used for GD-emulation work; `dc-tool-ip` remains the
 reference implementation.
+
+**It is also what picks the loader's base address** (§4.11). Before it uploads
+a title it reads the disc's boot sector, identifies the game, looks the game up
+in `docs/game-presets.tsv`, and chainloads a relinked loader if the answer is
+not where the loader already is. `src/presets.rs` and `src/loaders.rs` hold
+that; the parts the DC side constrains:
+
+- **`docs/game-presets.tsv` is generated** by `scripts/make-preset-db.py` from
+  `docs/dreamshell-presets/`, one row per distinct boot-sector MD5. Both the
+  loader ELFs go to `loaders/` **in the Rust host's project root** and this
+  file next to it — outside `target/`, so `cargo clean` cannot take them and
+  debug and release read the same set. Overridable with `--loader-dir` /
+  `DCLOAD_LOADER_DIR` and `--game-db` / `DCLOAD_GAME_DB`; a directory beside
+  the executable is still honoured, last. Deploying is a copy, not a build
+  step: `make loaders` writes to `target-src/dcload/loaders/` here, and a set
+  left behind elsewhere is §14.19 waiting to happen.
+- **Identification is two-tier, and the exact tier will usually miss.**
+  DreamShell keys presets on the MD5 of IP.BIN sector 0, which identifies a
+  *dump*: neither Sonic Adventure dump used here is in its 1026 rows. The
+  fallback is the IP.BIN title, reported as approximate. 24 titles have presets
+  that disagree about `memory`; a tie breaks towards **not moving**, because a
+  title that already runs at the stock base is not worth a coin toss.
+- **The loader reports its own base** in the four bytes it appends to its VERS
+  payload after the version string's NUL (`cmd_version`). Without that the host
+  refuses to move anything — probing candidate bases for the `0xdeadbeef` magic
+  would take several round trips and still not distinguish a live loader from
+  the remains of a previous one. An older loader sends no such bytes and is
+  handled, not failed.
+- **The hop is not optional and its reason is §14.17.** Going from a low base to
+  `0x8cfe8000` directly writes through the running loader's packet buffers, so
+  the host goes via `0x8ce00000` — chosen because its span is clear of every
+  other base in the set, in both directions. Two 26 KB uploads, ~1.1 s total.
+- **`is_uploadable()` gates ELF sections on SHF_ALLOC and a non-zero address**,
+  not on `SHT_PROGBITS` alone. The old test logged "skipping" and then pushed
+  the section anyway, so `.symtab`/`.strtab`/`.comment` were uploaded to address
+  0 on every ELF; it went unseen because the common input is a raw
+  `1ST_READ.BIN`, which never reaches that branch.
+- Settings a preset asks for that the host does **not** act on (`irq`, `cdda`,
+  `type`, `mode`, `low`, `heap`, `altread`, `pa*`/`pv*`) are logged as warnings
+  at load time rather than dropped in silence — when a title misbehaves, that
+  line is the first thing worth knowing.
 
 What the DC side depends on:
 
@@ -929,9 +1157,10 @@ Code first. Then, most likely to answer a question:
 | `Makefile.hostdetect` | host flags |
 | `host-src/tool/dc-tool.c` | CLI and protocol behaviour |
 | `target-src/dcload/dcload.c` | the DC main loop |
-| `target-src/dcload/dcload.x` + `dcload.map` | the memory map, and `_end` |
+| `target-src/dcload/Makefile` | the loader's base address and layout (§4.11) |
+| `target-src/dcload/dcload.x.in` + `dcload.map` | the memory map, and `_end` (`dcload.x` is generated) |
 | `target-src/dcload/cdfs_syscalls.c`, `cdfs_redir.s` | GD emulation — long headers, read them |
-| `target-src/dcload/go.s` | the handoff, and why SR and CCR are what they are |
+| `target-src/dcload/go.S` | the handoff, and why SR and CCR are what they are |
 | `target-src/1st_read/loader.s` | bootstrap flow |
 | `README.md`, `CHANGES` | user-facing behaviour and history |
 | `Cdif131e.txt` | SPI / GD-ROM command spec |
@@ -945,3 +1174,4 @@ Documents in `docs/`:
 | `flycast-debug-loop.md` | the emulator-as-target workflow. |
 | `read-back-verification.md` | what read-back verification proves, what it cannot, how to read a mismatch. |
 | `dreamshell-presets/` | 6168 archived per-game presets — what DreamShell prescribes for a given title (`memory`, `dma`, `async`, `irq`). |
+| `game-presets.tsv` | the same thing folded to one row per game, which is what the host reads (§16). **Generated** by `scripts/make-preset-db.py`. |

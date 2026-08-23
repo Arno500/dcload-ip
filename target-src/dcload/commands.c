@@ -86,6 +86,18 @@ typedef struct {
 // Align huge map array to 8 bytes (it's already after 2x unsigned ints)
 __attribute__((aligned(8))) static bin_info_t bin_info; // Here's a global array. This one is massive, but please don't shrink it. It's meant to act as a map where each 1024B maps into 16MB RAM, and 1024B fits into a packet...
 
+/*
+ * The loader's own base address, from the linker script (dcload.x.in:
+ * PROVIDE(_dcload_base = ORIGIN(ram))). Everything below that used to be
+ * written as 0xac004000 / 0xac004004 names it through this instead, because
+ * the base is per-title now -- the host relinks and chainloads the loader to
+ * whatever address a game's DreamShell preset asks for. A literal here would
+ * be a literal the linker owns, which is the shape of bug that once rebooted
+ * the machine at EXEC with no breadcrumb (AGENTS.md 14.11).
+ */
+extern char dcload_base[];
+#define DCLOAD_BASE_P2 (((unsigned int)dcload_base) | 0xa0000000U)
+
 void cmd_reboot(void)
 {
 	booted = 0;
@@ -94,7 +106,7 @@ void cmd_reboot(void)
 //	CacheBlockPurge((void*)0x0c004000, 1536);
 	asm volatile ("nop\n\t" : : : "memory"); // memory barrier for GCC
 	disable_cache();
-	go(0xac004000);
+	go(DCLOAD_BASE_P2);
 }
 
 void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, command_t * command)
@@ -124,12 +136,14 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 			disp_status("executing...");
 
 		if (cmd_size&1)
-			*((volatile unsigned int *)0xac004004) = 0xdeadbeef; /* enable console */
+			*((volatile unsigned int *)(DCLOAD_BASE_P2 + 4)) = 0xdeadbeef; /* enable console */
 		else
-			*((volatile unsigned int *)0xac004004) = 0xfeedface; /* disable console */
+			*((volatile unsigned int *)(DCLOAD_BASE_P2 + 4)) = 0xfeedface; /* disable console */
 
 		if (cmd_size>>1)
+		{
 			cdfs_redir_enable();
+		}
 
 		/* If what we are starting turns out to be another dcload, this is the
 		 * only chance to tell it what address we were answering on -- see the
@@ -138,6 +152,18 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 
 		running = 1;
 
+#if GUEST_TICK
+		/* Last thing before the jump, so the first sample is already the
+		 * title's own code and not ours. */
+		guest_tick_arm();
+#endif
+#if ISOLDR_SETUP_MACHINE
+		/* isoldr's last step before launch(): timer restarted, ASIC
+		 * interrupts quiesced, GD interrupt cleared. Not done for
+		 * cmd_reboot() -- that goes back into this loader, which wants
+		 * the machine exactly as it is. */
+		setup_machine();
+#endif
 //		CacheBlockPurge((void*)0x0c004000, 1536);
 		asm volatile ("nop\n\t" : : : "memory"); // memory barrier for GCC
 		disable_cache();
@@ -505,6 +531,26 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	// the 'data' member is an unsigned char pointer
 	memcpy(response->data + datalength, bb->name, j);
 	datalength += j;
+
+	/*
+	 * Then four raw bytes: the address this loader was linked at, big-endian
+	 * like every other number on the wire.
+	 *
+	 * The host needs it to decide whether to chainload. A title's DreamShell
+	 * preset names the address the loader has to be at to stay out of its way
+	 * (`memory`), and the host answers that by uploading a loader relinked for
+	 * it -- but only when the one already running is somewhere else. Probing
+	 * for the 0xdeadbeef magic at each candidate base instead would be several
+	 * round trips and would still not distinguish a live loader from the
+	 * remains of a previous one.
+	 *
+	 * This goes AFTER the string's NUL, and `size` covers it. An older host
+	 * treats the payload as a C string and prints it unchanged; there is no
+	 * version gate to get wrong.
+	 */
+	unsigned int base_be = htonl((unsigned int)dcload_base);
+	memcpy(response->data + datalength, &base_be, 4);
+	datalength += 4;
 
 	response->size = htonl(datalength);
 	// Stuff the adapter type inside the otherwise unused address field. :)

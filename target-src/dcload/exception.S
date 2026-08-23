@@ -204,7 +204,7 @@ return_to_loader:
 stack_addr:
 	.long 0x8d000000
 exc_to_string_k:
-	.long 0x8c00401c
+	.long (DCLOAD_BASE + 0x1c)
 timeout_1second:
 	.long 66666666
 dump_size:
@@ -214,7 +214,7 @@ exception_id:
 ! "EXPT" (no null termination)
 	.long 0x54505845
 dcloadsyscall_k:
-	.long	0x8c004008
+	.long	(DCLOAD_BASE + 0x08)
 
 ! regdump will be aligned to 4 bytes just by virtue of how all the above variables
 ! are aligned to 4 bytes and are all longs.
@@ -506,11 +506,11 @@ disp_addr:
 val_addr:
 	.long disp_values
 entry_addr:
-	.long	0x8c004000
+	.long	(DCLOAD_BASE + 0x00)
 draw_k:
-	.long	0x8c004014
+	.long	(DCLOAD_BASE + 0x14)
 uint_to_string_k:
-	.long	0x8c004018
+	.long	(DCLOAD_BASE + 0x18)
 expevt:
 	.long	0xff000024
 labels1_k:
@@ -522,7 +522,7 @@ labels3_k:
 labels4_k:
 	.long labels4
 setup_video_k:
-	.long 0x8c00400c
+	.long (DCLOAD_BASE + 0x0c)
 .align 2
 expevt_string:
 	.asciz "EXPEVT"
@@ -619,5 +619,144 @@ labels4:
 ! VBR + 0x600
 interrupt:
 	nop ! would rather not have a return as the first instruction given a branch shouldn't be there
+#if GUEST_TICK
+	bra tick_handler
+	 nop
+#else
 	rte
 	 nop
+#endif
+
+#if GUEST_TICK
+!
+! GUEST_TICK -- a sampling handler for a title that has stopped talking to us.
+!
+! WHY. dcload only executes when a title calls a GD syscall. A title that hangs
+! before its first disc read therefore takes the machine with it: no packet is
+! answered, no counter is readable, and every diagnosis is guesswork. This
+! handler runs off TMU0, which is on-chip and needs nothing from Holly, so it
+! keeps running whatever the title has done to the ASIC.
+!
+! WHAT IT RECORDS. SPC -- the PC the title was executing when the timer fired --
+! into a 32-entry ring, plus SSR and INTEVT. A hung title samples to the same
+! handful of addresses, and that names the loop. INTEVT also says which
+! interrupts the machine is actually delivering, which nothing here has ever
+! been able to see.
+!
+! NO STACK, NO CALLS, NO MEMORY FOR SAVES. The title's r15 may be garbage in
+! exactly the situation this exists for, so nothing is pushed. Registers are
+! parked in REGISTER BANK 0 with ldc Rm,Rn_BANK, which reaches the bank that is
+! not current and needs no scratch register to get started.
+!
+! THE ASSUMPTION THAT BUYS THAT, WRITTEN DOWN: go.S hands the title SR with
+! RB=1, so the title runs in bank 1 and bank 0 is dead space. An exception entry
+! sets RB=1, which it already is, so this handler shares the title's bank 1 and
+! bank 0 stays free. A title that switches itself to RB=0 breaks the assumption
+! -- but a title rewriting SR that way has almost certainly installed its own
+! VBR too (Sonic Adventure does), at which point this handler is no longer
+! reachable at all. That is why this is a diagnostic flag and not a feature.
+!
+! THE WATCHDOG is what makes the samples readable. If the title is hung, nobody
+! ever services the network again, so after GUEST_TICK_WATCHDOG ticks the
+! handler jumps back into the loader's entry point. dcload re-inits, adopts the
+! adapter warm, and answers on the network again -- with the ring still intact,
+! because it lives above the loader and outside every region crt0 zeroes.
+!
+	.align 2
+tick_handler:
+	ldc	r0,r0_bank		! park in bank 0: no memory, no stack
+	ldc	r1,r1_bank
+	ldc	r2,r2_bank
+	ldc	r3,r3_bank
+
+	mov.l	tick_blk_k,r0
+
+	mov.l	@(4,r0),r1		! ticks++
+	add	#1,r1
+	mov.l	r1,@(4,r0)
+
+	stc	spc,r2			! where the title actually is
+	mov.l	r2,@(12,r0)
+	stc	ssr,r3
+	mov.l	r3,@(16,r0)
+	mov.l	intevt_k,r3
+	mov.l	@r3,r3
+	mov.l	r3,@(20,r0)
+
+	mov.l	@(8,r0),r3		! ring[idx] = SPC
+	mov	r0,r1
+	add	#32,r1
+	shll2	r3
+	add	r3,r1
+	mov.l	r2,@r1
+	shlr2	r3
+	add	#1,r3
+	mov	#31,r2
+	and	r2,r3
+	mov.l	r3,@(8,r0)
+
+	mov.l	@(20,r0),r3		! ack TMU0 only if this was TUNI0
+	mov.l	tuni0_k,r2
+	cmp/eq	r2,r3
+	bf	tick_no_ack
+	mov.l	tcr0_k,r1
+	mov.w	@r1,r3
+	mov.w	tcr_unf_k,r2
+	and	r2,r3
+	mov.w	r3,@r1
+tick_no_ack:
+
+	mov.l	@(24,r0),r1		! watchdog limit, 0 = disabled
+	tst	r1,r1
+	bt	tick_done
+	mov.l	@(4,r0),r2
+	cmp/hs	r1,r2
+	bf	tick_done
+	mov	#1,r2			! record that we took the machine back
+	mov.l	r2,@(28,r0)
+	mov.l	tick_loader_k,r1
+	jmp	@r1			! into dcload, BL still 1 -- which is the
+	 nop				! state 1st_read runs it in anyway
+
+tick_done:
+	stc	r3_bank,r3
+	stc	r2_bank,r2
+	stc	r1_bank,r1
+	stc	r0_bank,r0
+	rte
+	 nop
+
+	.align 2
+tick_blk_k:
+	.long	GUEST_TICK_BLOCK
+intevt_k:
+	.long	0xff000028
+tuni0_k:
+	.long	0x400			! INTEVT for TUNI0
+tcr0_k:
+	.long	0xffd80010
+tick_loader_k:
+	.long	DCLOAD_BASE + 0x20000000
+	.align 1
+tcr_unf_k:
+	.word	0xfeff			! TCR0 with UNF cleared
+
+! The sampling block is NOT here -- it is at GUEST_TICK_BLOCK (0x8cff8000), and
+! the Makefile explains why: anything inside this image is inside the region
+! 1st_read's bootstrap zero-fills, so the samples would not survive the reset
+! that is the only way to read them back after a title has hung the machine.
+!
+! TWO ADDRESSES HAVE ALREADY BEEN WRONG HERE, AND BOTH TAUGHT SOMETHING.
+! VBR + 0x800 (one byte past this image) is memory belonging to the title:
+! Sonic Adventure 2 read our magic word out of it and passed it to memcmp as a
+! pointer, taking an address error on 0xfc3afdfa. That was NOT a bug in the
+! title and NOT the failure being chased -- it was this instrument corrupting
+! what it was measuring, and the register dump it produced was misread for a
+! whole session as evidence about a library-handle table. It did prove one
+! thing worth keeping: the dump came out of general_1 below, so OUR VECTOR
+! TABLE WAS STILL INSTALLED while the title ran. A title that had replaced VBR
+! could not have produced it.
+!
+! Then VBR + 0x700, inside this image: safe from the title, but wiped by the
+! bootstrap on the next boot, which is when you go to read it.
+#endif

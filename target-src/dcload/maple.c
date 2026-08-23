@@ -64,8 +64,14 @@ void maple_wait_dma()
  * 0x8cfe8000 is what isoldr's own heap heuristic picks as free high RAM
  * (ARCHITECTURE.md 10.2). Maple DMA only needs RAM the controller can write
  * and 32-byte alignment, so it does not care where it lives.
+ *
+ * The Makefile supplies the address, because 0x8cfe8000 is also a base a
+ * title can ask the loader to move to -- and then this buffer would be inside
+ * the image it is supposed to be clear of. See the layout table there.
  */
+#ifndef MAPLE_DMA_BUFFER_ADDR
 #define MAPLE_DMA_BUFFER_ADDR 0x8cfe8000U
+#endif
 volatile unsigned char *const dmabuffer =
 	(volatile unsigned char *)MAPLE_DMA_BUFFER_ADDR;
 

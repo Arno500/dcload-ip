@@ -96,6 +96,7 @@ extern unsigned int g_rx_frames, g_rx_wraps, g_rx_hdr_defer, g_rx_copying;
 extern unsigned int g_rx_overflow, g_rx_reinit, g_rx_last_capr, g_rx_last_cbr, g_rx_polls;
 extern unsigned int g_rx_linkchange, g_rx_link_giveup, g_rx_underrun_ack;
 extern unsigned int g_rx_status_drop, g_rx_last_bad_status, g_rx_missed;
+extern unsigned int g_rx_resync;
 extern int loop_secs_elapsed;
 
 // All adapter drivers should use this shared buffer to receive.

@@ -11,3 +11,7 @@ example-src/exception-test
 example-src/gethostinfo
 target-src/dcload/dcload
 target-src/dcload/exception
+
+# Python bytecode from the scripts in this directory
+__pycache__/
+*.pyc

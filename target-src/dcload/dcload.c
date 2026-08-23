@@ -729,11 +729,270 @@ void set_ip_dhcp(void)
 	// dcload-ip can now keep on going as normal.
 }
 
+/*
+ * The loader's own base, from the linker script (dcload.x.in PROVIDEs
+ * _dcload_base = ORIGIN(ram)). Same reasoning as commands.c: the base is
+ * per-title, so C names it rather than restating it.
+ */
+extern char dcload_base[];
+/* .hiram's placement, likewise from dcload.x. The asm name is __hiram_start. */
+extern char _hiram_start[];
+
+/*
+ * DCLOAD_ZERO_GAME_RAM -- hand the title a clean machine.
+ *
+ * A real Dreamcast boots a title through IP.BIN, which clears RAM first. We do
+ * not: the host uploads 1ST_READ.BIN over whatever the previous session left
+ * behind -- an earlier dcload, an earlier title, the BIOS -- and jumps. A title
+ * whose BSS lies beyond the end of its own file therefore starts with garbage
+ * in it, and garbage in a control structure produces a spin, not a fault: black
+ * screen, no exception, no disc read, and the loader never gets the CPU back.
+ *
+ * Under an emulator this cannot happen, because emulated RAM starts zeroed.
+ * That makes it one of the few divergences that is invisible on flycast BY
+ * CONSTRUCTION, which is the shape of the failure being chased.
+ *
+ * The range runs from 1ST_READ.BIN's load address up to the LOWEST of our own
+ * placements that lies above it -- "above it" matters, because at the stock
+ * base the loader itself is BELOW the title and a plain minimum would collapse
+ * the range to nothing. 0x8c010000 and the top of RAM are platform constants,
+ * not addresses this linker owns; every bound that IS ours comes from the
+ * build. What each base gives:
+ *
+ *   0x8c004000  image+stack end at 0x8c00fc00, below the start and skipped;
+ *               the Maple buffer bounds it.       -> [0x8c010000, 0x8cfe8000)
+ *   0x8ce00000  the base itself.                  -> [0x8c010000, 0x8ce00000)
+ *   0x8cef8000  the base itself.
+ *   0x8cfe8000  the base itself.
+ *
+ * so nothing live is ever inside it -- including the guest vector table at
+ * DCLOAD_GUEST_VBR, which is below the start for every base. What it does NOT
+ * clear is RAM above a HIGH loader; a title needing that too wants a second
+ * range here.
+ */
+static void zero_game_ram(void)
+{
+#if DCLOAD_ZERO_GAME_RAM
+	const unsigned int start = 0x8c010000U;	/* where a title is loaded */
+	unsigned int end = 0x8d000000U;		/* top of RAM on a retail unit */
+	unsigned int i;
+	const unsigned int ours[3] = {
+		(unsigned int)dcload_base,
+		(unsigned int)MAPLE_DMA_BUFFER_ADDR,
+		(unsigned int)_hiram_start,
+	};
+	unsigned int *p;
+	unsigned int *e;
+
+	for (i = 0; i < 3; i++)
+	{
+		if ((ours[i] > start) && (ours[i] < end))
+			end = ours[i];
+	}
+
+	/* Through P2: caches are off here anyway, and this must not leave 15 MB
+	 * of dirty lines behind it for the title to trip over. */
+	p = (unsigned int *)(start | 0xa0000000U);
+	e = (unsigned int *)(end | 0xa0000000U);
+
+	while (p < e)
+		*p++ = 0;
+#endif
+}
+
+/*
+ * setup_machine() -- ported from DreamShell isoldr (loader/utils.c). We had no
+ * equivalent at all: dcload jumped to a title leaving the machine in whatever
+ * state it had been running in.
+ *
+ * The part that matters most is the TIMER. A title started in isoldr's
+ * BOOT_MODE_DIRECT -- which is our only mode -- never runs IP.BIN's bootstrap,
+ * and the bootstrap is what leaves TMU0 free-running. isoldr compensates by
+ * reprogramming the unit and starting TMU0 itself, and it does so ONLY for
+ * direct boot. A title that waits on TCNT0 with the counter stopped waits
+ * forever, with no fault and no disc access: the shape of the failure here.
+ *
+ * The ASIC block is the same thing for interrupts: masks cleared, pending
+ * acknowledged, so nothing can be delivered into a vector table that
+ * acknowledges nothing (exception.S). Reading the G1 alternate status register
+ * clears a drive interrupt the real GD-ROM may still be asserting -- a source
+ * that exists on a console and not in an emulator.
+ */
+void setup_machine(void)
+{
+	volatile unsigned char *tmu8 = (volatile unsigned char *)0xffd80000;
+	volatile unsigned int *tmu32 = (volatile unsigned int *)0xffd80000;
+	volatile unsigned short *tmu16 = (volatile unsigned short *)0xffd80000;
+	volatile unsigned int *asic = (volatile unsigned int *)0xa05f6900;
+	volatile unsigned char *g1_altstatus = (volatile unsigned char *)0xa05f709c;
+	unsigned char dummy;
+
+	tmu8[4] = 0;			/* TSTR: stop every timer first */
+	tmu8[0] = 0;			/* TOCR */
+	tmu32[2] = 0xffffffff;		/* TCOR0 */
+	tmu32[3] = 0xffffffff;		/* TCNT0  -- TCR0 is left alone, as isoldr does */
+	tmu32[5] = 0xffffffff;		/* TCOR1 */
+	tmu32[6] = 0xffffffff;		/* TCNT1 */
+	tmu16[14] = 0;			/* TCR1  */
+	tmu32[8] = 0xffffffff;		/* TCOR2 */
+	tmu32[9] = 0xffffffff;		/* TCNT2 */
+	tmu16[20] = 0;			/* TCR2  */
+
+	/* ONE DELIBERATE DIVERGENCE FROM isoldr, and it is forced on us by go.S.
+	 * isoldr leaves TCR0 exactly as it found it, which is safe there because
+	 * it hands the title SR = 0x700000f0 -- BL=1, IMASK=15 -- so an underflow
+	 * cannot be delivered whatever UNIE says. We hand over SR = 0x60000101
+	 * with interrupts live, into a vector table whose VBR + 0x600 is
+	 * `nop; rte; nop` and ACKNOWLEDGES NOTHING (exception.S). Starting TMU0
+	 * with UNIE still set from whatever ran before us would therefore livelock
+	 * the machine on the first underflow: taken, returned from unacknowledged,
+	 * taken again -- black screen, no fault, no disc read, i.e. indistinguish-
+	 * able from the failure this function exists to test. Clear UNIE only;
+	 * TPSC and everything a title might read stay as they were. */
+	tmu16[8] &= (unsigned short)~0x0020;	/* TCR0.UNIE */
+
+	tmu8[4] |= 1;			/* TSTR: start TMU0, as the bootstrap would */
+
+	asic[4] = 0;			/* SB_IML2NRM */
+	asic[5] = 0;			/* SB_IML2EXT */
+	asic[6] = 0;			/* SB_IML2ERR */
+	asic[8] = 0;			/* SB_IML4NRM */
+	asic[9] = 0;			/* SB_IML4EXT */
+	asic[10] = 0;			/* SB_IML4ERR */
+	asic[12] = 0;			/* SB_IML6NRM */
+	asic[13] = 0;			/* SB_IML6EXT */
+	asic[14] = 0;			/* SB_IML6ERR */
+	asic[16] = 0;			/* SB_PDTNRM  */
+	asic[17] = 0;			/* SB_PDTEXT  */
+	asic[20] = 0;			/* SB_G2DTNRM */
+	asic[21] = 0;			/* SB_G2DTEXT */
+
+	dummy = *g1_altstatus;		/* clears a pending GD-ROM interrupt */
+	(void)dummy;
+
+	asic[0] = 0xffffffff;		/* SB_ISTNRM: acknowledge everything */
+	asic[2] = 0xffffffff;		/* SB_ISTERR */
+	asic[1] = 0xf;			/* SB_ISTEXT */
+	asic[2] = 0x9fffff;		/* SB_ISTERR, again -- isoldr writes both */
+
+	*((volatile unsigned int *)0xa05f74a0) = 0x2001;	/* SB_G1GDRC */
+}
+
+/*
+ * DCLOAD_CLEAR_IPBIN -- the region 0x8c008000..0x8c010000 belongs to IP.BIN.
+ *
+ * A real Dreamcast loads IP.BIN there and runs its bootstrap; isoldr loads it
+ * too, EVEN IN DIRECT-BOOT MODE (main.c, and it goes out of its way to check
+ * the loader is not sitting on top of it first). We never have, and the region
+ * therefore holds whatever the last thing to run left in it.
+ *
+ * It is not inert either: Sonic Adventure 2 reads out of it and passes what it
+ * finds to memcmp as a pointer. Measured on the console, with a diagnostic
+ * block of ours parked at 0x8c00fc00 -- the title took an address error on
+ * `mov.b @r7+,r2` with r7 = 0xfc3afdfa, inside a plain memcmp at 0x8c0ca1b4.
+ *
+ * READ THAT CAREFULLY, BECAUSE IT WAS MISREAD ONCE AND COST A SESSION. The
+ * faulting routine is memcmp, nothing more; the "library-handle table with an
+ * entry count and GUIDs" this comment used to describe was inferred from it and
+ * was never observed. And the fault existed ONLY because our own block was
+ * sitting there. It says the title reads this region. It says nothing about why
+ * the title fails.
+ *
+ * SO THIS IS NOT A FIX, AND IT WAS TESTED. Zeroing the region changed nothing
+ * for Sonic Adventure 2 on hardware, and neither did loading the real IP.BIN
+ * header sector over it (which is what isoldr does in direct boot, and which
+ * the Rust host now sends). Both are kept because both are more faithful than
+ * leaving the previous session's debris there -- not because either cured
+ * anything.
+ *
+ * ONLY WHEN THE LOADER IS NOT IN LOW RAM. At the stock base the image occupies
+ * 0x8c004000 upward and is itself inside this region, so there is nothing to
+ * clear and no way to serve a title that needs it -- which is precisely why
+ * DreamShell's preset for this title asks for 0x8cfe8000 (AGENTS.md 4.11).
+ * Our own vector table at DCLOAD_GUEST_VBR is above the range and survives.
+ */
+static void clear_ipbin_region(void)
+{
+#if DCLOAD_CLEAR_IPBIN
+	unsigned int *p, *e;
+
+	if ((unsigned int)dcload_base < 0x8c010000U)
+		return;
+
+	/*
+	 * TWO RANGES, WITH OUR OWN VECTOR TABLE PUNCHED OUT OF THE MIDDLE.
+	 *
+	 * The first attempt cleared only up to DCLOAD_GUEST_VBR and did nothing at
+	 * all, because the table Sonic Adventure 2 walks is at 0x8c00fc00 -- ABOVE
+	 * that boundary, in the kilobyte between the end of exception.bin and the
+	 * title's load address. That kilobyte is the part that matters and it was
+	 * the part being skipped.
+	 *
+	 * The gap is exception.bin itself, which the host uploaded as .guestvbr
+	 * before this loader started running and which IS the vectors the title is
+	 * about to be handed. 0x800 is its size; the link would have to change for
+	 * that to stop being true, and exception.bin has been exactly 2048 bytes
+	 * for as long as this file has existed.
+	 */
+	p = (unsigned int *)(0x8c008000U | 0xa0000000U);
+	e = (unsigned int *)((unsigned int)DCLOAD_GUEST_VBR | 0xa0000000U);
+	while (p < e)
+		*p++ = 0;
+
+	p = (unsigned int *)(((unsigned int)DCLOAD_GUEST_VBR + 0x800U) | 0xa0000000U);
+	e = (unsigned int *)(0x8c010000U | 0xa0000000U);
+	while (p < e)
+		*p++ = 0;
+#endif
+}
+
+#if GUEST_TICK
+/*
+ * Arm the sampling handler in exception.S. TMU0 is on-chip, so unlike anything
+ * routed through Holly it cannot be silenced by what a title does to the ASIC
+ * masks -- which matters, since the whole point is to keep running after a
+ * title has stopped cooperating.
+ *
+ * The block is at DCLOAD_GUEST_VBR + 0x800, a FIXED address for every loader
+ * base, so it can be read with SBIQ without resolving a single symbol and
+ * without knowing which loader is running (AGENTS.md 14.19 stops applying).
+ * It is also above everything crt0 zeroes, so it survives the watchdog jumping
+ * back into the loader.
+ */
+void guest_tick_arm(void)
+{
+	volatile unsigned int *blk =
+		(volatile unsigned int *)(GUEST_TICK_BLOCK | 0xa0000000U);
+	volatile unsigned char *tstr = (volatile unsigned char *)0xffd80004;
+	volatile unsigned int *tcor0 = (volatile unsigned int *)0xffd80008;
+	volatile unsigned int *tcnt0 = (volatile unsigned int *)0xffd8000c;
+	volatile unsigned short *tcr0 = (volatile unsigned short *)0xffd80010;
+	volatile unsigned short *ipra = (volatile unsigned short *)0xffd00004;
+	unsigned int i;
+
+	for (i = 0; i < 40; i++)
+		blk[i] = 0;
+	blk[0] = 0x4443544bU;		/* 'DCTK', so a reader can tell it is live */
+	blk[6] = GUEST_TICK_WATCHDOG;
+
+	*tstr = (unsigned char)(*tstr & ~1);	/* stop TMU0 while reprogramming */
+	*tcor0 = GUEST_TICK_PERIOD;
+	*tcnt0 = GUEST_TICK_PERIOD;
+	*tcr0 = 0x0020;			/* UNIE, TPSC = Pck/4 = 12.5 MHz */
+	*ipra = (unsigned short)((*ipra & 0x0fff) | 0x4000); /* TMU0 priority 4 */
+	*tstr = (unsigned char)(*tstr | 1);
+}
+#endif
+
 int main(void)
 {
 	unsigned char start;
 
 	running = 0;
+
+	/* Before the adapter is up, so no transfer can be in flight across it. */
+	zero_game_ram();
+	clear_ipbin_region();
 
 	/*    scif_init(115200); */
 

@@ -883,6 +883,42 @@ static void gd_note_caller(unsigned int pr)
 	}
 }
 
+/*
+ * GD_SERVICE_EVERY_SYSCALL -- A DIAGNOSTIC.
+ *
+ * bb->loop() is reached from the READ PATH ONLY (data_transfer below). Every
+ * other syscall answers out of state and returns, so a title that busy-waits on
+ * ReqCmd/GetCmdStat/GetDrvStat without ever completing a read leaves this
+ * loader running constantly and ANSWERING NOTHING: no VERS, no ping, no SBIQ.
+ * That silence is indistinguishable from a dead loader, which is exactly the
+ * hole this closes -- with it on, the counters in g_gd_idx_counts[] become
+ * readable in the one situation where they say the most.
+ *
+ * Bounded by drain_iters so a call costs a fixed number of poll iterations, and
+ * skipped whenever the GD path is already held, so it can never insert a
+ * transmit into the middle of a live transfer (the pkt_buf invariant at the top
+ * of this file).
+ */
+#if GD_SERVICE_EVERY_SYSCALL
+#ifndef GD_SERVICE_ITERS
+#define GD_SERVICE_ITERS 256
+#endif
+static void gd_service_net(void)
+{
+	if (gd_lock())
+	{
+		return; /* a transfer owns the wire -- stay off it */
+	}
+	gd_unlock();
+
+	drain_iters = GD_SERVICE_ITERS;
+	bb->loop(0);
+	drain_iters = 0;
+}
+#else
+#define gd_service_net() do { } while (0)
+#endif
+
 int gdGdcReqCmd(int cmd, int *param)
 {
 	int gd_chn = GDC_CHN_ERROR;
@@ -890,6 +926,7 @@ int gdGdcReqCmd(int cmd, int *param)
 	int n;
 
 	g_gd_idx_counts[0]++;
+	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
 
 	if ((cmd < 0) || (cmd > CMD_MAX) || gd_lock())
@@ -950,6 +987,7 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 	int rv = CMD_STAT_IDLE;
 
 	g_gd_idx_counts[1]++;
+	gd_service_net();
 
 	if (gd_lock())
 	{
@@ -1013,6 +1051,7 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 int gdGdcGetDrvStat(int *status)
 {
 	g_gd_idx_counts[4]++;
+	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
 
 	if (gd_lock())
@@ -1188,3 +1227,4 @@ int gdGdcDummy(int gd_chn, int *arg2)
 	(void)arg2;
 	return 0;
 }
+

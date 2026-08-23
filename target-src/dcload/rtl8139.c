@@ -109,6 +109,17 @@ unsigned char g_warm_start = 0;
  * inherit. Consumed by main() before set_ip_from_file(). */
 unsigned int g_warm_ip = 0;
 
+/*
+ * How many consecutive polls may find an implausible header at the SAME ring
+ * position before the position itself is treated as wrong. A frame the chip is
+ * genuinely mid-way through writing resolves within one frame time (~120 us at
+ * 100 Mbit); this is three orders of magnitude past that, so it can only be
+ * reached by a ring that has desynchronised. See rtl_bb_rx().
+ */
+#define RTL_HDR_DEFER_LIMIT 2048u
+static unsigned short rtl_defer_at = 0;	/* cur_rx the run of defers is stuck at */
+static unsigned int rtl_defer_run = 0;	/* length of that run */
+
 // 8, 16, and 32 bit access to G2 addresses
 static vuc * const g28 = REGC(0xa1000000);
 static vus * const g216 = REGS(0xa1000000);
@@ -461,6 +472,29 @@ static void rtl_init(void)
 }
 
 /*
+ * PUT BOTH SIDES BACK ON THE SAME PACKET BOUNDARY.
+ *
+ * CBR is the chip's own write pointer, and it only ever advances by whole
+ * frames, so it is the one position in the ring that is guaranteed to be a
+ * boundary. Adopting it -- and telling the chip so, via CAPR's -16 convention
+ * -- throws away whatever is queued and leaves both sides agreeing the ring is
+ * empty.
+ *
+ * Two callers, for the same reason: a warm start inherits a ring it has no
+ * read pointer for, and the header-plausibility guard in rtl_bb_rx() needs an
+ * escape when the slot it is waiting on never becomes valid. Discarding is the
+ * right answer in both cases -- the host retransmits what it did not see
+ * acknowledged, and a frame we cannot parse is already lost.
+ */
+static void rtl_ring_resync(void)
+{
+	unsigned int cbr = nic16[RT_RXBUFHEAD/2];
+
+	rtl.cur_rx = (unsigned short)((cbr & (RX_BUFFER_LEN - 1)) & ~3U);
+	nic16[RT_RXBUFTAIL/2] = (unsigned short)((rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1));
+}
+
+/*
  * IS THIS ADAPTER STILL THE ONE A PREVIOUS DCLOAD SET UP?
  *
  * Every value tested here is one rtl_init() writes and nothing else does. A
@@ -522,6 +556,7 @@ static int rtl_warm_usable(void)
 	return 1;
 }
 
+
 /*
  * Take over a running adapter. Everything here is state that lived in the
  * PREVIOUS instance's memory and is therefore gone; the chip itself needs
@@ -529,8 +564,6 @@ static int rtl_warm_usable(void)
  */
 static void rtl_warm_adopt(void)
 {
-	unsigned int cbr;
-
 	rtl_read_mac();
 
 	/* Inherit the previous instance's address, if it left one. */
@@ -552,9 +585,7 @@ static void rtl_warm_adopt(void)
 	 * own write pointer throws the backlog away and leaves both sides agreeing
 	 * on an empty ring.
 	 */
-	cbr = nic16[RT_RXBUFHEAD/2];
-	rtl.cur_rx = (unsigned short)((cbr & (RX_BUFFER_LEN - 1)) & ~3U);
-	nic16[RT_RXBUFTAIL/2] = (unsigned short)((rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1));
+	rtl_ring_resync();
 	rtl.cur_tx = 0; /* rtl_bb_tx() waits on OWN, so any descriptor is safe to start from */
 
 	/* Conditions raised during someone else's session are not ours to act on. */
@@ -931,8 +962,49 @@ static int rtl_bb_rx()
 		if ((rx_size < 8U) || (rx_size > (RX_PKT_BUF_SIZE + 4U)))
 		{
 			g_rx_hdr_defer++;
+
+			/*
+			 * "SELF-CORRECTING" IS AN ASSUMPTION, AND IT WAS MEASURED FALSE.
+			 *
+			 * Everything above holds only while the chip is ACTUALLY writing
+			 * this slot: then the status word lands a few microseconds later
+			 * and the next poll consumes the frame. When cur_rx is instead
+			 * pointing somewhere the chip has no intention of writing -- off a
+			 * packet boundary, or behind a position it has already passed --
+			 * the header never becomes plausible and this break is not a
+			 * retry, it is a livelock.
+			 *
+			 * Measured on a chainloaded loader at 0x8cfe8000 that had gone
+			 * deaf: g_rx_hdr_defer 13436910 against g_rx_frames 24, with
+			 * g_rx_polls at 41 million. The loader was not hung and not
+			 * wedged on the PHY -- it was spinning here, answering roughly one
+			 * datagram in dozens, which is exactly what a host sees as "the
+			 * upload times out and a while later it works".
+			 *
+			 * So bound it. The legitimate wait is at most one frame time
+			 * (~120 us at 100 Mbit); this is three orders of magnitude more,
+			 * and past it the only useful move is the one a warm start already
+			 * makes -- take the chip's own write pointer and agree with it.
+			 * Nothing extra is lost: a frame whose header we cannot read is
+			 * already gone, and the host retransmits what it saw no
+			 * acknowledgement for.
+			 */
+			if (rtl.cur_rx != rtl_defer_at)
+			{
+				rtl_defer_at = rtl.cur_rx;
+				rtl_defer_run = 1;
+			}
+			else if (++rtl_defer_run > RTL_HDR_DEFER_LIMIT)
+			{
+				g_rx_resync++;
+				rtl_ring_resync();
+				rtl_defer_run = 0;
+			}
 			break;
 		}
+
+		/* Progress: whatever the ring looked like, it is moving again. */
+		rtl_defer_run = 0;
 
 		pkt_size = rx_size - 4;
 
@@ -1100,6 +1172,7 @@ unsigned int g_idle_polls_max = 0;
 unsigned int g_rx_frames = 0;		/* frames handed to the stack */
 unsigned int g_rx_wraps = 0;		/* cur_rx crossed the end of the ring */
 unsigned int g_rx_hdr_defer = 0;	/* header implausible, gave up and retried */
+unsigned int g_rx_resync = 0;		/* defers ran long enough to be a desync */
 unsigned int g_rx_copying = 0;		/* chip said "still copying" (0xfff0) */
 unsigned int g_rx_overflow = 0;		/* RX buffer overflow seen */
 unsigned int g_rx_reinit = 0;		/* ring refused to drain, NIC re-initialised */

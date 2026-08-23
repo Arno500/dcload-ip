@@ -84,19 +84,27 @@ exception_size:
     .long       (exception_end - exception) >> 2
 exception_ptr:
     .long       exception
+! The three addresses below are supplied by the Makefile with
+! -Wa,--defsym, read out of ../dcload's own build, because the loader is
+! relinkable per game now (see the header of ../dcload/Makefile). They used to
+! be literals, and a literal that had drifted from what the linker chose would
+! not fail the build here -- it would zero-fill and jump to the wrong address,
+! which on a console is a black screen with no way to tell why.
+!
+! Written as P2 (| 0xa0000000) because the cache is off at this point.
 exception_base:
 ! FYI: exception.bin is exactly 2048 bytes
-    .long       0xac00f400
+    .long       DCLOAD_GUEST_VBR | 0xa0000000
 dcload_size:
     .long       (dcload_end - dcload) >> 2
 dcload_ptr:
     .long       dcload
 dcload_base:
-    .long       0xac004000
+    .long       DCLOAD_BASE | 0xa0000000
 disable_cache:
     .long       _disable_cache
 dcload_max_sz:
-    .long       (0x8c010000 - 0x8c004000) >> 2
+    .long       (DCLOAD_ZERO_END - DCLOAD_BASE) >> 2
 
 ! Include the binaries here, making sure they're aligned to 4 byte boundaries
 ! and that they're a multiple of 4 bytes in size.

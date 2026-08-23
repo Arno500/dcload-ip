@@ -19,6 +19,11 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# The default build. Since the loader can be relinked per game and chainloaded
+# (target-src/dcload/loaders/dcload-0x8cfe8000.elf and friends), this is only
+# right when nothing has moved -- pass --elf for a relocated session, or every
+# symbol resolves to an address the running image does not use. The image check
+# below catches that, which is exactly what it is for.
 ELF = REPO / "target-src" / "dcload" / "dcload"
 NM = Path("/opt/toolchains/dc/sh-elf/bin/sh-elf-nm")
 
@@ -79,7 +84,15 @@ def rsp(payload: str) -> bytes:
 # So verify instead of hoping: read a word of CODE from the target and compare it
 # with the same address in the ELF. Code is immutable and resident, so any
 # mismatch means the running image is not this build.
-ANCHOR_SYMBOL = "_cmd_partbin_commit"
+# Several candidates, tried in order, because an anchor is a NAME and names go
+# away: this list used to be the single symbol _cmd_partbin_commit, which was
+# removed with the windowed-upload accounting, and from then on every dc-peek
+# run printed "anchor not in ELF, cannot verify image" and read on regardless --
+# i.e. the guard against reading a stale image was itself silently dead, which
+# is exactly the failure mode the comment above describes. Anything in this list
+# must be CODE (immutable and resident) and load-bearing enough that its
+# disappearance would be noticed.
+ANCHOR_SYMBOLS = ("_cmd_partbin", "_cmd_loadbin", "_cmd_execute", "_gdcServerMain")
 ANCHOR_LEN = 16
 
 
@@ -113,10 +126,15 @@ def elf_bytes_at(addr: int, length: int) -> bytes | None:
 
 def verify_image(sock, syms) -> bool:
     """True when the target's code matches this ELF at the anchor address."""
-    addr = syms.get(ANCHOR_SYMBOL) or syms.get(ANCHOR_SYMBOL.lstrip("_"))
+    addr = name = None
+    for candidate in ANCHOR_SYMBOLS:
+        addr = syms.get(candidate) or syms.get(candidate.lstrip("_"))
+        if addr is not None:
+            name = candidate
+            break
     if addr is None:
-        print(f"warning: anchor {ANCHOR_SYMBOL} not in ELF, cannot verify image",
-              file=sys.stderr)
+        print(f"warning: no anchor of {ANCHOR_SYMBOLS} is in the ELF, "
+              "cannot verify image", file=sys.stderr)
         return True
     want = elf_bytes_at(addr, ANCHOR_LEN)
     if want is None:
@@ -145,7 +163,7 @@ def verify_image(sock, syms) -> bool:
         return True
     print(
         "MISMATCH: the running image is NOT this build.\n"
-        f"  {ANCHOR_SYMBOL} @ {addr:08x}\n"
+        f"  {name} @ {addr:08x}\n"
         f"    ELF says    {want.hex()}\n"
         f"    target says {got.hex()}\n"
         "  Every symbol address below would be wrong, so nothing is printed.\n"
@@ -176,7 +194,24 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=3263)
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the running-image identity check (see verify_image)")
+    ap.add_argument("--elf", default=None,
+                    help="ELF to resolve symbols from. Give this when the host "
+                         "has chainloaded a relinked loader, e.g. "
+                         "target-src/dcload/loaders/dcload-0x8cfe8000.elf; the "
+                         "default is the tree's own build at the stock base.")
+    ap.add_argument("--base", default=None,
+                    help="shorthand for --elf: a base address like 0x8cfe8000, "
+                         "resolved to target-src/dcload/loaders/dcload-<base>.elf")
     args = ap.parse_args()
+
+    global ELF
+    if args.elf:
+        ELF = Path(args.elf)
+    elif args.base:
+        ELF = REPO / "target-src" / "dcload" / "loaders" / f"dcload-{args.base}.elf"
+    if not ELF.is_file():
+        print(f"no such ELF: {ELF}", file=sys.stderr)
+        return 1
 
     # The anchor is a symbol, so the table is needed for verification too.
     syms = symbol_table()
