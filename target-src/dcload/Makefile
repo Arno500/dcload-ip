@@ -86,8 +86,8 @@ else
 endif
 
 CFLAGS += -DDCLOAD_BASE=$(DCLOAD_BASE) -DDCLOAD_STACK=$(DCLOAD_STACK) \
-          -DDCLOAD_GUEST_VBR=$(DCLOAD_GUEST_VBR) \
-          -DMAPLE_DMA_BUFFER_ADDR=$(DCLOAD_MAPLE)
+          -DDCLOAD_GUEST_VBR=$(DCLOAD_GUEST_VBR)
+
 
 # Sample the guest's PC from a TMU0 interrupt handler installed in the vector
 # table we hand the title (exception.S). The only instrument that keeps working
@@ -267,6 +267,7 @@ WITH_PMCR_CMD ?= 1
 CFLAGS += -DWITH_PMCR_CMD=$(WITH_PMCR_CMD)
 
 OBJCOPY	= $(TARGETOBJCOPY)
+READELF	= $(TARGETREADELF)
 
 DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o video.o memcpy.o memcmp.o memfuncs.o packet.o net.o adapter.o rtl8139.o dhcp.o dcload.o perfctr.o cdfs_redir.o cdfs_syscalls.o syscalls.o commands.o
 ifeq ($(WITH_LAN_ADAPTER),1)
@@ -303,10 +304,20 @@ all: dcload.bin exception.bin
 # markers, which ld would reject).
 dcload.x: dcload.x.in Makefile ../../Makefile.cfg
 	$(CC) -E -P -x c -DDCLOAD_BASE=$(DCLOAD_BASE) -DDCLOAD_STACK=$(DCLOAD_STACK) \
-	      -DDCLOAD_HIRAM=$(DCLOAD_HIRAM) $< -o $@
+	      -DDCLOAD_HIRAM=$(DCLOAD_HIRAM) -DDCLOAD_MAPLE=$(DCLOAD_MAPLE) $< -o $@
+
+# DCLOAD_EMIT_RELOCS=1 keeps the relocations in the ELF (`ld -q`), which is what
+# lets the HOST move this image to any base without a rebuild -- see the
+# `loaders` target and dcload-ip-rs's loaders::relocate(). It changes nothing
+# that is loaded: measured 2026-08-27, .text/.rodata/.data come out byte for
+# byte identical and at the same addresses; only the ELF on the PC grows
+# (39 KB -> 49 KB), and none of that reaches the Dreamcast.
+ifeq ($(DCLOAD_EMIT_RELOCS),1)
+  LDEXTRA += -Wl,-q
+endif
 
 dcload: $(DCLOBJECTS) dcload.x
-	$(CC) $(CFLAGS) -Wl,--warn-common -Wl,--no-undefined -Wl,-Map,dcload.map -Wl,-Tdcload.x -nostartfiles -nostdlib -static -Wl,-z,now $(DCLOBJECTS) -o $@ -lgcc
+	$(CC) $(CFLAGS) -Wl,--warn-common -Wl,--no-undefined -Wl,-Map,dcload.map -Wl,-Tdcload.x -nostartfiles -nostdlib -static -Wl,-z,now $(LDEXTRA) $(DCLOBJECTS) -o $@ -lgcc
 
 # Linked at the BIOS VBR, for every base: this image IS the vector table the
 # launched title is handed (go.s), so unlike the loader it does not move.
@@ -354,6 +365,10 @@ exception: $(EXCOBJECTS)
 # building these would only produce a loader that bricks the session.
 LOADER_BASES = 0x8c004000 0x8ce00000 0x8cef8000 0x8cfe8000
 LOADER_DIR   = loaders
+# The base the relocatable image is linked at. Any HIGH base does: the host
+# rewrites every address in it. This one is SCRATCH_BASE on the host side, so
+# an unrelocated copy still lands somewhere sane.
+LOADER_RELOC_BASE = 0x8ce00000
 
 .PHONY : loaders
 loaders:
@@ -372,6 +387,27 @@ loaders:
 	             --change-section-address .guestvbr=$(DCLOAD_GUEST_VBR) \
 	             dcload $(LOADER_DIR)/dcload-$$base.elf || exit 1; \
 	done
+	@# And one image the host can put ANYWHERE, without any of this running
+	@# again. The bases above answer the addresses we happen to have thought of;
+	@# this answers the ones we have not. Only a HIGH base is worth relocating:
+	@# a flat delta moves the whole layout together, which is true of the HIGH
+	@# family (stack, .hiram and Maple are all base-relative) and false of LOW
+	@# (its buffers stay at 0x8cfe8000 while the image is down at 0x8c004000).
+	@# That costs nothing: the CD always boots 0x8c004000 and the 593 presets at
+	@# that address ask for no move at all, so everything that must move is high.
+	@echo "[loaders] linking relocatable dcload at $(LOADER_RELOC_BASE)"
+	@$(MAKE) --no-print-directory clean >/dev/null || exit 1
+	@$(MAKE) --no-print-directory DCLOAD_BASE=$(LOADER_RELOC_BASE) DCLOAD_EMIT_RELOCS=1 \
+	         dcload exception.bin >/dev/null || exit 1
+	@$(OBJCOPY) --add-section .guestvbr=exception.bin \
+	           --set-section-flags .guestvbr=alloc,load,contents,readonly \
+	           --change-section-address .guestvbr=$(DCLOAD_GUEST_VBR) \
+	           dcload $(LOADER_DIR)/dcload-relocatable.elf || exit 1
+	@# The relocations are the whole point of that image, and objcopy is well
+	@# within its rights to drop them. Fail here rather than ship an ELF the
+	@# host would silently refuse to move.
+	@$(READELF) -S $(LOADER_DIR)/dcload-relocatable.elf | grep -q '\.rela\.text' || \
+	  { echo "[loaders] ERROR: relocations did not survive objcopy"; exit 1; }
 	@$(MAKE) --no-print-directory clean >/dev/null && $(MAKE) --no-print-directory all >/dev/null
 	@echo "[loaders] built:" && ls -l $(LOADER_DIR)
 

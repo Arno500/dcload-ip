@@ -737,6 +737,10 @@ void set_ip_dhcp(void)
 extern char dcload_base[];
 /* .hiram's placement, likewise from dcload.x. The asm name is __hiram_start. */
 extern char _hiram_start[];
+/* The Maple DMA buffer, from dcload.x too -- and named rather than spelled out
+ * for the extra reason in maple.c: a -D would land in a literal pool as a bare
+ * number, with no relocation, and quietly make the image un-relocatable. */
+extern char maple_dma_buffer[];
 
 /*
  * DCLOAD_ZERO_GAME_RAM -- hand the title a clean machine.
@@ -778,7 +782,7 @@ static void zero_game_ram(void)
 	unsigned int i;
 	const unsigned int ours[3] = {
 		(unsigned int)dcload_base,
-		(unsigned int)MAPLE_DMA_BUFFER_ADDR,
+		(unsigned int)maple_dma_buffer,
 		(unsigned int)_hiram_start,
 	};
 	unsigned int *p;

@@ -68,12 +68,29 @@ void maple_wait_dma()
  * The Makefile supplies the address, because 0x8cfe8000 is also a base a
  * title can ask the loader to move to -- and then this buffer would be inside
  * the image it is supposed to be clear of. See the layout table there.
+ *
+ * NAMED, NOT SPELLED OUT. The address comes from the linker script as a
+ * symbol (dcload.x.in: PROVIDE (_maple_dma_buffer = DCLOAD_MAPLE)), the same
+ * way the base itself is reached through _dcload_base -- and for a second
+ * reason beyond the one in AGENTS.md 4.11. A -D reaches the compiler as a
+ * NUMBER: -Os folds it straight into this function's literal pool, and a
+ * number in a literal pool carries no relocation. Measured 2026-08-27 by
+ * relinking the loader at two high bases and diffing: 841 words differ, all by
+ * exactly the delta, and 832 of them are described by the relocations `ld -q`
+ * emits. The nine that were not were all in _maple_docmd's pool, and all of
+ * them were this constant. With it named, relocating an `ld -q` image by a flat
+ * delta reproduces a native build at the new base BYTE FOR BYTE -- checked
+ * against three of them, including a negative delta and a base no one had ever
+ * linked at. Naming it makes the loader relocatable by the host without a
+ * rebuild; spelling it out makes it silently un-relocatable.
+ *
+ * It costs 16 bytes of `_end` (0x8c00a5e8 -> 0x8c00a5f8 at the stock base):
+ * the compiler can no longer fold the address in as a constant. Cheap against
+ * AGENTS.md 4.6's margin, and stated here because that section is the reason
+ * anyone would object.
  */
-#ifndef MAPLE_DMA_BUFFER_ADDR
-#define MAPLE_DMA_BUFFER_ADDR 0x8cfe8000U
-#endif
-volatile unsigned char *const dmabuffer =
-	(volatile unsigned char *)MAPLE_DMA_BUFFER_ADDR;
+extern unsigned char maple_dma_buffer[];
+volatile unsigned char *const dmabuffer = (volatile unsigned char *)maple_dma_buffer;
 
 
 /*

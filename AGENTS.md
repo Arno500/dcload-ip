@@ -603,6 +603,44 @@ way it is:
    still reports success, the new loader comes up and runs — correct PC, correct
    SP — and is **deaf**. Nothing reports an error anywhere. The host goes via
    `0x8ce00000` instead; §16 has the rule.
+5. **A preset's address is chosen for isoldr, and we are four times its size.**
+   isoldr's network build is 13 KB; the HIGH layout reserves `0xe000` from the
+   base — image, stack at `+0xb000`, `.hiram` at `+0xc000`, Maple DMA at
+   `+0xd000`. So a base that leaves isoldr room can leave us none, and the RAM
+   past `base + 0x8000` is RAM the preset never promised was free. Measured
+   2026-08-27 on **Sonic Adventure 2**, whose preset is `0x8cfe8000`: it loads
+   `0x0cff0000` as its **Maple DMA list** (two sites, `0x8c15b9de` and
+   `0x8c17a904`; every Maple register — `SB_MDSTAR`, `SB_MDST`, `SB_MSYS`,
+   `SB_MDAPRO`, `SB_MDTSEL` — is in the same literal pools), which at that base
+   is the loader's own stack. **The Maple DMA is written by the hardware**, so
+   not one byte passes through dcload or the host: the console goes black, stops
+   asking for sectors, and nothing is logged at either end — the same ending as
+   §4.12, reached a completely different way. Confirmed: `--loader-base
+   0x8cef8000` runs the title, Kart mode included. The host now finds this
+   before it uploads anything — §16, `literals_in_loader_footprint`.
+
+**`make loaders` also builds one image the host can put anywhere.**
+`DCLOAD_EMIT_RELOCS=1` links with `ld -q`, which keeps the relocations in the
+ELF, and `loaders/dcload-relocatable.elf` is that image. The loader emits
+exactly one relocation type, `R_SH_DIR32`, so moving it is "add the delta to
+each word a relocation names" and nothing else — measured by linking natively at
+several bases and diffing: **833 words differ between two bases, every one of
+them by exactly the delta, and the relocations name exactly those 833 words** —
+none missed, and none naming a word that does not change. The second half is
+what proves no relocation points at a hardware register or at `.guestvbr`, which
+a delta would corrupt. Relocating the image reproduces a native link **byte for
+byte**, checked at three bases including a negative delta and one nothing had
+ever been linked at.
+
+Two things make that true and must stay true. Every address the C code uses is a
+**linker symbol**, never a `-D`: a `-D` reaches the compiler as a number, `-Os`
+folds it into a literal pool, and a number in a pool carries no relocation. That
+was the last defect here — the Maple DMA buffer, nine words, now
+`PROVIDE (_maple_dma_buffer = DCLOAD_MAPLE)` — and it cost 16 bytes of `_end` to
+fix. And it is **HIGH bases only**: a flat delta moves the whole layout
+together, which is true of the HIGH family and false of LOW, whose buffers stay
+at `0x8cfe8000` while its image is at `0x8c004000`. `relocate()` refuses a LOW
+image rather than move half of it.
 
 No address is written twice: `DCLOAD_BASE`/`DCLOAD_STACK`/`DCLOAD_HIRAM`/
 `DCLOAD_MAPLE` reach the linker script, the C sources and the exception
@@ -851,7 +889,7 @@ with `scripts/flycast-resume.py`. Anything touching `:3263` must end with a GDB
 | Script | What it answers |
 | --- | --- |
 | `dc-peek.py <symbol\|0xaddr>` | read guest memory, resolving symbols from the ELF. Never hard-code a counter address — adding a counter shifts `.data` and the values become plausible nonsense. **Pass `--base 0x8cfe8000` (or `--elf …`) after a relocation**, or every symbol resolves into an image the console is not running; its identity check catches that rather than printing plausible nonsense. |
-| `dc-counters.py <ip>` | **the same counters, on real hardware.** Everything else here talks to flycast's GDB stub, which does not exist on a console; this asks dcload itself with `SBIQ`, which it answers from inside `bb->loop()` without touching the screen. One round trip for the whole set. It asks the loader where it lives first (VERS carries the base) **and compares 256 bytes of its code against the ELF**, refusing to decode on any mismatch. Both checks are needed and the second is the one that earns its keep: the base only proves *where*, and two builds of the same base put the same counter at different addresses (§14.19). `--repeat N --interval S` prints deltas; `--raw addr len` hex-dumps anything. Symbols come from `sh-elf-nm`, so `source environ.sh` first. |
+| `dc-counters.py <ip>` | **the same counters, on real hardware.** Everything else here talks to flycast's GDB stub, which does not exist on a console; this asks dcload itself with `SBIQ`, which it answers from inside `bb->loop()` without touching the screen. One round trip for the whole set. It asks the loader where it lives first (VERS carries the base) **and compares 256 bytes of its code against the ELF**, refusing to decode on any mismatch. Both checks are needed and the second is the one that earns its keep: the base only proves *where*, and two builds of the same base put the same counter at different addresses (§14.19). **When the host relocated the loader** (§4.11) there is no ELF on disk to aim this at, because the move happens in memory: produce the matching one with `dcload-ip-rs relocate loaders/dcload-relocatable.elf <base> -o <file>` and pass it with `--elf`. Its symbols are relocated too, which is the whole reason that step exists. `--repeat N --interval S` prints deltas; `--raw addr len` hex-dumps anything. Symbols come from `sh-elf-nm`, so `source environ.sh` first. |
 | `dc-sample.py` | poll a table of counters at a fixed rate, print deltas. |
 | `dc-track.py` | continuous sampling that **re-attaches per sample**, because flycast halts the guest while a debugger stays connected — a held connection freezes what you are watching. |
 | `dc-freeze.py` | snapshot everything during a freeze. |
@@ -1085,10 +1123,107 @@ that; the parts the DC side constrains:
   would take several round trips and still not distinguish a live loader from
   the remains of a previous one. An older loader sends no such bytes and is
   handled, not failed.
-- **The hop is not optional and its reason is §14.17.** Going from a low base to
-  `0x8cfe8000` directly writes through the running loader's packet buffers, so
-  the host goes via `0x8ce00000` — chosen because its span is clear of every
-  other base in the set, in both directions. Two 26 KB uploads, ~1.1 s total.
+- **Every move goes through `0x8ce00000`, always** — not only when a direct one
+  would clash (§14.17). That address is neutral ground: its span is clear of
+  every other base in the set in both directions, and a **pre-linked,
+  non-relocatable** loader is built for it, so the first step never depends on
+  the relocation machinery. From there the final move is always the same shape,
+  instead of a different one per starting point. The direct move used to be
+  taken whenever `clashes()` said it was safe, and the failure that guards
+  against is silent: the transfer reports success, the new loader runs with the
+  right PC and stack, and is deaf. The extra upload is 26 KB — **0.04 s,
+  measured** — against a session lost when the check is wrong.
+- **The preset is the answer unless something says otherwise**, and exactly two
+  things can: what the title *names* (constants in its binary) and where its
+  reads have *landed* (`game-memory.tsv`). DreamShell's address is isoldr's own
+  answer for that game and is right far more often than any rule of ours; it is
+  wrong only where our `0xe000` does not fit what isoldr's 13 KB did. **The map
+  is consulted for the preset itself**, not just for the alternatives — it used
+  to be reached only after the constant scan had already rejected the preset,
+  which is the one case where the map has something to say and nothing to say it
+  about. Measured on Sonic Adventure 2: its map marks blocks `0xfc..0xfe`, so
+  `0x8cfe8000` is ruled out **without any margin at all** — the title writes
+  inside the preset's own span.
+- **Ctrl-C reports what the session learned.** It is how a session with a title
+  ends — the game is running, there is nothing to finish — so without a handler
+  the map loses whatever it has not flushed and nobody is told anything. It
+  flushes, then says whether this run added blocks: if it did, **running it
+  again is worth doing**, because the loader will be placed knowing ground it
+  had to guess at; if it did not, a plain re-run does exactly the same thing and
+  is a wasted session. Both halves matter — retrying unchanged is the obvious
+  move and usually the wrong one.
+- **A preset's base is refused when the title itself addresses it.**
+  `literals_in_loader_footprint()` scans the boot binary for constants naming
+  RAM inside `live_footprint(base)` and reports the ones an `mov.l @(disp,PC)`
+  actually loads; `nearest_clear_base()` then answers with the closest built
+  base **of the same family** (a high preset never falls back to a low base —
+  that would trade this collision for the one the preset exists to avoid). This
+  runs before the relocation, which is before the upload, because that is the
+  last moment the base can change. §4.11 item 5 is the measurement it was
+  written for.
+  Two rules keep it honest, and the second was paid for: **an instruction must
+  load the constant** — Sonic Adventure 2 has eight aligned occurrences of
+  `0x0cff0000` and two sites that use them — and **the low ranges are
+  excluded**, because a low loader shares the BIOS work area by construction
+  (§4.6) and Sonic Adventure, which runs perfectly at the stock base, has eleven
+  legitimate constants in `0x8c0080f0..0x8c008208`. Reporting those would have
+  condemned the one title measured to work, which is §14.9 in miniature.
+  `dcload-ip-rs identify <image>` prints the whole answer with no console
+  attached, and prints the same base `uexec` would pick.
+- **The base no longer has to be one someone thought of in advance.**
+  `LoaderSet::image_for()` hands back a pre-linked `dcload-0x…elf` when there is
+  one and otherwise relocates `dcload-relocatable.elf` in memory (§4.11).
+  `search_free_base()` walks 64 KB steps from the preset's address — **down
+  first**, because the collisions seen so far are titles reaching the top of RAM
+  — and requires the neighbouring step to be clear too. That margin is the
+  point: what is detected is an address the title *names*, and what gets written
+  is a buffer of some size around it, so landing 8 KB under a known Maple DMA
+  list satisfies "nothing inside my span" and is still a bad place to be.
+  **A pre-built base is preferred; relocation answers what the set cannot.**
+  Three measurements on Sonic Adventure 2 (preset `0x8cfe8000`) fix that order,
+  and the middle one is why "nearest the preset wins" is *not* the rule, though
+  it was for an afternoon:
+
+  | base | result |
+  | --- | --- |
+  | `0x8cef8000` | game and Kart mode both run |
+  | `0x8cfd0000` | freezes loading `COURSE.PVM`, the Kart's track textures, decompressed into ~`0x8cfc0000..0x8cfc6000` — **41 KB under that base** |
+  | `0x8ce00000` | Kart is a black screen; `KART.ADX` streams into `0x8ce3a920`, **182 KB above that base** |
+
+  Proximity to the preset is worth nothing by itself: DreamShell chose
+  `0x8cfe8000` for isoldr, which is 13 KB and fits the 32 KB hole between those
+  texture buffers and the Maple DMA list. **Ours needs `0xe000` and does not fit
+  that hole**, so just below the preset is the textures and well below is the
+  audio heap. `0x8cef8000` is in neither — and the only reason anyone knows that
+  is that someone ran it. **The real fix is to fit in 32 KB**, which is what
+  every preset address assumes.
+
+  All three failures were allocators, which name no address, so the constant
+  scan cannot see them. `receive_syscalls` therefore also warns when a disc read
+  lands within 256 KB of the loader: where a title's reads land is the only
+  direct evidence of where its memory actually is, and on these three it says
+  41 KB, 182 KB and 741 KB respectively.
+  `dcload-ip-rs relocate <elf> <base> -o <out>` does the move on its own, for
+  diffing against a native link.
+- **`game-memory.tsv`: what a title's memory actually looks like, learned by
+  watching it.** The constant scan misses every failure measured so far, because
+  the addresses that matter are produced by the title's allocator and appear
+  nowhere in its binary — `0x8cfc0360` and `0x8ce3a920` are in no window and at
+  no alignment. But the host *serves* those reads, so it sees them. `memmap.rs`
+  records a **256-bit bitmap, one bit per 64 KB of RAM**, per boot-sector md5,
+  and `pick_clear_base` refuses a base whose span comes within 256 KB of a
+  marked block. Measured on Sonic Adventure 2 with only the relocatable image
+  available: without the map the pass picks `0x8cfd0000`, **which freezes**;
+  with it, `0x8cf60000`.
+  A bitmap and not a `min..max` range, because the holes are the whole point and
+  `0x8cef8000` is one. **Rows merge by OR**, so the file is worth committing and
+  sharing: two people playing different parts of the same game produce two
+  partial maps that combine, in any order, with nothing to resolve — and a row
+  is only ever incomplete, never wrong, since a bit is set because a read really
+  landed there. It is written **during** the session, every 15 s, because a
+  session is normally ended by Ctrl-C and the interesting ones are the ones that
+  hang. `save()` re-reads and merges before writing, so a concurrent session or
+  a `git pull` cannot be silently overwritten.
 - **`is_uploadable()` gates ELF sections on SHF_ALLOC and a non-zero address**,
   not on `SHT_PROGBITS` alone. The old test logged "skipping" and then pushed
   the section anyway, so `.symtab`/`.strtab`/`.comment` were uploaded to address
@@ -1175,3 +1310,4 @@ Documents in `docs/`:
 | `read-back-verification.md` | what read-back verification proves, what it cannot, how to read a mismatch. |
 | `dreamshell-presets/` | 6168 archived per-game presets — what DreamShell prescribes for a given title (`memory`, `dma`, `async`, `irq`). |
 | `game-presets.tsv` | the same thing folded to one row per game, which is what the host reads (§16). **Generated** by `scripts/make-preset-db.py`. |
+| `game-memory.tsv` | where each title's reads have actually landed, 64 KB per bit (§16). **Written by the host as it runs**, merged by OR, meant to be committed and shared. Lives beside `game-presets.tsv` in the Rust host's project root. |

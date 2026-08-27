@@ -251,6 +251,10 @@ SECTIONS
    * PROVIDE + a leading underscore because the SH ELF C ABI prefixes C symbols
    * with one: this is `dcload_base` in C. */
   PROVIDE (_dcload_base = ORIGIN(ram));
+  /* The Maple DMA buffer, as a symbol so that references to it carry a
+   * relocation -- see maple.c. It is not a section: nothing is loaded there and
+   * the hardware, not this image, writes it. */
+  PROVIDE (_maple_dma_buffer = DCLOAD_MAPLE);
 
   /* Stabs debugging sections.  */
   .stab 0 : { *(.stab) }
