@@ -365,9 +365,9 @@ exception: $(EXCOBJECTS)
 # building these would only produce a loader that bricks the session.
 LOADER_BASES = 0x8c004000 0x8ce00000 0x8cef8000 0x8cfe8000
 LOADER_DIR   = loaders
-# The base the relocatable image is linked at. Any HIGH base does: the host
-# rewrites every address in it. This one is SCRATCH_BASE on the host side, so
-# an unrelocated copy still lands somewhere sane.
+# The base the relocatable image is linked at. Any base does: the host rewrites
+# every address in it, in either layout family. This one is SCRATCH_BASE on the
+# host side, so an unrelocated copy still lands somewhere sane.
 LOADER_RELOC_BASE = 0x8ce00000
 
 .PHONY : loaders
@@ -389,12 +389,21 @@ loaders:
 	done
 	@# And one image the host can put ANYWHERE, without any of this running
 	@# again. The bases above answer the addresses we happen to have thought of;
-	@# this answers the ones we have not. Only a HIGH base is worth relocating:
-	@# a flat delta moves the whole layout together, which is true of the HIGH
-	@# family (stack, .hiram and Maple are all base-relative) and false of LOW
-	@# (its buffers stay at 0x8cfe8000 while the image is down at 0x8c004000).
-	@# That costs nothing: the CD always boots 0x8c004000 and the 593 presets at
-	@# that address ask for no move at all, so everything that must move is high.
+	@# this answers the ones we have not -- in EITHER family. The host does not
+	@# apply one delta, it applies four: each relocation is classified by the
+	@# value of the symbol it names (image, _stack, .hiram, _maple_dma_buffer)
+	@# and gets that region's delta, so a move from here down to 0x8c004000
+	@# leaves the buffers at 0x8cfe8000 where the LOW layout puts them. Inside
+	@# one family all four deltas are equal and it is a flat delta again.
+	@#
+	@# What the host CANNOT get from the relocations is .guestvbr: exception.S
+	@# names the loader's jump table as a -D literal (.long DCLOAD_BASE + ...)
+	@# and is linked separately, at the guest VBR, so those six words carry
+	@# nothing that points at them. The host patches them by content and then
+	@# re-scans the section -- a reference to the loader added there that is NOT
+	@# through the jump table at base+0x00..+0x20 fails the relocation rather
+	@# than shipping a vector table that jumps to the wrong base on the first
+	@# exception a title takes.
 	@echo "[loaders] linking relocatable dcload at $(LOADER_RELOC_BASE)"
 	@$(MAKE) --no-print-directory clean >/dev/null || exit 1
 	@$(MAKE) --no-print-directory DCLOAD_BASE=$(LOADER_RELOC_BASE) DCLOAD_EMIT_RELOCS=1 \

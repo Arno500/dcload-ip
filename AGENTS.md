@@ -572,7 +572,9 @@ response received" and the loader is then executing in the empty 4 KB above its
 own `_stack` with PR inside `raw_current_pkt`. Supporting them means giving up
 the on-screen display for those bases (isoldr's `low`/`syscalls` option is its
 answer to the same problem); `loaders::known_unsupported()` on the host reports
-the reason instead of asking for an ELF that would brick the session.
+the reason instead of asking for an ELF that would brick the session — and then
+places the loader somewhere else, because such a preset is the strongest
+statement in the database and not a missing one (§16).
 
 So `DCLOAD_BASE` is a build variable (`target-src/dcload/Makefile`, which
 carries the layout table), `make loaders` builds one self-contained ELF per
@@ -622,25 +624,60 @@ way it is:
 **`make loaders` also builds one image the host can put anywhere.**
 `DCLOAD_EMIT_RELOCS=1` links with `ld -q`, which keeps the relocations in the
 ELF, and `loaders/dcload-relocatable.elf` is that image. The loader emits
-exactly one relocation type, `R_SH_DIR32`, so moving it is "add the delta to
-each word a relocation names" and nothing else — measured by linking natively at
-several bases and diffing: **833 words differ between two bases, every one of
-them by exactly the delta, and the relocations name exactly those 833 words** —
-none missed, and none naming a word that does not change. The second half is
-what proves no relocation points at a hardware register or at `.guestvbr`, which
-a delta would corrupt. Relocating the image reproduces a native link **byte for
-byte**, checked at three bases including a negative delta and one nothing had
-ever been linked at.
+exactly one relocation type, `R_SH_DIR32`, so moving it is "rewrite each word a
+relocation names" and nothing else — measured by linking natively at several
+bases and diffing: **833 words differ between two bases, every one of them by
+exactly the delta, and the relocations name exactly those 833 words** — none
+missed, and none naming a word that does not change. The second half is what
+proves no relocation points at a hardware register.
 
-Two things make that true and must stay true. Every address the C code uses is a
-**linker symbol**, never a `-D`: a `-D` reaches the compiler as a number, `-Os`
-folds it into a literal pool, and a number in a pool carries no relocation. That
-was the last defect here — the Maple DMA buffer, nine words, now
-`PROVIDE (_maple_dma_buffer = DCLOAD_MAPLE)` — and it cost 16 bytes of `_end` to
-fix. And it is **HIGH bases only**: a flat delta moves the whole layout
-together, which is true of the HIGH family and false of LOW, whose buffers stay
-at `0x8cfe8000` while its image is at `0x8c004000`. `relocate()` refuses a LOW
-image rather than move half of it.
+**It is not one delta, it is four, and that is what makes a LOW base reachable.**
+A loader is pinned to the four addresses of the layout table above, and only the
+HIGH family moves them together — which is why this was a HIGH-only mechanism
+until 2026-08-28, and why the 593 presets asking for the stock base were served
+by a pre-linked ELF or not at all. Each relocation is classified by **the value
+of the symbol it names** — image, `_stack`, `.hiram` or `_maple_dma_buffer` — and
+gets that region's delta; inside one family all four are equal and it is the
+flat delta it always was. Two things had to be got right, both measured:
+
+- **Classify by the symbol's value, not its section, and not the word's.**
+  `PROVIDE (_dcload_base = ORIGIN(ram))` sits after `.hiram` in the linker
+  script, so `ld` files that symbol *in* `.hiram` — four words that would have
+  followed the packet buffers into high RAM. And `commands.c` reaches its own
+  base through P2, so the word reads `0xace00000` where the symbol is
+  `0x8ce00000`; adding the region's delta to the word preserves both the window
+  bits and any addend.
+- **`.guestvbr` carries no relocations and IS base-dependent.** `exception.S`
+  reaches the loader through the fixed jump table at `base+0x00..+0x20`
+  (`.long DCLOAD_BASE + …`), and that image is linked separately, at the guest
+  VBR, then folded in with `objcopy` — so its **six** references arrive as plain
+  literals with nothing naming them. They were not being patched at all: every
+  relocated loader was handing its title a vector table whose handlers jump back
+  to the base the image was *linked* for, and only on a fault, which is the one
+  moment the dump exists for. The host patches them by content and then
+  re-scans: a word still naming the old image is an error, not a silent miss.
+
+Relocating now reproduces a native link **byte for byte, `.guestvbr` included**,
+at every base `make loaders` builds — `0x8c004000`, `0x8ce00000`, `0x8cef8000`,
+`0x8cfe8000` — the first of which crosses families. (The earlier flat-delta
+measurement stands for the HIGH-to-HIGH cases, including a negative delta and a
+base nothing had ever been linked at.) The split is 824 image words, 7 `.hiram`,
+one stack, one Maple.
+
+One thing makes all of that true and must stay true. Every address the C code
+uses is a **linker symbol**, never a `-D`: a `-D` reaches the compiler as a
+number, `-Os` folds it into a literal pool, and a number in a pool carries no
+relocation. That was the last defect here — the Maple DMA buffer, nine words,
+now `PROVIDE (_maple_dma_buffer = DCLOAD_MAPLE)` — and it cost 16 bytes of `_end`
+to fix. The one address that is still a `-D` is `DCLOAD_BASE` in `exception.S`,
+which is exactly why `.guestvbr` needs the treatment above; anything added there
+that names the loader outside the jump table will be caught by the re-scan
+rather than shipped.
+
+A LOW target has one constraint a HIGH one does not, and the host checks it: its
+stack top stays at the BIOS VBR whatever the image does, so the image must fit
+under `0x8c00f400` with the 800 bytes the link script asserts. That is what
+rules out a base much above `0x8c008000`, not the relocation.
 
 No address is written twice: `DCLOAD_BASE`/`DCLOAD_STACK`/`DCLOAD_HIRAM`/
 `DCLOAD_MAPLE` reach the linker script, the C sources and the exception
@@ -1144,14 +1181,27 @@ that; the parts the DC side constrains:
   about. Measured on Sonic Adventure 2: its map marks blocks `0xfc..0xfe`, so
   `0x8cfe8000` is ruled out **without any margin at all** — the title writes
   inside the preset's own span.
-- **Ctrl-C reports what the session learned.** It is how a session with a title
-  ends — the game is running, there is nothing to finish — so without a handler
-  the map loses whatever it has not flushed and nobody is told anything. It
-  flushes, then says whether this run added blocks: if it did, **running it
-  again is worth doing**, because the loader will be placed knowing ground it
-  had to guess at; if it did not, a plain re-run does exactly the same thing and
-  is a wasted session. Both halves matter — retrying unchanged is the obvious
-  move and usually the wrong one.
+- **Ctrl-C reports what the session learned — but it is not what saves it.**
+  Ctrl-C is how a session with a title ends (the game is running, there is
+  nothing to finish), so the handler says whether this run added blocks: if it
+  did, **running it again is worth doing**, because the loader will be placed
+  knowing ground it had to guess at; if it did not, a plain re-run does exactly
+  the same thing and is a wasted session. Both halves matter — retrying
+  unchanged is the obvious move and usually the wrong one.
+  **The handler is a courtesy this process is not always paid**, which is why
+  the file does not depend on it. Under a debugger the signal never arrives:
+  lldb takes SIGINT for itself (`pass=false, stop=true`), and on Windows a
+  console Ctrl-C reaches the debugger first as `DBG_CONTROL_C` — either way the
+  debuggee is *suspended*, which is exactly what it looks like ("it just
+  stopped"), and whatever ends it afterwards is a kill. A Stop button is a kill
+  by construction, and a process a DAP adapter launched on pipes is in no
+  console process group at all, so no `CTRL_C_EVENT` is delivered to it. To get
+  the report back inside Zed, add
+  `"postRunCommands": ["process handle SIGINT --stop false --pass true"]` to the
+  configuration in `.zed/debug.json` (untested on the Windows build — the
+  ticker below is what makes it not matter). The handler is installed at the
+  top of `main`, **before** the chainload and the multi-megabyte upload, which
+  used to be several seconds in which a Ctrl-C was an outright kill.
 - **A preset's base is refused when the title itself addresses it.**
   `literals_in_loader_footprint()` scans the boot binary for constants naming
   RAM inside `live_footprint(base)` and reports the ones an `mov.l @(disp,PC)`
@@ -1172,7 +1222,12 @@ that; the parts the DC side constrains:
   attached, and prints the same base `uexec` would pick.
 - **The base no longer has to be one someone thought of in advance.**
   `LoaderSet::image_for()` hands back a pre-linked `dcload-0x…elf` when there is
-  one and otherwise relocates `dcload-relocatable.elf` in memory (§4.11).
+  one and otherwise relocates `dcload-relocatable.elf` in memory (§4.11). Since
+  2026-08-28 that covers **both layout families**, so the relocatable image
+  alone is a complete set — the stock base included, which used to be
+  answerable only by its own ELF: with that one file renamed, a title asking for
+  `0x8c004000` got a warning telling the reader to build something the
+  relocatable could have produced, and the loader stayed where it was.
   `search_free_base()` walks 64 KB steps from the preset's address — **down
   first**, because the collisions seen so far are titles reaching the top of RAM
   — and requires the neighbouring step to be clear too. That margin is the
@@ -1205,6 +1260,72 @@ that; the parts the DC side constrains:
   41 KB, 182 KB and 741 KB respectively.
   `dcload-ip-rs relocate <elf> <base> -o <out>` does the move on its own, for
   diffing against a native link.
+- **A preset this host cannot build is the strongest statement in the database,
+  not a missing one.** The 276 presets below `0x8c004000` used to end the
+  decision: `ensure_loader_base()` refused the address and kept the loader where
+  it was — which is `0x8ce00000`, because that is where every chainload bounces
+  through. That is the one answer such a preset positively excludes. DreamShell
+  reaches `_MIN` only after `ISOLDR_DEFAULT_ADDR` (`0x8ce00000`) **and** `_HIGH`
+  (`0x8cfe8000`) have both failed for that title, so `ruled_out_by_low_preset()`
+  strikes both out and `base_for_low_preset()` answers from the map instead.
+  Measured 2026-08-28 on **Jet Set Radio** (preset `0x8c000100`): the host stayed
+  at `0x8ce00000`, the constant scan reported the title loading that very address
+  (at `0x8c013bde`) — too late, after the upload, as a message for the human —
+  and the 81st disc read of the boot landed on the loader. Nothing had asked
+  whether staying was safe.
+  Three smaller things came out of the same session. **Wherever the host decides
+  to keep the loader where it is, it now checks where that is** — the "not in the
+  database" path in particular used to say "keeping the loader where it is (the
+  stock base is 0x8c004000)" without ever looking, and where it is need not be
+  the stock base. **`search_free_base()` clamped only the *top* of its scan**, so
+  a `wanted` below the floor started the upward walk at `0x8c010000` and could
+  answer with a base inside the title's own image; unreachable while the
+  short-circuit above existed, reachable the moment it was removed.
+  And **every map test now runs over `exclusive_footprint()`** — the same ranges
+  the constant scan reads, i.e. everything except a low image's own span, which
+  it shares with the BIOS work area by construction (§4.6). `seen_hits_preset`
+  asked about a flat `base..base+LOADER_SPAN`, which for a low base is that work
+  area: **Sonic Adventure's row marks `0x8c030000`**, so the map ruled out the
+  stock base — the address 593 presets ask for, and the one that title is
+  measured running at — for every title that uses low RAM, which is all of them.
+  It went unnoticed because the fallback then failed to produce anything and the
+  preset stood; clamping the scan would have turned that into a relocation into
+  high RAM. `nearest_clear_base()`'s "same family first" rule is now applied to
+  the relocation branch too, which fixes it structurally rather than one
+  predicate at a time. §14.9 in miniature, twice over: a guard that fires on the
+  one title known to work, and a guard whose wrong answer was hidden by a second
+  bug.
+- **The biggest hole, not the highest free address.** `MemoryMap::free_runs()`
+  returns the runs of RAM a title has never been seen using, longest first, and
+  `base_in_span()` centres the loader in the longest one. Centred, because a run
+  is bounded at both ends by blocks a read really landed in, so its middle is the
+  furthest point from anything known — and highest is actively wrong, because the
+  map of a title that failed is **truncated at its own failure**, which makes the
+  top of RAM look free precisely when it is not. Jet Set Radio's row marks
+  `0x8cff0000` and stops dead at `0x8ce00000`; the answer is `0x8cef0000`.
+  The useful consequence is that a run which still collides **halves the
+  unexplored region** instead of advancing one block. Each failed session
+  bisects, and rows merge by OR, so nothing is lost between them.
+- **For those titles the search floor is the title's own image, not
+  `FREE_BASE_FLOOR`.** The constant `0x8ce00000` is justified by "below it a
+  loader starts competing with the title's own image, which is loaded at
+  `0x8c010000` and is routinely megabytes long" — a guess the host does not have
+  to make, since it uploaded the image and knows its length.
+  **Jet Set Radio is what forced this.** Its map, after several sessions, marks
+  `0x8ccd0000..0x8cfdffff` and `0x8cff0000`: the entire relocatable window bar
+  **one 64 KB block** (`0x8cfe0000`), for a 56 KB loader, with the title's own
+  data hard against both sides. Its image is 334 KB, and below the constant floor
+  sit **12.4 MB no disc read has ever landed in**. `window_above_image()` is that
+  floor (one step of margin above the image; `search_free_base_above()` walks from
+  it), and the answer becomes `0x8c6a0000` instead of a 56-in-64 KB wedge.
+  **Only this path**: the normal one keeps the constant, whose ordering is what
+  Sonic Adventure and Sonic Adventure 2 were measured against, and a title whose
+  preset can be built has no reason to look down there.
+  What the map says about that region is **silence, not clearance** — it records
+  where disc reads landed, and an allocator is invisible to it (§16, the SA2
+  measurements). It is still the better bet here: 6 MB of clearance on each side
+  against 4 KB, and a preset of `_MIN` is DreamShell saying high RAM is the
+  problem.
 - **`game-memory.tsv`: what a title's memory actually looks like, learned by
   watching it.** The constant scan misses every failure measured so far, because
   the addresses that matter are produced by the title's allocator and appear
@@ -1220,10 +1341,20 @@ that; the parts the DC side constrains:
   sharing: two people playing different parts of the same game produce two
   partial maps that combine, in any order, with nothing to resolve — and a row
   is only ever incomplete, never wrong, since a bit is set because a read really
-  landed there. It is written **during** the session, every 15 s, because a
-  session is normally ended by Ctrl-C and the interesting ones are the ones that
-  hang. `save()` re-reads and merges before writing, so a concurrent session or
-  a `git pull` cannot be silently overwritten.
+  landed there. It is written **during** the session by a ticker thread, every
+  2 s (1 s for the first write, since a title that dies in its first seconds is
+  the one whose map matters most), because a session is normally ended by Ctrl-C
+  or a kill and the interesting ones are the ones that hang. `save()` re-reads
+  and merges before writing, so a concurrent session or a `git pull` cannot be
+  silently overwritten.
+  **The ticker, not the read path, does the writing.** `MemoryRecorder::record`
+  marks two bits and returns; `flush_if_due()` on the ticker does the I/O. Two
+  reasons, and the second is the one that was measured elsewhere in this file:
+  the map then survives an ending nobody was told about, and **no disc read pays
+  for a file write** — dcload answers a read synchronously, so anything done on
+  that path is time the title is frozen (§16, the `thread::sleep` measurement).
+  A block that is new is also logged the moment it is marked, so a session that
+  is killed still leaves its verdict in the log.
 - **`is_uploadable()` gates ELF sections on SHF_ALLOC and a non-zero address**,
   not on `SHT_PROGBITS` alone. The old test logged "skipping" and then pushed
   the section anyway, so `.symtab`/`.strtab`/`.comment` were uploaded to address
