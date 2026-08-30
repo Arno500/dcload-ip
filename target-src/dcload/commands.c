@@ -413,6 +413,28 @@ void cmd_donebin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	}
 }
 
+/*
+ * WHY THERE IS NO GD-TRANSFER GUARD HERE, having briefly had one.
+ *
+ * This builds a reply in pkt_buf and transmits it, and pkt_buf is single and
+ * shared -- so refusing to answer while a disc read is in flight looks like the
+ * obvious reading of the invariant at the top of cdfs_syscalls.c. It is the
+ * wrong reading, and it cost every counter a running title could report.
+ *
+ * The window that invariant is about is between BUILDING a command in pkt_buf
+ * and SENDING it -- the trace bug written up in ReadSectors(), where a write()
+ * laid its own command over a read request that had not gone out yet. This
+ * function is only ever reached from inside bb->loop(), which a caller enters
+ * AFTER build_send_packet() has already transmitted. And a retry does not
+ * re-send the buffer: GD_READ_RETRIES calls ReadSectors() again, which rebuilds
+ * the request from scratch. So clobbering pkt_buf during the wait costs
+ * nothing.
+ *
+ * Measured, 2026-08-29: with the guard in, a title that never sets
+ * GD_SERVICE_EVERY_SYSCALL is answered from data_transfer's bb->loop() and
+ * nowhere else -- and the GD lock is held for all of it, so the guard refused
+ * 100% of reads and the panel never showed a single sample.
+ */
 void cmd_sendbinq(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
 	our_ip = ntohl(ip->dest);
@@ -425,6 +447,10 @@ void cmd_sendbinq(ip_header_t * ip, udp_header_t * udp, command_t * command)
 
 	unsigned int cmd_addr = ntohl(command->address);
 	unsigned int bytes_left = ntohl(command->size);
+
+	// KEPT FOR THE TERMINATOR, and it is not cosmetic -- see below.
+	const unsigned int req_addr = cmd_addr;
+	const unsigned int req_size = bytes_left;
 
 	// Legacy check for versions < 2.0.0
 	// Need to hardcode these divides so that GCC can optimize them out (and
@@ -471,9 +497,29 @@ void cmd_sendbinq(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		cmd_addr += bytes_thistime;
 	}
 
+	// THE TERMINATOR NAMES THE RANGE IT JUST SERVED. It used to be 0/0, which
+	// is byte for byte what `cmd_donebin()` answers when a LoadBinary window is
+	// COMPLETE -- so the two were indistinguishable on the wire, and the host
+	// has no way to tell "the read you asked for is finished" from "the upload
+	// you are pushing has landed". That ambiguity was harmless only for as long
+	// as nobody read memory while a transfer was in flight.
+	//
+	// The counter panel does exactly that (dcload-ip-rs `--diag`), and it broke
+	// both ways at once, measured 2026-08-30 on Sonic Adventure: the host's
+	// filter swallowed a *transfer's* DoneBinary and the sector read died with
+	// "No DoneBinary response received", while this reply leaked the other way
+	// and was read as "nothing missing anywhere: done" -- a sector read
+	// credited as complete with data still missing. Either way the title
+	// froze for the loader's whole 6-second timeout plus the retry.
+	//
+	// Naming the range costs nothing (the fields are already on the wire and
+	// no host reads them here -- `dc-tool-ip` and the Rust host both match on
+	// the 4-byte id alone) and makes the two answers disjoint by construction:
+	// a SendBinQ terminator names loader RAM, a LoadBinary terminator names a
+	// game buffer or nothing at all.
 	memcpy(response->id, CMD_DONEBIN, 4);
-	response->address = 0;
-	response->size = 0;
+	response->address = htonl(req_addr);
+	response->size = htonl(req_size);
 	make_ip(ip_src, our_ip, UDP_H_LEN + COMMAND_LEN, IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
 	make_udp(udp_src, udp_dest, COMMAND_LEN, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
 	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
@@ -550,6 +596,28 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	 */
 	unsigned int base_be = htonl((unsigned int)dcload_base);
 	memcpy(response->data + datalength, &base_be, 4);
+	datalength += 4;
+
+	/*
+	 * And four more: which video cable this console is plugged into
+	 * (0 = VGA, 2 = RGB, 3 = composite), read off PDTRA the same way the
+	 * BootROM and every Katana title read it.
+	 *
+	 * The host uses it to decide whether to patch a title's own cable check:
+	 * forcing a title to VGA is right when there is a VGA box on the other
+	 * end and a black screen when there is a television, and nothing on the
+	 * host's side of the wire can see which. Only this end can answer, and
+	 * answering costs two register reads.
+	 *
+	 * FIELDS ARE READ IN ORDER FROM THE STRING'S NUL, not backwards from the
+	 * end. A host that took the last four bytes as the base -- which is what
+	 * the first version of this did -- reads this word instead the moment a
+	 * second field exists, decides the base is implausible, and quietly stops
+	 * relocating anything. That failure is silent, so the parser was changed
+	 * before this field was added rather than after.
+	 */
+	unsigned int cable_be = htonl(STARTUP_Get_Cable());
+	memcpy(response->data + datalength, &cable_be, 4);
 	datalength += 4;
 
 	response->size = htonl(datalength);

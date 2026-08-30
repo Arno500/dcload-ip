@@ -55,11 +55,25 @@ INCLUDE	= -I../../target-inc
 #                              base + 0x0000  image (text/rodata/data/bss)
 #                              base + …       stack, descending from _stack
 #                              base + 0xb000  _stack (dcload's own)
-#                              base + 0xc000  .hiram packet buffers (3 KB)
-#                              base + 0xd000  Maple DMA buffer (2 KB)
+#                              base + 0xc000  .hiram buffers (12 KB)
+#                              base + 0xf000  Maple DMA buffer (2 KB)
 #
-#                            Span 0xd800, so a base above 0x8cff2800 does not
+#                            Span 0x10000, so a base above 0x8cff0000 does not
 #                            fit in RAM. The link ASSERTs catch that.
+#
+#                            .hiram GREW FROM 4 KB TO 12 KB for CDDA (cdda.c):
+#                            the packet buffers take 3 KB of it and the audio
+#                            staging buffer takes 7056 bytes more. It is
+#                            reserved WHETHER OR NOT WITH_CDDA is set, so the
+#                            host's copy of this table (dcload-ip-rs,
+#                            loaders::live_footprint) is right for every build
+#                            of this loader rather than for some of them --
+#                            a host that disagrees about the loader's extent
+#                            places the next one on top of it and nothing
+#                            reports it (AGENTS.md 4.11 item 4).
+#                            dcload.x asserts .hiram does not reach the Maple
+#                            buffer, so growing it past 12 KB fails the link
+#                            instead of corrupting Maple DMA at run time.
 #
 # Override any of these on the command line. They reach the generated linker
 # script, the C sources and the exception handler's link address from this one
@@ -82,7 +96,7 @@ ifeq ($(DCLOAD_IS_LOW),1)
 else
   DCLOAD_STACK ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xb000 )))
   DCLOAD_HIRAM ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xc000 )))
-  DCLOAD_MAPLE ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xd000 )))
+  DCLOAD_MAPLE ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xf000 )))
 endif
 
 CFLAGS += -DDCLOAD_BASE=$(DCLOAD_BASE) -DDCLOAD_STACK=$(DCLOAD_STACK) \
@@ -259,6 +273,14 @@ CFLAGS += -DWITH_LAN_ADAPTER=$(WITH_LAN_ADAPTER)
 WITH_MAPLE ?= 1
 CFLAGS += -DWITH_MAPLE=$(WITH_MAPLE)
 
+# CDDA -- Redbook audio playback, on isoldr's model. Read cdda.h before
+# touching it. Costs ~2 KB of image and 7056 bytes of .hiram (which is
+# reserved either way, see the layout table above), and is what a title with
+# music on its disc needs: without it PLAY_TRACKS is answered "COMPLETED, the
+# drive is spinning" and nothing is ever heard.
+WITH_CDDA ?= 1
+CFLAGS += -DWITH_CDDA=$(WITH_CDDA)
+
 # Serve the PMCR command (host-driven SH4 performance counters). Worth 808
 # bytes. This does NOT remove perfctr.c: dcload uses counter 1 itself for
 # the DHCP lease and for the adapter loops' timeouts. Only the host-facing
@@ -273,6 +295,10 @@ DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o video.o memcpy.o mem
 ifeq ($(WITH_LAN_ADAPTER),1)
   DCLOBJECTS += lan_adapter.o
 endif
+ifeq ($(WITH_CDDA),1)
+  DCLOBJECTS += cdda.o
+endif
+
 ifeq ($(WITH_MAPLE),1)
   DCLOBJECTS += maple.o
 endif

@@ -66,6 +66,7 @@
 #include "adapter.h"
 #include "commands.h"
 #include "cdfs.h"
+#include "cdda.h"
 
 /* Command codes, from the BIOS GD driver (same numbering as isoldr). */
 #define CMD_PIOREAD            16
@@ -234,6 +235,20 @@ static gd_state_t _GDS = {
 /* Forensics. Names are load-bearing: scripts/sa-repeat.sh and dc-peek.py
  * read these symbols out of the ELF by name. */
 unsigned int g_gd_idx_counts[18];
+/*
+ * WHICH GD COMMAND, not just which syscall. g_gd_idx_counts[] says the title
+ * called gdGdcReqCmd; it does not say what it asked for, and gdcServerMain
+ * force-completes CMD_INIT, CMD_SEEK, CMD_GETSCD, CMD_REQ_MODE and CMD_SET_MODE
+ * through one `default:` without recording a thing. So a title stuck on a
+ * command we silently answer looks exactly like a title that is busy.
+ *
+ * 192 bytes of BSS and one increment, no UDP round trip -- none of what makes
+ * GD_TRACE too expensive to leave on (AGENTS.md 14.13). Counted BEFORE the
+ * lock and the IDLE test, so a command we REFUSE is counted too: a title
+ * re-asking because the previous command was never collected is the signal,
+ * and it would be invisible if only accepted commands were tallied.
+ */
+unsigned int g_gd_cmd_counts[CMD_MAX + 1];
 unsigned int g_cdfs_sync_chunks;
 unsigned int g_cdfs_sync_reentered;
 unsigned int g_cdfs_read_fails;
@@ -769,6 +784,11 @@ void gdcServerMain(void)
 	 */
 	while (1)
 	{
+		/* Where isoldr calls CDDA_MainLoop() from: the top of the
+		 * server's dispatch loop (loader/syscalls.c:866). Top level of
+		 * a syscall, so the fetch inside it may transmit. */
+		cdda_service();
+
 		if (_GDS.status == CMD_STAT_PROCESSING)
 		{
 			switch (_GDS.cmd)
@@ -790,21 +810,51 @@ void gdcServerMain(void)
 			case CMD_GETSES:
 				get_session_info();
 				break;
+			/* CDDA. The engine is the drive: see cdda.h.
+			 *
+			 * A REFUSAL IS STILL COMPLETED. isoldr force-completes what
+			 * it does not model rather than failing it, because a title
+			 * that gets FAILED for a command it considers routine
+			 * usually gives up entirely -- and "the music did not
+			 * start" must never become "the game did not start". So a
+			 * play the engine cannot honour leaves the drive looking
+			 * like it is spinning, exactly as this did before there was
+			 * an engine at all. */
 			case CMD_PLAY_TRACKS:
+				(void)cdda_play_tracks(_GDS.param[0], _GDS.param[1],
+						       _GDS.param[2]);
+				_GDS.drv_stat = CD_STATUS_PLAYING;
+				_GDS.status = CMD_STAT_COMPLETED;
+				break;
 			case CMD_PLAY_SECTORS:
+				(void)cdda_play_sectors(_GDS.param[0], _GDS.param[1],
+							_GDS.param[2]);
+				_GDS.drv_stat = CD_STATUS_PLAYING;
+				_GDS.status = CMD_STAT_COMPLETED;
+				break;
 			case CMD_RELEASE:
-				/* No CDDA here. Claim success and look like a spinning
-				 * drive, which is what isoldr does without HAVE_CDDA. */
+				(void)cdda_release();
 				_GDS.drv_stat = CD_STATUS_PLAYING;
 				_GDS.status = CMD_STAT_COMPLETED;
 				break;
 			case CMD_PAUSE:
-			case CMD_STOP:
+				(void)cdda_pause();
 				_GDS.drv_stat = CD_STATUS_PAUSED;
 				_GDS.status = CMD_STAT_COMPLETED;
 				break;
-			case CMD_INIT:
+			case CMD_STOP:
+				(void)cdda_stop();
+				_GDS.drv_stat = CD_STATUS_PAUSED;
+				_GDS.status = CMD_STAT_COMPLETED;
+				break;
 			case CMD_SEEK:
+				/* A seek while music is playing repositions the
+				 * stream; a seek at any other time is the data
+				 * path's and costs nothing to complete. */
+				(void)cdda_seek(_GDS.param[0]);
+				_GDS.status = CMD_STAT_COMPLETED;
+				break;
+			case CMD_INIT:
 			case CMD_NOP:
 			case CMD_REQ_MODE:
 			case CMD_SET_MODE:
@@ -851,9 +901,41 @@ static unsigned int gd_last_pr;
  */
 static unsigned int gd_last_sp;
 
+/*
+ * THE FOOTPRINT GUARD, always compiled, no round trip.
+ *
+ * A retail title uses the BIOS work area as a stack because from its point of
+ * view that is free memory, and that area is where this loader lives (§4.6).
+ * When its stack descends past _end it writes into dcload's BSS, and what comes
+ * out is a request this loader built out of clobbered state -- a ReadSector
+ * with a size of 0xa2900000, say, which the host cannot even parse.
+ *
+ * The whole diagnosis used to be inference from a symptom. It is two integers:
+ * the lowest stack pointer any GD syscall was entered with, and how many of
+ * them landed inside the image. g_gd_sp_min against _end is the margin, and it
+ * is readable while the title is still healthy -- which is the point, because
+ * after the overlap nothing this loader reports can be trusted.
+ */
+extern char dcload_base[];
+extern char end[];
+
+unsigned int g_gd_sp_min = 0xffffffffU;
+unsigned int g_gd_sp_in_image = 0;
+
 static void gd_note_caller(unsigned int pr)
 {
 	unsigned int sp;
+
+	__asm__ volatile ("mov r15,%0" : "=r" (sp));
+
+	if (sp < g_gd_sp_min)
+	{
+		g_gd_sp_min = sp;
+	}
+	if ((sp >= (unsigned int)dcload_base) && (sp < (unsigned int)end))
+	{
+		g_gd_sp_in_image++;
+	}
 
 	/*
 	 * OFF unless explicitly asked for. This costs a full UDP round trip per
@@ -867,8 +949,6 @@ static void gd_note_caller(unsigned int pr)
 		(void)pr;
 		return;
 	}
-
-	__asm__ volatile ("mov r15,%0" : "=r" (sp));
 
 	if (pr != gd_last_pr)
 	{
@@ -898,6 +978,26 @@ static void gd_note_caller(unsigned int pr)
  * skipped whenever the GD path is already held, so it can never insert a
  * transmit into the middle of a live transfer (the pkt_buf invariant at the top
  * of this file).
+ *
+ * AND THAT REASONING IS NOT SUFFICIENT -- MEASURED, 2026-08-29.
+ *
+ * Sonic Adventure dies with this on. Isolated to this flag alone: same base
+ * (0x8cfe8000), same feature set, same host, two loader sets differing in
+ * nothing else. With it off the title boots and plays; with it on the console
+ * goes silent a second or two after the title's first big read, with no
+ * exception, no further disc request and nothing logged at either end -- the
+ * same ending as the GAPS bridge in AGENTS.md 4.12, reached some other way.
+ *
+ * The mechanism is NOT known. What is known is that "the lock is free, so a
+ * transmit here is safe" describes the GD state machine and nothing else: this
+ * hands the whole packet path -- link-change handling, ring re-init, any
+ * command the host happens to have in flight -- a context at the top of a
+ * syscall that a title enters sixty times a second. The claim above is about
+ * one hazard out of that set.
+ *
+ * So: OFF, and it is a last resort rather than a default diagnostic. If it is
+ * ever revisited, GD_SERVICE_ITERS (256) and restricting the servicing to a
+ * single syscall are the two cheapest things to narrow it with.
  */
 #if GD_SERVICE_EVERY_SYSCALL
 #ifndef GD_SERVICE_ITERS
@@ -928,6 +1028,11 @@ int gdGdcReqCmd(int cmd, int *param)
 	g_gd_idx_counts[0]++;
 	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
+
+	if ((cmd >= 0) && (cmd <= CMD_MAX))
+	{
+		g_gd_cmd_counts[cmd]++;
+	}
 
 	if ((cmd < 0) || (cmd > CMD_MAX) || gd_lock())
 	{
@@ -1054,11 +1159,24 @@ int gdGdcGetDrvStat(int *status)
 	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
 
+	/* isoldr's other no-IRQ context (loader/syscalls.c:1067), and the one
+	 * that carries the stream on this transport: a title's frame loop calls
+	 * this about sixty times a second while it calls the server only when
+	 * it wants something. Before the lock, because the lock is the GD
+	 * command state and the audio stream is not part of it. */
+	cdda_service();
+
 	if (gd_lock())
 	{
 		return CMD_STAT_BUSY;
 	}
 
+	/* PLAYING while there is music, whatever the data path is doing: a
+	 * title polls this to know whether its own PLAY took. */
+	if (cdda_state() == CDDA_PLAYING)
+	{
+		_GDS.drv_stat = CD_STATUS_PLAYING;
+	}
 	status[0] = _GDS.drv_stat;
 	status[1] = _GDS.drv_media;
 

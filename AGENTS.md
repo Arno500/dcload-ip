@@ -194,7 +194,7 @@ relocate or reorder code behind your back:
 | `dcload.c` | `main`: adapter detection, DHCP retry, lease-time perfcounter, video background, the command loop, `announce_presence()`. |
 | `go.S` / `go.h` | the handoff to a launched game — SR, CCR, entry. **Read its header before touching it** (§4.7). |
 | `disable.s` / `disable.h` | turns off the SH4 cache (must run from P2). |
-| `startup_support.c` | BSS zeroing helpers and C++ constructors. |
+| `startup_support.c` | BSS zeroing helpers, C++ constructors, and the video-mode setup — including `STARTUP_Get_Cable()`, which reads the cable off PDTRA (0 = VGA, 2 = RGB, 3 = composite) for `STARTUP_Set_Video()` **and** for the VERS reply. It reads the port rather than returning the cached `cable_mode`, because that cache is zero until `STARTUP_Init_Video()` runs and zero *means VGA*. |
 | `video.s` / `video.h` | on-screen status output (Marcus Comstedt's `video.s`). |
 | `packet.c/.h` | packet builder/parser; `bswap.h` supplies `ntohl`/`htons`. |
 | `net.c/.h` | ARP/ICMP/UDP glue, adapter detection, `announce_presence()`. |
@@ -206,6 +206,7 @@ relocate or reorder code behind your back:
 | `perfctr.c/.h` | SH4 performance counters; counter #1 tracks the DHCP lease. |
 | `memfuncs.c/.h`, `memcpy.S`, `memcmp.c` | hand-written aligned mem* fast paths. |
 | `maple.c/.h` | Maple bus driver (Marcus Comstedt). Its DMA buffer is **not** in BSS — §4.6. |
+| `cdda.c/.h` | CD-DA (Redbook audio) playback, on isoldr's model — §4.13. `cdda.h` carries the design and what it keeps and drops from isoldr; read it first. |
 | `cdfs.h`, `cdfs_redir.s`, `cdfs_syscalls.c` | GD-ROM drive emulation (§4.5). `cdfs_redir.s` is the syscall trampoline and the coroutine park/resume; `cdfs_syscalls.c` is the server. Both carry long explanatory headers — read them first. |
 | `syscalls.c/.h` | host-issued `DC00`–`DC22` syscall handlers. |
 | `commands.c/.h` | the `EXEC`/`LBIN`/`PBIN`/`DBIN`/… dispatcher and `bin_info`. |
@@ -224,6 +225,7 @@ title's stack (§4.6) — so they are listed with what they cost:
 | `PKT_BUFS_IN_HIRAM` | `1` | Put `raw_pkt_buf` and `raw_current_pkt` (1536 B each) in the `.hiram` NOLOAD section at `0x8cfe9000` instead of BSS. **−3088 B of `_end` (3072 B of buffer plus alignment), more than every other knob combined.** `hiram.h` states the trade. |
 | `WITH_LAN_ADAPTER` | `1` | Build the HIT-0300 LAN Adapter driver. 0 → BBA only, `adapter_detect()` stops probing for it. −2040 B. |
 | `WITH_MAPLE` | `1` | Serve `MAPL` and build `maple.c`. −640 B. |
+| `WITH_CDDA` | `1` | Build `cdda.c` and play a disc's audio tracks (§4.13). −2028 B of `_end`, measured. Its 7056-byte staging buffer is in `.hiram` and costs nothing in `_end`; the `.hiram` reservation is 12 KB **whether or not this is set**, so the host's table is right for every build. |
 | `WITH_PMCR_CMD` | `1` | Serve `PMCR`. Does **not** remove `perfctr.c` — dcload uses counter 1 itself for the DHCP lease and the adapter loop timeouts. −808 B. |
 | `DCLOAD_LTO` | `0` | `-flto`. −1856 B. **Off on purpose**: it inlines across translation units, which changes the depth of the C frame the GD coroutine parks into a 96-long buffer (§4.5), and it makes `lto-wrapper` discard the `-Wa` options so the `*.asm` listings (§6) stop being produced. Neither is checkable at build time — if you turn it on, read `g_gd_park_longs` on a real boot before trusting the build. |
 
@@ -259,7 +261,7 @@ build variable now because it is **per-game** — see §4.11.
 | `0x8c00f400` | `_stack`, **and** the VBR handed to the game, **and** the base of `exception` (`-Ttext=$(DCLOAD_GUEST_VBR)`), **and the BIOS VBR on this machine**. The last three do **not** move with the base; `_stack` does (§4.11). |
 | `0x8c010000` | the game's load address. `exception.bin` (2048 B) ends before it; total footprint `0xc000`, exactly the hole between the BIOS syscall area and 1ST_READ.BIN. |
 | `0x8cfe8000` | Maple DMA buffer (2 KB), deliberately outside the loader image (§4.6). From `DCLOAD_MAPLE`, defaulted in `maple.c`. **A low loader's buffers being here is why a direct chainload to a `0x8cfe8000` base fails — §4.11 item 4.** |
-| `0x8cfe9000` | `.hiram` — the two 1536-byte packet buffers, also outside the image. Placed by `dcload.x`, `NOLOAD`, so it costs nothing in `dcload.bin` and nothing in `_end`; `dcload-crt0.s` zeroes it explicitly because BSS zeroing no longer covers it. Empty when `PKT_BUFS_IN_HIRAM=0`. Put a new large buffer here — mark it `HIRAM_BUF`, see `hiram.h` — rather than in BSS. |
+| `0x8cfe9000` | `.hiram` — the two 1536-byte packet buffers and (with `WITH_CDDA`) the 7056-byte audio staging buffer, also outside the image. **12 KB is reserved**, and `dcload.x` asserts it does not reach the Maple buffer. Placed by `dcload.x`, `NOLOAD`, so it costs nothing in `dcload.bin` and nothing in `_end`; `dcload-crt0.s` zeroes it explicitly because BSS zeroing no longer covers it. Empty when `PKT_BUFS_IN_HIRAM=0`. Put a new large buffer here — mark it `HIRAM_BUF`, see `hiram.h` — rather than in BSS. |
 | `0x8cf0c000` | post-mortem block (`PM_BASE`, `cdfs_syscalls.c`). **Advisory only** — at the low base nothing caps a title's allocator there, and Sonic Adventure re-claims it. The caveat is written at the definition. |
 
 Two link-time asserts guard this, and they are the whole safety net:
@@ -316,7 +318,19 @@ Two invariants written on the code, both paid for:
 
 - **A TX is only safe at the top level of a syscall.** `pkt_buf` is single and
   shared, and `bb->loop()` dispatches incoming commands that build into it.
-  Never transmit nested inside a `bb->loop()`. A corollary that cost a whole
+  **But the window is narrower than "inside a `bb->loop()`", and reading it too
+  widely breaks the loader's own instrumentation.** What must not happen is a
+  transmit between *building* a command in `pkt_buf` and *sending* it — the
+  trace bug written up in `ReadSectors()`. A command dispatched from inside
+  `bb->loop()` is past that point by construction (the caller only enters the
+  loop after `build_send_packet()`), and a read's retry rebuilds its request
+  rather than re-sending the buffer, so clobbering `pkt_buf` during the wait
+  costs nothing. `cmd_sendbinq()` briefly refused to answer while `gd_lock()`
+  was held, on the wide reading; measured 2026-08-29, that refused **100 %** of
+  counter reads on any build without `GD_SERVICE_EVERY_SYSCALL`, because
+  `data_transfer`'s loop is then the only place dcload looks at the wire at all
+  and the lock is held for all of it. The guard is gone and the reasoning is
+  kept at the function. A corollary that cost a whole
   session: emit any trace **before** building the command, or the trace's own
   `write()` overwrites it in `pkt_buf` and the host never sees the request.
 - **No function live across a yield may take the address of a local.** A parked
@@ -332,6 +346,7 @@ Tuning constants, all in `cdfs_syscalls.c` (override with `-D`):
 | `GD_SYSCALL_TIMEOUT_SECONDS` | `6` | Deliberately shorter than the host's ~4 s give-up plus margin, so a retry can actually happen instead of us still being blocked when the host is ready again. |
 | `GD_READ_RETRIES` | `4` | Re-requests before failing a chunk. |
 | `GD_DRAIN_ITERS` | `0` | Bounded `bb->loop()` before each request. Left at 0 **and left in the tree**: it was measured at 256 and 50000 iterations and moves nothing, so the next person to suspect a stale ring can see it was tested. |
+| `GD_SERVICE_EVERY_SYSCALL` | `0` | Drain a bounded `GD_SERVICE_ITERS` (256) poll iterations of `bb->loop()` at the top of `ReqCmd`/`GetCmdStat`/`GetDrvStat`, so the loader still answers when a title has stopped reading the disc — which is the only way `--diag` (§16) shows counters during a freeze. **Sonic Adventure dies with this on**, measured 2026-08-29 and isolated to this flag alone: same base, same features, two loader sets differing in nothing else; the console goes silent seconds after the first big read, with no exception and nothing logged at either end. The mechanism is not known. Its own comment argues it cannot insert a transmit into a live transfer, and that is true and not sufficient — it hands the *whole* packet path a context a title enters sixty times a second. |
 | `GD_TRACE_CALLER` | `0` | Trace the caller's PC/SP. This is what found the root cause in §4.6 — and it is also expensive enough to stop a title booting. Diagnostic only. |
 | `GD_TRACE_DEST_FROM` | `0xffffffff` | Trace only reads landing at or above this destination. |
 
@@ -396,8 +411,20 @@ So, when adding anything to the DC side:
   last object in BSS, so it is the first thing a descending stack reaches.
   That is inherited link order, not a decision; ordering BSS deliberately is
   free and has never been done.
-- A guard is cheap: latching the SP seen at syscall entry and counting it when
-  it falls inside `[0x8c004000, _end)` would have found this in minutes.
+- **The guard now exists, and it is two integers.** `gd_note_caller()`
+  (`cdfs_syscalls.c`) latches the SP every GD syscall is entered with, always
+  compiled and costing no round trip: `g_gd_sp_min` is the lowest one seen —
+  subtract `_end` and that is the margin, readable **while the title is still
+  healthy** — and `g_gd_sp_in_image` counts the ones already inside
+  `[_dcload_base, _end)`. Read them with `--diag` (§16) or `dc-counters.py`.
+  What it catches, before you have to infer it: a `ReadSector` whose size is not
+  a sector multiple is a request dcload built out of overwritten state, and the
+  host now says so and stays up rather than dying on the parse.
+  Measured 2026-08-29 on **Sonic Adventure at the stock base**: the margin had
+  fallen to 2444 bytes (`_end = 0x8c00b044`) against the 5240 it was measured
+  booting and playing with, CD-DA having taken half of it back, and the title
+  corrupted the loader. `WITH_LAN_ADAPTER=0 WITH_MAPLE=0 WITH_PMCR_CMD=0` puts
+  it at 5796 with CD-DA kept.
 
 The full investigation, including every cause eliminated by measurement, is
 `docs/sonic-adventure-investigation.md`. Read it before re-suspecting the
@@ -598,7 +625,10 @@ way it is:
 3. **Two layout families.** LOW (base < `0x8c010000`) is the stock layout
    untouched. HIGH places everything relative to the base, because `0x8cfe8000`
    and `0x8cfe9000` are *inside* the image when the base is `0x8cfe8000`:
-   `+0xb000` stack top, `+0xc000` `.hiram`, `+0xd000` Maple DMA.
+   `+0xb000` stack top, `+0xc000` `.hiram` (12 KB), `+0xf000` Maple DMA — span
+   `0x10000`. The `.hiram` reservation grew from 4 KB for CD-DA (§4.13) and is
+   unconditional, because the host cannot see which build flags a running
+   loader was made with; `loaders::HIRAM_RESERVED` is its copy.
 4. **A low loader's buffers are at `0x8cfe8000`/`0x8cfe9000`, and that is what
    makes a direct chainload to `0x8cfe8000` fail.** Measured: the new image is
    written straight through the running loader's packet buffers, the transfer
@@ -753,6 +783,74 @@ The general lesson is worth more than the fix: **a title owns the machine, and
 read**. When every instrument goes quiet at once and the title is visibly alive,
 suspect the transport's power, not its logic.
 
+### 4.13 CD-DA: the loader is the drive
+
+A GD-ROM carries its music as ordinary audio tracks and a title plays them by
+asking the GD driver for `CMD_PLAY_TRACKS` / `CMD_PLAY_SECTORS`. There is no
+drive here, so dcload used to answer "COMPLETED, and the drive is spinning" —
+honest about the contract, silent about the music. `cdda.c` is isoldr's answer
+(`loader/cdda.c`, 1589 lines) for this transport: read the audio track, feed
+two AICA channels.
+
+**The table of contents is where a title learns it has music, and ours was a
+stub.** `build_dc_toc` on the host reported one data track — two when the
+low-density area is separate — from `start_sector()` and `num_sectors()` alone.
+Measured 2026-08-29 on Snow Surfers: the disc has **19 tracks, 16 of them
+audio**, and the title was being told it had one. The `CTRL` nibble (4 = data,
+0 = audio) is the entire signal, so no TOC means no `PLAY` command, ever,
+whatever else works. The host now builds the real table from
+`DiscFormat::toc_tracks()` (GDI and CDI), **per area** — a GETTOC asks for the
+CD part or the GD part, and this disc's music is in the GD part. An image that
+cannot enumerate its tracks still gets the old table byte for byte, which is
+the regression guard for every title that works today.
+
+What this keeps from isoldr, and what it replaces — `cdda.h` states each with
+its reason:
+
+| isoldr's option | here |
+| --- | --- |
+| `SRC_DMA` / `SRC_PIO` — read the track off IDE/SD | the source is the **network**: `CMD_CDDAREAD` (`DC23`), raw 2352-byte sectors, synchronous like every other read |
+| `DST_DMA` / `DST_SQ` / `DST_PIO` — push PCM to sound RAM | **PIO**, 32 bits at a time with a G2 FIFO drain every eight. Needs no setup, cannot collide with the BBA's G2 traffic through a DMA channel we do not own, and 176 KB/s against G2's tens of MB/s is not close |
+| `POS_TMU1` / `POS_TMU2` — derive position from a timer | read the AICA's **real** play position (`0x280c`/`0x2814`). No timer to own, no drift — and `perfctr.c` has counter 1 anyway |
+| `CH_ADAPT` / `CH_FIXED` | **fixed**, channels 62 and 63, isoldr's own default |
+
+**Where it runs, and the limit that follows.** `cdda_service()` is called from
+exactly isoldr's two no-IRQ contexts: the GD server's dispatch loop and
+`gdGdcGetDrvStat` (`loader/syscalls.c:866` and `:1067`). Both are **top level of
+a syscall**, which is what lets the fetch transmit — §4.5 forbids transmitting
+nested inside a `bb->loop()`. A title's frame loop calls `GetDrvStat` about
+sixty times a second and the ring holds 0.37 s, so the margin is two orders of
+magnitude. The limit is the mirror of that: **a title that stops calling the GD
+driver stops feeding the music**, and after one ring it goes quiet.
+
+**Why this does not need the interrupt hook, which is not a dodge.** isoldr's
+`use_irq` exists for CDDA largely because isoldr uses **AICA DMA**: it has to
+hide the AICA-DMA completion interrupt from the game and hand it back
+(`aica_dma_irq_hide`/`_restore`), and it drives `CDDA_MainLoop()` from the ASIC
+handler. Writing sound RAM with the CPU raises no such interrupt, so that whole
+class of arbitration does not arise. And an interrupt would not extend playback
+anyway: the fetch cannot run there — `pkt_buf` belongs to whatever the interrupt
+suspended — so an IRQ-driven service could push only what is already staged,
+which is 40 ms. `cdda_service_irq()` is that entry point, deliberately
+non-transmitting; §14.20 has what a real VBR hook would still take.
+
+Tuning constants, all in `cdda.c`:
+
+| Constant | Value | Note |
+| --- | --- | --- |
+| `RING_BYTES` | 32768 | per channel: 0.372 s at 44.1 kHz. In sound RAM, at the top of it, so it costs no main RAM at all |
+| `TICK_TO_SAMPLE_Q20` | 3699 | **the pacing clock is TMU2, not the AICA's play position.** Reading the channel position (`0x280c`/`0x2814`) is what isoldr compiles only under `HAVE_CDDA_TEST`; its production path paces from a timer, and this is why. Measured on console: with the position as flow control the engine fetched **3.4× real time** and starved the title. `0x280c` is the monitor *select* register and the game's own sound driver writes it, so what comes back is another channel's position — and a junk position makes `room >= headroom` true 86 % of the time, which turns the fetch rate into the service-call rate. `setup_machine()` already leaves TMU2 programmed at Pck/4 and stopped; DreamShell's preset for this title asks for `POS_TMU2`, which is isoldr saying the game does not use it |
+| `MAX_FETCH_PER_SERVICE` | `2` | belt and braces after that runaway: a wrong flow control then costs two round trips per syscall instead of a burst that starves the frame |
+| `FETCH_SECTORS` | `3` | 40 ms per host round trip, ~25 requests/s while music plays. Raising it costs `.hiram`, which the link now asserts against the Maple buffer |
+| `CDDA_TIMEOUT_SECONDS` | `2` | shorter than the data path's 6 on purpose: a late audio fetch is a gap in the music, and blocking a title's frame loop to avoid one trades a glitch for a freeze |
+| `G2_FIFO_SPIN_LIMIT` | 10000 | §4.8's rule — every hardware wait bounded. A G2 bus that never drains costs a dropped sample, not a hung console |
+
+Known gaps: `CMD_GETSCD` is still force-completed rather than answering a Q
+subcode, exactly as isoldr leaves it; a title that reads its playback position
+from the subcode rather than from `CMD_REQ_STAT` gets nothing moving.
+ADPCM tracks are not handled — a CD audio track is linear PCM by definition,
+and isoldr's `adpcm_split` is for its own `.raw` conversions.
+
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
 `loader.s` + `disable.s` are linked at `-Ttext=0x8c010000` (the BIOS's 1st_read
@@ -867,6 +965,28 @@ followed by `size` bytes of data.
 | `PMCR` | — | host-to-DC performance-counter control |
 | `EXPT` | `CMD_EXCEPTION` | DC-to-host exception dump |
 
+`DC23` (`CMD_CDDAREAD`, DC→host) reads **raw 2352-byte audio sectors**:
+value0 = LBA, value1 = destination, value2 = bytes. A separate command from
+`DC19` because an audio track has no 2048-byte user area — every byte of it is
+signed 16-bit stereo PCM (§4.13).
+
+**A `DBIN` is an answer to two different questions, so it names its range.**
+`cmd_donebin()` answers a LoadBinary window with the first part still missing,
+or `address = 0, size = 0` when nothing is; `cmd_sendbinq()` closes a memory
+read with a `DBIN` of its own. Those two were byte for byte identical when the
+transfer was complete, which is fine for as long as nobody reads memory while a
+transfer is in flight — and the counter panel (§16, `--diag`) does exactly
+that. Measured 2026-08-30 on Sonic Adventure: the panel's filter swallowed a
+sector transfer's `DBIN` (the host logged `No DoneBinary response received` and
+the loader sat out its whole 6 s timeout), *and* the panel's own terminator
+leaked the other way and was read as "nothing missing anywhere: done" — a
+sector read credited complete with holes in it. The title stopped for ~10 s
+every 2 s, once per sample. `cmd_sendbinq()` now puts the address and size it
+served in that terminator, so the two are disjoint by construction: one names
+loader RAM, the other a game buffer or nothing. **No host reads those fields**
+— `dc-tool-ip` and the Rust host both match on the 4-byte id — so this is
+invisible to everything except the filter that needs it.
+
 `LBIN`/`PBIN`/`DBIN` are **not only the upload path** — they are also how disc
 sectors reach a running game (§4.5). Anything you change there affects both.
 
@@ -946,7 +1066,9 @@ Its SH4 UBC is register storage with no compare logic in the memory path, so
 programming `BARA` from dcload would compile, run and never fire. Use a
 host-side watchpoint, or patch flycast.
 
-**Always-compiled counters** (read with `dc-peek`): `g_gd_idx_counts[]`
+**Always-compiled counters** (read with `dc-peek`, or `--diag` on the Rust
+host): `g_gd_sp_min` / `g_gd_sp_in_image` (the footprint guard, §4.6 — the two
+to read first when a title misbehaves at a low base), `g_gd_idx_counts[]`
 (histogram of GD syscall indices — this is what identifies the condition a
 title is spinning on), `g_gd_park_longs`, `g_cdfs_read_retries` /
 `g_cdfs_read_fails`, `g_lbin_count` / `g_dbin_count`, `g_pbin_ok` /
@@ -954,6 +1076,9 @@ title is spinning on), `g_gd_park_longs`, `g_cdfs_read_retries` /
 `g_last_reject_*`, and the RX set in `rtl8139.c` (`g_rx_frames`, `g_rx_polls`,
 `g_rx_wraps`, `g_rx_overflow`, `g_rx_reinit`, `g_rx_linkchange`,
 `g_rx_link_giveup`, `g_rx_hdr_defer`, `g_rx_last_capr` / `_cbr`), plus
+the CD-DA set (`g_cdda_plays`, `g_cdda_fetches`, `g_cdda_fetch_fails`,
+`g_cdda_underruns`, `g_cdda_toc_fails`, `g_cdda_irq_pushes`,
+`g_cdda_last_lba` — §4.13), plus
 `g_dhcp_replies` / `g_dhcp_not_ours` (§4.10 — DHCP traffic seen against DHCP
 traffic that was somebody else's). The
 post-mortem block at `PM_BASE` survives a reboot but is no longer out of a
@@ -1078,6 +1203,22 @@ result, prove the instrument still detects something.
     (§11) — an instrument that cannot prove it is looking at the right image
     reports fiction with full confidence.
 
+20. **Expecting an interrupt hook to keep the music playing.** It cannot, and
+    the reason is structural: the CD-DA fetch transmits, `pkt_buf` is single
+    and shared, and an interrupt can land inside a `bb->loop()` that is halfway
+    through building a packet (§4.5). So an IRQ-driven service can push only
+    what is already staged — 40 ms — and then it is out of data like everyone
+    else. What a real VBR hook would still take, from the record of the one
+    that was removed: drop the phase model and patch `vbr()` whatever it is,
+    re-verifying by `memcmp` as isoldr does (`exception_vbr_ok()`), and move
+    the stub's continuation out of the vector entries — it used to be published
+    at `VBR+0x604`, which is inside the handler Sonic Adventure writes at
+    `+0x600`; `VBR+0x5f0` is free (measured, 22 bytes of `nop`). Note also
+    that isoldr replaces the first **four** instructions of the title's handler
+    and never runs them, which is a per-binary-type assumption
+    (`exception.c`, `vbr_buffer_orig`), not a general mechanism.
+
+
 ## 15. Where to look first
 
 - **Wire protocol** → `host-src/tool/commands.h`, `host-src/tool/syscalls.h`,
@@ -1154,12 +1295,20 @@ that; the parts the DC side constrains:
   fallback is the IP.BIN title, reported as approximate. 24 titles have presets
   that disagree about `memory`; a tie breaks towards **not moving**, because a
   title that already runs at the stock base is not worth a coin toss.
-- **The loader reports its own base** in the four bytes it appends to its VERS
-  payload after the version string's NUL (`cmd_version`). Without that the host
-  refuses to move anything — probing candidate bases for the `0xdeadbeef` magic
-  would take several round trips and still not distinguish a live loader from
-  the remains of a previous one. An older loader sends no such bytes and is
-  handled, not failed.
+- **The loader reports its own base, and what it can see of the console**, in
+  the 4-byte fields it appends to its VERS payload after the version string's
+  NUL (`cmd_version`): first the base it was linked at, then the video cable it
+  measured (0 = VGA, 2 = RGB, 3 = composite). Without the base the host refuses
+  to move anything — probing candidate bases for the `0xdeadbeef` magic would
+  take several round trips and still not distinguish a live loader from the
+  remains of a previous one. An older loader sends fewer fields, or none, and
+  is handled, not failed.
+  **The fields are read forward from the NUL, never backwards from the end.**
+  Taking the last four bytes as the base was right while there was exactly one
+  field and silently wrong the moment a second appeared: the cable word reads
+  as an implausible base, the host stops relocating anything, and the log says
+  only "does not report its load address" — which is also what an old loader
+  says. The host's parser was changed **before** the second field was added.
 - **Every move goes through `0x8ce00000`, always** — not only when a direct one
   would clash (§14.17). That address is neutral ground: its span is clear of
   every other base in the set in both directions, and a **pre-linked,
@@ -1170,9 +1319,10 @@ that; the parts the DC side constrains:
   against is silent: the transfer reports success, the new loader runs with the
   right PC and stack, and is deaf. The extra upload is 26 KB — **0.04 s,
   measured** — against a session lost when the check is wrong.
-- **The preset is the answer unless something says otherwise**, and exactly two
-  things can: what the title *names* (constants in its binary) and where its
-  reads have *landed* (`game-memory.tsv`). DreamShell's address is isoldr's own
+- **The preset is the answer unless something says otherwise**, and four things
+  can: what the title *names* (constants in its binary), where its reads have
+  *landed* (`game-memory.tsv`), how deep its *stack* has gone (`sp_min`, the two
+  bullets below) and what the database's own votes *disagree* about. DreamShell's address is isoldr's own
   answer for that game and is right far more often than any rule of ours; it is
   wrong only where our `0xe000` does not fit what isoldr's 13 KB did. **The map
   is consulted for the preset itself**, not just for the alternatives — it used
@@ -1181,6 +1331,42 @@ that; the parts the DC side constrains:
   about. Measured on Sonic Adventure 2: its map marks blocks `0xfc..0xfe`, so
   `0x8cfe8000` is ruled out **without any margin at all** — the title writes
   inside the preset's own span.
+- **The third test is not an address collision, and it is the one Sonic
+  Adventure needs.** The constant scan and the map both look for an overlap; a
+  title's stack is neither named by a constant nor read into by anything. It
+  descends from `0x8c00f400` into whatever a LOW loader left below it, and §4.6
+  is what happens next. The host now computes `sp_min - _end` against
+  `LOW_BASE_MIN_MARGIN` (4096, sitting between the 5240 measured booting and
+  playing and the 2444 measured corrupting the loader) and leaves the low family
+  when it does not clear. Two of that margin are `GD_STACK_WORST_CASE`: **the
+  emulated GD driver runs on the game's stack by design** (`cdfs_redir.s` —
+  "ONE STACK, NOT TWO"), so dcload's own read path spends up to 1352 bytes
+  *below* the deepest point the title reaches on its own, measured over
+  `dcload-0x8c004000.elf` by summing the frames reachable from `gdGdcReqCmd`.
+  With nothing recorded the test passes: assuming a depth would reject the base
+  593 presets ask for on one game's evidence.
+- **`sp_min` is learned the way the map is, and from the same instrument.**
+  `g_gd_sp_min` (§11) is latched on the title's **first** GD syscall, so the
+  host reads it back with one `SBIQ` every ten seconds — `src/stackwatch.rs`,
+  on in every session, not behind `--diag` — and records it beside the block
+  map, merged by **minimum**. Two consequences worth having: a session at a base
+  that works teaches exactly as much as one at a base that does not, since the
+  depth is a property of the title and not of the placement; and a doomed run
+  now says so in its first seconds ("the loader is about to be overwritten")
+  instead of freezing minutes later with nothing logged.
+- **A split vote with one address below `0x8c004000` moves the loader off the
+  low family.** A title match is ambiguous when several dumps share a name and
+  DreamShell gave them different addresses, and the tie-break keeps the loader
+  still. But `_MIN` is only reached after `ISOLDR_DEFAULT_ADDR` and `_HIGH` have
+  both failed for a title, so such a vote is that title saying low RAM was too
+  tight — for isoldr's 13 KB. Keeping our 26 KB image at the stock base on the
+  strength of the other vote picks the one address the disagreement argues
+  against. **Sonic Adventure is exactly this**: its two votes are `0x8c004000`
+  and `0x8c000100`, and it corrupts the loader at the first. 8 of the 1026 rows
+  reach this rule; `base_off_the_low_family()` answers from `ISOLDR_HIGH_ADDR`,
+  checked like any other candidate — which for Sonic Adventure rejects it, since
+  the title loads `0x0cff0000` at `0x8c65f24e` and that is inside the image at
+  that base.
 - **Ctrl-C reports what the session learned — but it is not what saves it.**
   Ctrl-C is how a session with a title ends (the game is running, there is
   nothing to finish), so the handler says whether this run added blocks: if it
@@ -1355,6 +1541,62 @@ that; the parts the DC side constrains:
   that path is time the title is frozen (§16, the `thread::sleep` measurement).
   A block that is new is also logged the moment it is marked, so a session that
   is killed still leaves its verdict in the log.
+- **The table of contents is real now, and it was a stub.** `build_dc_toc` used
+  to report one data track from `start_sector()`/`num_sectors()` alone; it now
+  builds from `DiscFormat::toc_tracks()` (GDI and CDI both enumerate audio
+  tracks, and always did — nothing read them), **per area**, with the `CTRL`
+  nibble that tells data from audio. Area 2 is the loader's own request and
+  means "the whole disc": dcload asks for it once to resolve `CMD_PLAY_TRACKS`
+  against, and merging two areas on the console would cost it a second
+  408-byte buffer. An image that cannot enumerate its tracks gets the old
+  table byte for byte — the regression guard, and it has a test. §4.13 has the
+  measurement that forced this.
+- **`read_audio()` serves raw 2352-byte sectors** for `DC23`, refusing a data
+  track rather than handing back sync bytes and ECC as if they were samples.
+  A refusal is answered −1 and the loader turns that into silence: a title
+  that asks for audio this image cannot serve should lose its music, not its
+  disc. `--no-cdda` refuses every one of them, which is the A/B switch.
+  **CDDA reads are excluded from `game-memory.tsv`** — their destination is
+  dcload's own staging buffer, and marking it would teach the map that the
+  title writes where the loader lives.
+- **`--vga auto` asks the console, because only the console can answer.**
+  dcload reads the cable and reports it in VERS (above), so the host patches a
+  title for VGA only when there is really a VGA box on the other end: forcing
+  VGA on a television is a black screen, and nothing on the host's side of the
+  wire can see which is plugged in. `auto` is the default, `always` covers the
+  adapter that does not ground the detect pins (some VGA cables, some HDMI
+  boxes — the console says composite while the display wants 480p), `never`
+  disables it. A loader too old to report the cable counts as **unknown**, and
+  unknown means "leave the title alone" — the code for VGA is 0, so every loose
+  decode lands on the one answer that would patch a title on a TV. The host
+  asks at the moment it decides, not once at start-up: a chainload replaces the
+  loader, and the one that came off the CD may predate the field while the one
+  just uploaded reports it.
+- **`--vga` forces the cable check, and it is found by content.** A Katana
+  title asks which video cable it is on exactly once — it reads the SH4's port
+  data register `0xff800030` and takes bits 8 and 9 (0 = VGA, 2 = RGB,
+  3 = composite) — and everything downstream, 480p or interlace, follows from
+  those two bits. `vga_cable_patches()` finds the read the same way the GAPS
+  probe finds its signature (a literal an `mov.l @(disp,PC),Rn` really loads,
+  then the read of that register) and turns the `mov.w @r3,r4` into
+  `mov #0,r4`. Measured on four PAL dumps — Sonic Adventure, Sonic Adventure 2,
+  Crazy Taxi, Snow Surfers — each with **exactly one** aligned occurrence of
+  that address and the same six-instruction routine around it, byte for byte.
+  The read is patched rather than the shift-and-mask after it, so a title that
+  tests the raw `0x300` is answered too. The host also sets bit 4 of IP.BIN's
+  peripheral field in the header it puts at `0x8c008000` — a different reader
+  (IP.BIN's own bootstrap, and any title that reads its header back), and the
+  one place Snow Surfers differs from the other three (`0799A00` against
+  `0799A10`). **Off by default**: nothing on the host can see which cable is
+  plugged into the console, and a title forced to VGA on a TV is a black
+  screen. Both patched words go on the same reload guard as the GAPS one
+  (§4.12), because a title may read its own image back off the disc.
+- **`loaders::HIRAM_RESERVED` is 12 KB and unconditional.** `.hiram` holds the
+  packet buffers and, with `WITH_CDDA`, the audio staging buffer; this host
+  cannot see which flags a running loader was built with, so it reserves the
+  maximum. Sizing it to one build makes it silently wrong for the others, and
+  wrong here means placing the next loader on the running one's buffers with
+  nothing reported at either end. `LOADER_SPAN` is `0x10000` to match.
 - **`is_uploadable()` gates ELF sections on SHF_ALLOC and a non-zero address**,
   not on `SHT_PROGBITS` alone. The old test logged "skipping" and then pushed
   the section anyway, so `.symtab`/`.strtab`/`.comment` were uploaded to address

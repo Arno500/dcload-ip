@@ -300,6 +300,18 @@ _stack = DCLOAD_STACK;
 /* ASSERT triggers when condition is FALSE */
 /* Stack calculation will wrap around if ram region overflows, so only one
    error displays at a time :) */
+/* .hiram is placed by address and bounded by nothing but the next thing in
+ * high RAM, which is the Maple DMA buffer. Overflowing into it would be
+ * silent and would corrupt DMA the hardware writes -- so it is a link error.
+ * Growing a .hiram buffer therefore means growing the reservation in
+ * target-src/dcload/Makefile AND the host's copy of that table.
+ *
+ * Only in the HIGH family. In the LOW one the Maple buffer sits BELOW .hiram
+ * (0x8cfe8000 against 0x8cfe9000) and what bounds .hiram is the top of RAM,
+ * 92 KB further up -- so the same comparison would fail every low link. */
+#if DCLOAD_MAPLE > DCLOAD_HIRAM
+ASSERT(( __hiram_end <= DCLOAD_MAPLE ), "Error: .hiram overflows into the Maple DMA buffer: raise the reservation in target-src/dcload/Makefile (and the host's loaders::live_footprint)")
+#endif
 ASSERT(( (_stack - _end) > 800 ), "Error: Not enough stack space: need at least 800 bytes")
 ASSERT(( _end <= (ORIGIN(ram) + LENGTH(ram)) ), "Error: Region 'ram' overflowed: try '-Os' or shrink code size")
 /* For some reason LD's normal overflow checks don't run when sections are

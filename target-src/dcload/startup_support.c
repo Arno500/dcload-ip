@@ -43,23 +43,39 @@ void __call_builtin_sh_set_fpscr(unsigned int value)
 static volatile uint32_t cable_mode = 0;
 static volatile uint32_t video_region = 0;
 
+// Which video cable the console is plugged into, straight off the port:
+// 0 = VGA, 2 = RGB (SCART), 3 = composite -- the BootROM's own numbering, and
+// the same two bits every Katana title reads for itself.
+//
+// Read here rather than returning the cached `cable_mode`, and that is not
+// fussiness: the cache is only filled by STARTUP_Init_Video(), it is zero
+// before that runs, and zero MEANS VGA. A caller that got in first would be
+// told "VGA box" about a console on a television, with nothing to say the
+// answer was never measured. This costs two register accesses and cannot.
+//
+// The host asks for this (it travels in the VERS reply, see cmd_version) to
+// decide whether patching a title's own cable check is worth doing at all.
+unsigned int STARTUP_Get_Cable(void)
+{
+  // Need to read port 8 and 9 data (bits 8 & 9 in PDTRA), so set them as input
+  // direction via PCTRA (necessary per SH7750 hardware manual):
+  *(volatile uint32_t*)0xff80002c = ( (*(volatile uint32_t*)0xff80002c) & 0xfff0ffff ) | 0x000a0000;
+  // Per the SH7750 manual, there are 16 data regs, hence a 16-bit read should
+  // be used on PDTRA.
+  return ( (unsigned int)(*(volatile uint16_t*)0xff800030) & 0x300 ) >> 8;
+}
+
 // Video mode is automatically determined based on cable type and console region
 // This sets up everything related to Dreamcast video modes.
 // The framebuffer address will always be 0xa5000000 after this runs.
 void STARTUP_Init_Video(unsigned char fbuffer_color_mode)
 {
-  // Set cable type to hardware pin setting
-  // Need to read port 8 and 9 data (bits 8 & 9 in PDTRA), so set them as input
-  // direction via PCTRA (necessary per SH7750 hardware manual):
-  *(volatile uint32_t*)0xff80002c = ( (*(volatile uint32_t*)0xff80002c) & 0xfff0ffff ) | 0x000a0000;
-
+  // Set cable type to hardware pin setting.
   // According to the BootROM, cable data is on PORT8/9 GPIO pins.
   // Read them and then write them to somewhere in AICA memory (refer to notes
   // section for an explanation and a theory as to why this might be necessary):
-  cable_mode = (uint32_t)( (*(volatile uint16_t*)0xff800030) & 0x300 );
+  cable_mode = STARTUP_Get_Cable() << 8;
   *(volatile uint32_t*)0xa0702c00 = ( (*(volatile uint32_t*)0xa0702c00) & 0xfffffcff ) | cable_mode;
-  // Per the SH7750 manual, there are 16 data regs, hence a 16-bit read should
-  // be used on PDTRA.
 
   // Store video output region (0 = NTSC, 1 = PAL)
   video_region = (*(uint8_t*)0x8c000074) - 0x30;

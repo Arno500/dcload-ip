@@ -124,6 +124,10 @@ void __call_builtin_sh_set_fpscr(unsigned int value);
 void STARTUP_Init_Video(unsigned char fbuffer_color_mode);
 void STARTUP_Set_Video(unsigned char fbuffer_color_mode);
 
+// The video cable this console is plugged into: 0 = VGA, 2 = RGB, 3 = composite.
+// Reported to the host in the VERS reply -- see cmd_version().
+unsigned int STARTUP_Get_Cable(void);
+
 /* Quiesce the machine the way isoldr does before it launches a title, timer
  * included. Called from cmd_execute() under ISOLDR_HANDOFF. */
 void setup_machine(void);

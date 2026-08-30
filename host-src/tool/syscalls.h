@@ -74,6 +74,12 @@ int dc_gdbpacket(unsigned char * buffer);
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
 #define CMD_CDFSTOC "DC22"
+/* CDDA: read raw 2352-byte AUDIO sectors. A separate command from
+ * CMD_CDFSREAD because it is a different unit and a different part of the
+ * disc -- an audio track has no 2048-byte user area, every one of its bytes
+ * is signed 16-bit stereo PCM. value0 = LBA, value1 = destination,
+ * value2 = bytes. */
+#define CMD_CDDAREAD "DC23"
 
 // Special definition for exception handler data
 #define CMD_EXCEPTION "EXPT"

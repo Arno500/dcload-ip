@@ -82,9 +82,16 @@ GROUPS = [
         "g_warm_start", "g_warm_ip", "g_dhcp_replies", "g_dhcp_not_ours",
     ]),
     ("GD emulation (cdfs_syscalls.c)", [
-        "g_gd_park_longs", "g_gd_idx_counts",
+        "g_gd_park_longs", "g_gd_idx_counts", "g_gd_cmd_counts",
         "g_cdfs_read_retries", "g_cdfs_read_fails",
         "g_cdfs_sync_chunks", "g_cdfs_sync_reentered",
+    ]),
+    ("CDDA (cdda.c)", [
+        "g_cdda_plays", "g_cdda_fetches", "g_cdda_fetch_fails",
+        "g_cdda_underruns", "g_cdda_toc_fails", "g_cdda_irq_pushes",
+        "g_cdda_deferred", "g_cdda_aica_pos",
+        "g_cdda_mvol", "g_cdda_mvol_raised",
+        "g_cdda_last_lba",
     ]),
     ("State", [
         "booted", "running", "our_ip", "tool_ip",
@@ -93,10 +100,21 @@ GROUPS = [
 ]
 
 IP_NAMES = {"our_ip", "tool_ip", "g_warm_ip"}
+
+# The GD command codes, so g_gd_cmd_counts[] reads as commands rather than as a
+# row of 48 numbers to count along by hand. Same numbering as cdfs_syscalls.c
+# and as isoldr; a code with no name here still prints, as its number.
+GD_CMD_NAMES = {
+    16: "PIOREAD", 17: "DMAREAD", 18: "GETTOC", 19: "GETTOC2",
+    20: "PLAY_TRACKS", 21: "PLAY_SECTORS", 22: "PAUSE", 23: "RELEASE",
+    24: "INIT", 27: "SEEK", 29: "NOP", 30: "REQ_MODE", 31: "SET_MODE",
+    33: "STOP", 34: "GETSCD", 35: "GETSES", 36: "REQ_STAT", 40: "GET_VERS",
+}
 HEX_NAMES = {
     "g_last_load_addr", "g_last_pbin_addr", "g_last_reject_addr",
     "g_last_reject_load", "g_last_reject_end",
     "g_rx_last_capr", "g_rx_last_cbr", "g_rx_last_bad_status",
+    "g_cdda_last_lba", "g_cdda_mvol",
 }
 
 
@@ -232,6 +250,13 @@ def fmt(name, size, raw):
         return str(v)
     if size % 4 == 0:
         vals = struct.unpack("<%dI" % (size // 4), raw)
+        # ONLY WHAT WAS ASKED FOR. 48 slots of which four are used reads as a
+        # haystack; the commands a title issues are the whole point.
+        if name == "g_gd_cmd_counts":
+            hit = [(i, v) for i, v in enumerate(vals) if v]
+            if not hit:
+                return "(none)"
+            return " ".join(f"{GD_CMD_NAMES.get(i, str(i))}={v}" for i, v in hit)
         return "[" + " ".join(str(v) for v in vals) + "]"
     return raw.hex()
 
