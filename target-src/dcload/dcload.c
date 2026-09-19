@@ -857,6 +857,13 @@ void setup_machine(void)
 
 	tmu8[4] |= 1;			/* TSTR: start TMU0, as the bootstrap would */
 
+	/* TMU2 is the loader's free-running deadline clock (adapter.h), needed by
+	 * the GD read deadline even when no audio plays. TCR2 and TCNT2 are set
+	 * above; UNIE stays clear, so nothing is delivered on underflow. NOTE: this
+	 * function only runs with ISOLDR_SETUP_MACHINE=1, so in the default build
+	 * TMU2 is still started only by CD-DA. */
+	tmu8[4] |= 4;			/* TSTR: start TMU2, Pck/4, free-running */
+
 	asic[4] = 0;			/* SB_IML2NRM */
 	asic[5] = 0;			/* SB_IML2EXT */
 	asic[6] = 0;			/* SB_IML2ERR */

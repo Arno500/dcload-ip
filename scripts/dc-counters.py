@@ -86,12 +86,13 @@ GROUPS = [
         "g_cdfs_read_retries", "g_cdfs_read_fails",
         "g_cdfs_sync_chunks", "g_cdfs_sync_reentered",
     ]),
-    ("CDDA (cdda.c)", [
+    ("CDDA (cdda.c) -- AGENTS.md 4.13 says what to read first", [
         "g_cdda_plays", "g_cdda_fetches", "g_cdda_fetch_fails",
-        "g_cdda_underruns", "g_cdda_toc_fails", "g_cdda_irq_pushes",
-        "g_cdda_deferred", "g_cdda_aica_pos",
-        "g_cdda_mvol", "g_cdda_mvol_raised",
-        "g_cdda_last_lba",
+        "g_cdda_wrong_lba", "g_cdda_retv_nodata", "g_cdda_stale_lbin",
+        "g_cdda_mutes", "g_cdda_ch_stolen",
+        "g_cdda_room_min", "g_cdda_svc_gap_max",
+        "g_cdda_toc_fails", "g_cdda_last_lba",
+        "g_cdda_end_tm", "g_cdda_scale_ppm",
     ]),
     ("State", [
         "booted", "running", "our_ip", "tool_ip",
@@ -114,7 +115,7 @@ HEX_NAMES = {
     "g_last_load_addr", "g_last_pbin_addr", "g_last_reject_addr",
     "g_last_reject_load", "g_last_reject_end",
     "g_rx_last_capr", "g_rx_last_cbr", "g_rx_last_bad_status",
-    "g_cdda_last_lba", "g_cdda_mvol",
+    "g_cdda_last_lba",
 }
 
 

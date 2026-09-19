@@ -39,23 +39,29 @@
  *
  *   gdGdcReqCmd      queues, sets PROCESSING, returns a channel. No I/O.
  *   gdcServerMain    endless dispatch loop, entered once and never left.
- *   data_transfer    reads in chunks of GD_EMU_ASYNC sectors, yielding to the
- *                    game between chunks (isoldr's emu_async).
+ *   data_transfer    reads in chunks of GD_EMU_ASYNC sectors, one host round
+ *                    trip each (isoldr's emu_async). By default the whole
+ *                    read completes in one ExecServer: the game only gets
+ *                    control back before a failed chunk is retried
+ *                    (GD_YIELD_BETWEEN_CHUNKS=1 would yield after every
+ *                    chunk; that broke Sonic Adventure).
  *   gdGdcGetCmdStat  reports progress; COMPLETED is consumed once, then IDLE.
- *   gdGdcGetDrvStat  reports PLAYING while a read is live, PAUSED otherwise.
+ *   gdGdcGetDrvStat  reports PLAYING while a read or CD-DA is live, PAUSED
+ *                    otherwise.
  *
- * WHAT ISOLDR DOES THAT WE DELIBERATELY DO NOT. Its SD path reaches
+ * The CD-DA engine (cdda.c) is also driven from here: cdda_service() runs at
+ * the top of the server loop and of gdGdcGetDrvStat, and between the chunks of
+ * a read.
+ *
+ * WHAT ISOLDR DOES THAT WE DO NOT. Its SD path reaches
  * data_transfer_true_async(), which overlaps an SPI DMA with the game and
- * polls it. Our "device" is a UDP round trip to the host, which has no
- * overlappable DMA to poll, so the chunk loop IS our async: each chunk blocks
- * only for its own round trip, and the game runs between chunks. isoldr falls
- * back to this same emu_async loop whenever DMA is unavailable.
+ * polls it. Our "device" is a UDP round trip with nothing to poll, so we use
+ * the emu_async chunk loop that isoldr falls back to without DMA.
  *
- * WHERE A TX IS SAFE. pkt_buf is single and shared, and bb->loop() dispatches
- * incoming commands that build into it. A transmit is therefore only safe at
- * the top level of a syscall, never nested inside a bb->loop(). The chunk loop
- * respects this: each chunk's send-and-wait completes before the yield, and
- * the next chunk begins at the top of a later ExecServer.
+ * WHERE A TX IS SAFE. pkt_buf and the LoadBinary window are single and shared,
+ * and bb->loop() dispatches incoming commands that build into pkt_buf. Never
+ * transmit between building a command and sending it, and never start a second
+ * transfer while one is waiting (g_gd_in_transfer). AGENTS.md 4.5.
  */
 
 #include <string.h>
@@ -117,11 +123,32 @@
 #define GDC_PARAMS_COUNT        4
 
 /*
- * Shorter than the host's own give-up time, on purpose. The host abandons an
- * unanswered transfer in ~4 s and goes back to listening; if we waited longer
- * than that we would still be blocked when it became ready to serve us again,
- * and the retry below could never happen.
+ * Deadline for one disc-read wait (ReadSectors, GetTOC): 1.2 s in TMU2 ticks
+ * (Pck/4, 12500 per millisecond).
+ *
+ * The adapter loop's other bounds are poor for this. The seconds timeout counts
+ * whole seconds on the performance counter (6 s fires at 7 s, and never under
+ * an emulator without PMCR support). RTL_IDLE_POLL_LIMIT only counts polls with
+ * no incoming frame, and while a read is stuck the network is usually busy
+ * (host retries, CD-DA, --diag). Both are also disarmed if anything clears
+ * timeout_loop during the wait, which is how a CD-DA fetch nested in a read
+ * once left it waiting forever (see g_gd_in_transfer).
+ *
+ * A healthy 16 KB chunk takes well under a millisecond and the host gives up on
+ * a transfer after ~0.7 s, so 1.2 s waits past the host rather than racing it.
+ * On expiry the chunk fails and data_transfer_emu_async() retries it after
+ * giving the title a frame.
+ *
+ * NOTE: in the default build nothing starts TMU2 before CD-DA does (cdda.c);
+ * setup_machine() also starts it, but only runs with ISOLDR_SETUP_MACHINE=1.
+ * Until then TMU2_COUNT does not move and this deadline cannot expire.
  */
+#ifndef GD_READ_DEADLINE_TICKS
+#define GD_READ_DEADLINE_TICKS 15000000u
+#endif
+
+/* The adapter loop's seconds timeout for GD waits: a coarse backstop behind
+ * GD_READ_DEADLINE_TICKS. */
 #define GD_SYSCALL_TIMEOUT_SECONDS 6
 
 /* How many times a chunk may be re-requested before the read is failed. */
@@ -257,6 +284,109 @@ unsigned int g_cdfs_read_retries;
  * which 11 go to registers and the count, so anything approaching 80 here
  * means the buffer needs enlarging before it silently overruns. */
 unsigned int g_gd_park_longs;
+
+/*
+ * Non-zero while a disc read (ReadSectors, GetTOC) waits in bb->loop().
+ *
+ * There is one LoadBinary window (bin_info) and one pkt_buf, so no other
+ * transfer may start during that wait. One did: the title runs with
+ * interrupts enabled, its handlers call gdGdcGetDrvStat, and that runs
+ * cdda_service() before taking the GD lock. An audio fetch started there
+ * replaced the read's window (the host's parts then landed nowhere) and cleared
+ * the read's deadline on its way out, so the read waited forever and the title
+ * froze with the loader still answering. cdda_service() now declines while
+ * this is set; the read loop feeds the ring between chunks
+ * instead (GD_CDDA_BETWEEN_CHUNKS).
+ */
+unsigned int g_gd_in_transfer;
+
+/*
+ * Stuck GD lock watchdog.
+ *
+ * A freeze was once read as "every gdGdcExecServer declined because the lock is
+ * held, while the server is parked and no C caller is inside" -- a state no
+ * path in this file produces and nothing would ever clear. gd_lock_watchdog()
+ * detects that state rather than a cause: lock held, server parked, and
+ * g_gd_lock_gen (bumped on every C acquire and release) unchanged for 250 ms.
+ * The generation test excludes the few instructions in gdcExitToGame() and
+ * es_enter where "held" and "parked" legitimately overlap. Releasing the lock
+ * then is safe: the server is parked, so resuming it is what ExecServer was
+ * trying to do anyway.
+ *
+ * It has not fired in any recorded session (g_gd_lock_stuck 0). The freezes
+ * behind it are attributed to the CD-DA nesting described at g_gd_in_transfer,
+ * and none has been recorded since that fix; the watchdog stays as a backstop.
+ * Like the read deadline, it needs TMU2 running.
+ */
+unsigned int g_gd_lock_gen;         /* ++ on every C acquire and release */
+unsigned int g_gd_lock_owner;       /* 1 ReqCmd 2 GetCmdStat 3 GetDrvStat
+                                     * 4 ChangeDataType 5 Reset; 0 = the
+                                     * server itself, which takes the byte in
+                                     * es_enter and writes no owner */
+unsigned int g_gd_lock_stuck;       /* deadlocks observed and broken */
+unsigned int g_gd_lock_stuck_owner; /* the owner latched at the break */
+unsigned int g_gd_lock_stuck_ticks; /* how long it had been held, TMU2 ticks */
+
+#ifndef GD_LOCK_STUCK_TICKS
+#define GD_LOCK_STUCK_TICKS 3125000u   /* 250 ms at Pck/4 */
+#endif
+
+static unsigned int gd_stuck_since;
+static unsigned int gd_stuck_gen;
+static unsigned int gd_stuck_armed;
+
+/* Take the GD path, recording who has it. Returns 0 on success like gd_lock(). */
+static int gd_take(unsigned int who)
+{
+	if (gd_lock())
+	{
+		return 1;
+	}
+	g_gd_lock_owner = who;
+	g_gd_lock_gen++;
+	return 0;
+}
+
+static void gd_give(void)
+{
+	g_gd_lock_owner = 0;
+	g_gd_lock_gen++;
+	gd_unlock();
+}
+
+/*
+ * Runs from the two syscalls a title polls every frame, BEFORE either takes
+ * the lock -- so it costs two loads and a compare on the healthy path and
+ * needs nothing held to do its job.
+ */
+static void gd_lock_watchdog(void)
+{
+	if (!gd_lock_state || (gd_park_ptr == (unsigned int)&gd_park_end))
+	{
+		gd_stuck_armed = 0;   /* free, or the server is running: nothing to see */
+		return;
+	}
+
+	if (!gd_stuck_armed || (gd_stuck_gen != g_gd_lock_gen))
+	{
+		gd_stuck_armed = 1;
+		gd_stuck_gen = g_gd_lock_gen;
+		gd_stuck_since = TMU2_COUNT;
+		return;
+	}
+
+	/* TMU2 counts DOWN; the unsigned subtraction is correct across its wrap. */
+	if ((unsigned int)(gd_stuck_since - TMU2_COUNT) < GD_LOCK_STUCK_TICKS)
+	{
+		return;
+	}
+
+	g_gd_lock_stuck++;
+	g_gd_lock_stuck_owner = g_gd_lock_owner;
+	g_gd_lock_stuck_ticks = (unsigned int)(gd_stuck_since - TMU2_COUNT);
+	gd_stuck_armed = 0;
+	gd_give();
+}
 
 /*
  * Post-mortem block, in high RAM.
@@ -520,8 +650,13 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 
 	syscall_retval = (unsigned int)-1;
 	timeout_loop = GD_SYSCALL_TIMEOUT_SECONDS;
+	fine_deadline_start = TMU2_COUNT;
+	fine_deadline_ticks = GD_READ_DEADLINE_TICKS;
+	g_gd_in_transfer++;
 	build_send_packet(sizeof(command_3int_t));
 	bb->loop(0);
+	g_gd_in_transfer--;
+	fine_deadline_ticks = 0;
 	timeout_loop = 0;
 
 	/* 'E' = the wait returned. If 'D' appears with no 'E', dcload is still
@@ -544,9 +679,21 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 }
 
 /*
- * Read in chunks, handing the CPU back to the game between them. This is
- * isoldr's data_transfer_emu_async(), with our UDP round trip standing in for
- * its sector reader.
+ * Feed the CD-DA ring between the chunks of a disc read. A read of a level file
+ * can take seconds, and cdda_service() declines during the read's own waits
+ * (g_gd_in_transfer), so this is the only thing feeding the music meanwhile;
+ * with it off the ring runs dry during level loads. 0 for an A/B.
+ */
+#ifndef GD_CDDA_BETWEEN_CHUNKS
+#define GD_CDDA_BETWEEN_CHUNKS 1
+#endif
+
+/*
+ * Serve a read in chunks of GD_EMU_ASYNC sectors, one host round trip each.
+ * This is isoldr's data_transfer_emu_async() with our UDP request standing in
+ * for its sector reader. Unlike isoldr, the title does not get control between
+ * chunks (GD_YIELD_BETWEEN_CHUNKS is 0); it only does before a failed chunk is
+ * retried.
  *
  * param[0] = LBA, param[1] = sectors remaining, param[2] = destination. All
  * three advance as we go, so a resumed transfer needs no side state.
@@ -605,6 +752,17 @@ static void data_transfer_emu_async(void)
 
 		_GDS.param[2] += sc_size;
 		_GDS.param[0] += sc;
+
+#if GD_CDDA_BETWEEN_CHUNKS
+		/*
+		 * Keep the music fed during a long read. This is the one safe point
+		 * in the loop: the chunk is committed, its window is finished, the
+		 * next request is not built yet, and g_gd_in_transfer is 0. It does
+		 * not hand the title control, unlike GD_YIELD_BETWEEN_CHUNKS and
+		 * GD_SERVICE_EVERY_SYSCALL, which both broke Sonic Adventure.
+		 */
+		cdda_service_between_chunks();
+#endif
 
 #if GD_YIELD_BETWEEN_CHUNKS
 		/* isoldr's emu_async: the title gets its frame back here. */
@@ -694,8 +852,13 @@ static void GetTOC(void)
 
 	syscall_retval = (unsigned int)-1;
 	timeout_loop = GD_SYSCALL_TIMEOUT_SECONDS;
+	fine_deadline_start = TMU2_COUNT;
+	fine_deadline_ticks = GD_READ_DEADLINE_TICKS;
+	g_gd_in_transfer++;
 	build_send_packet(sizeof(command_3int_t));
 	bb->loop(0);
+	g_gd_in_transfer--;
+	fine_deadline_ticks = 0;
 	timeout_loop = 0;
 
 	if ((int)syscall_retval < 0)
@@ -722,12 +885,105 @@ static void get_ver_str(void)
 	_GDS.status = CMD_STAT_COMPLETED;
 }
 
+/* SCD audio-status values a title reads out of CMD_GETSCD / CMD_REQ_STAT. */
+#define SCD_AUDIO_NO_INFO   0x15u
+
+/*
+ * CMD_REQ_STAT writes four output words: repeat count, track, (CTRL/ADR<<24)|FAD
+ * and index. While CD-DA is playing the FAD, track and repeat come from the
+ * audio engine (which is the drive), so a title synchronising to the disc
+ * position tracks the music; otherwise they are the data path's, as before.
+ * CTRL/ADR is 0x01 for an audio track and 0x41 for data. isoldr's get_stat().
+ */
 static void get_stat(void)
 {
+	int st = cdda_state();
+
+	if (st == CDDA_PLAYING || st == CDDA_PAUSED)
+	{
+		unsigned int lba = cdda_current_lba();
+		unsigned int track = cdda_track();
+
+		*((unsigned int *)_GDS.param[0]) = cdda_repeat();
+		if (track)
+		{
+			*((unsigned int *)_GDS.param[1]) = track;
+			*((unsigned int *)_GDS.param[2]) = (0x01U << 24) | lba;
+		}
+		else
+		{
+			*((unsigned int *)_GDS.param[1]) = _GDS.data_track;
+			*((unsigned int *)_GDS.param[2]) = (0x41U << 24) | lba;
+		}
+		*((unsigned int *)_GDS.param[3]) = 1;
+		_GDS.status = CMD_STAT_COMPLETED;
+		return;
+	}
+
 	*((unsigned int *)_GDS.param[0]) = 0;
 	*((unsigned int *)_GDS.param[1]) = _GDS.data_track;
 	*((unsigned int *)_GDS.param[2]) = (0x41U << 24) | _GDS.lba;
 	*((unsigned int *)_GDS.param[3]) = 1;
+	_GDS.status = CMD_STAT_COMPLETED;
+}
+
+/*
+ * CMD_GETSCD -- the Q subcode of the sector being played. A title that reads
+ * its playback position from here, rather than from CMD_REQ_STAT, gets nothing
+ * unless this is served: force-completing it (as this loader used to) writes no
+ * data and the title sees a stale buffer. Format 1 is the 14-byte Q block;
+ * anything else gets a zeroed all-subcode blob with the audio status patched
+ * in. isoldr's get_scd() (loader/syscalls.c:247).
+ */
+static void get_scd(void)
+{
+	unsigned char *buf = (unsigned char *)_GDS.param[2];
+	unsigned int fmt = _GDS.param[0];
+	int st = cdda_state();
+	int playing = (st == CDDA_PLAYING || st == CDDA_PAUSED);
+	unsigned int lba = playing ? cdda_current_lba() : _GDS.lba;
+	unsigned int track = playing ? cdda_track() : 0;
+	unsigned int astat = playing ? cdda_audio_status() : SCD_AUDIO_NO_INFO;
+	unsigned int offset = lba - 150;
+
+	if (fmt == 1)
+	{
+		buf[0] = 0x00;
+		buf[1] = (unsigned char)astat;
+		buf[2] = 0x00;
+		buf[3] = 0x0e;
+		if (track)
+		{
+			buf[4] = 0x01;              /* audio CTRL/ADR */
+			buf[5] = (unsigned char)track;
+			buf[6] = (unsigned char)track;
+		}
+		else
+		{
+			buf[4] = 0x41;              /* data CTRL/ADR */
+			buf[5] = (unsigned char)_GDS.data_track;
+			buf[6] = (unsigned char)_GDS.data_track;
+		}
+		buf[7] = (unsigned char)((offset >> 16) & 0xff);
+		buf[8] = (unsigned char)((offset >> 8) & 0xff);
+		buf[9] = (unsigned char)(offset & 0xff);
+		buf[10] = 0x00;
+		buf[11] = (unsigned char)((lba >> 16) & 0xff);
+		buf[12] = (unsigned char)((lba >> 8) & 0xff);
+		buf[13] = (unsigned char)(lba & 0xff);
+		_GDS.transfered = 14;
+	}
+	else
+	{
+		unsigned int i;
+
+		for (i = 0; i < 100u; i++)
+		{
+			buf[i] = 0;
+		}
+		buf[1] = (unsigned char)astat;
+		_GDS.transfered = 100;
+	}
 	_GDS.status = CMD_STAT_COMPLETED;
 }
 
@@ -854,11 +1110,15 @@ void gdcServerMain(void)
 				(void)cdda_seek(_GDS.param[0]);
 				_GDS.status = CMD_STAT_COMPLETED;
 				break;
+			case CMD_GETSCD:
+				/* The Q subcode, served from the audio engine's
+				 * position while music plays -- see get_scd(). */
+				get_scd();
+				break;
 			case CMD_INIT:
 			case CMD_NOP:
 			case CMD_REQ_MODE:
 			case CMD_SET_MODE:
-			case CMD_GETSCD:
 			default:
 				/* isoldr force-completes anything it does not model rather
 				 * than failing it: a title that gets FAILED for a command it
@@ -1034,7 +1294,7 @@ int gdGdcReqCmd(int cmd, int *param)
 		g_gd_cmd_counts[cmd]++;
 	}
 
-	if ((cmd < 0) || (cmd > CMD_MAX) || gd_lock())
+	if ((cmd < 0) || (cmd > CMD_MAX) || gd_take(1))
 	{
 		return gd_chn;
 	}
@@ -1078,7 +1338,7 @@ int gdGdcReqCmd(int cmd, int *param)
 			 (unsigned int)_GDS.req_count);
 	}
 
-	gd_unlock();
+	gd_give();
 	return gd_chn;
 }
 
@@ -1093,8 +1353,9 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 
 	g_gd_idx_counts[1]++;
 	gd_service_net();
+	gd_lock_watchdog();
 
-	if (gd_lock())
+	if (gd_take(2))
 	{
 		return CMD_STAT_BUSY;
 	}
@@ -1107,7 +1368,7 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 	if ((gd_chn == 0) || (gd_chn != _GDS.req_count))
 	{
 		status[0] = CMD_ERR_ILLEGALREQUEST;
-		gd_unlock();
+		gd_give();
 		return CMD_STAT_FAILED;
 	}
 
@@ -1147,7 +1408,7 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 		break;
 	}
 
-	gd_unlock();
+	gd_give();
 	gd_trace('S', (unsigned int)gd_chn, (unsigned int)rv,
 		 (unsigned int)status[2]);
 	return rv;
@@ -1158,6 +1419,7 @@ int gdGdcGetDrvStat(int *status)
 	g_gd_idx_counts[4]++;
 	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
+	gd_lock_watchdog();
 
 	/* isoldr's other no-IRQ context (loader/syscalls.c:1067), and the one
 	 * that carries the stream on this transport: a title's frame loop calls
@@ -1166,7 +1428,7 @@ int gdGdcGetDrvStat(int *status)
 	 * command state and the audio stream is not part of it. */
 	cdda_service();
 
-	if (gd_lock())
+	if (gd_take(3))
 	{
 		return CMD_STAT_BUSY;
 	}
@@ -1180,7 +1442,7 @@ int gdGdcGetDrvStat(int *status)
 	status[0] = _GDS.drv_stat;
 	status[1] = _GDS.drv_media;
 
-	gd_unlock();
+	gd_give();
 	return 0;
 }
 
@@ -1192,7 +1454,7 @@ int gdGdcChangeDataType(int *param)
 	{
 		return -1;
 	}
-	if (gd_lock())
+	if (gd_take(4))
 	{
 		return CMD_STAT_BUSY;
 	}
@@ -1210,7 +1472,7 @@ int gdGdcChangeDataType(int *param)
 		param[3] = (int)_GDS.sec_size;
 	}
 
-	gd_unlock();
+	gd_give();
 	return 0;
 }
 
@@ -1218,7 +1480,8 @@ int gdGdcReset(void)
 {
 	g_gd_idx_counts[9]++;
 	reset_GDS();
-	gd_unlock();
+	g_gd_lock_owner = 5;
+	gd_give();
 	return 0;
 }
 

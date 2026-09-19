@@ -1158,6 +1158,11 @@ static int rtl_bb_rx()
 }
 
 volatile int drain_iters = 0;
+
+/* The fine deadline -- see adapter.h. Zero unless a caller has armed it. */
+volatile unsigned int fine_deadline_ticks = 0;
+volatile unsigned int fine_deadline_start = 0;
+unsigned int g_fine_timeouts = 0;
 /* Times the performance counter read lower than it had before. Non-zero means
  * the clock cannot be trusted for deadlines on this machine. */
 unsigned int g_pmcr_backwards = 0;
@@ -1485,6 +1490,17 @@ void rtl_bb_loop(int is_main_loop)
 		 * waiting for a reply. The ring is emptied, nothing is awaited. */
 		if (drain_iters > 0 && --drain_iters == 0)
 		{
+			escape_loop = 1;
+		}
+
+		/* The fine deadline, checked before the seconds one so it wins when
+		 * both are armed. TMU2 counts DOWN, so elapsed is start minus now, and
+		 * the unsigned subtraction is correct across the counter's wrap. */
+		if (fine_deadline_ticks
+		    && (fine_deadline_start - TMU2_COUNT) > fine_deadline_ticks)
+		{
+			g_fine_timeouts++;
+			timeout_loop = -1;
 			escape_loop = 1;
 		}
 

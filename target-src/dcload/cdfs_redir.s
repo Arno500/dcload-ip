@@ -85,6 +85,20 @@
 	.global _gd_unlock
 	.global _gdGdcExecServer
 	.global _gdGdcInitSystem
+
+! Three words the C side needs to READ, and nothing else. gd_lock_byte says
+! whether the GD path is held; saved_regs_ptr against saved_regs_end says
+! whether the server context is PARKED (ptr below end, a frame is stored) or
+! RUNNING (ptr == end, the buffer was emptied by es_enter). Held while parked
+! is the one combination that cannot persist: gdcExitToGame parks and then
+! releases, so a parked server never leaves the lock behind. See
+! gd_lock_watchdog() in cdfs_syscalls.c.
+	.global _gd_lock_state
+	.set _gd_lock_state, gd_lock_byte
+	.global _gd_park_ptr
+	.set _gd_park_ptr, saved_regs_ptr
+	.global _gd_park_end
+	.set _gd_park_end, saved_regs_end
 .align 2
 
 _cdfs_redir_save:

@@ -46,17 +46,36 @@
 #define CMD_GDBPACKET "DC20"
 #define CMD_REWINDDIR "DC21"
 #define CMD_CDFSTOC "DC22"
-/* CDDA: read raw 2352-byte AUDIO sectors. A separate command from
- * CMD_CDFSREAD because it is a different unit and a different part of the
- * disc -- an audio track has no 2048-byte user area, every one of its bytes
- * is signed 16-bit stereo PCM. value0 = LBA, value1 = destination,
- * value2 = bytes. */
+/* CD-DA: read raw 2352-byte AUDIO sectors (signed 16-bit stereo PCM; an audio
+ * track has no 2048-byte user area, hence a command separate from
+ * CMD_CDFSREAD). value0 = LBA, value1 = destination, value2 = bytes.
+ * Served by dcload-ip-rs; dc-tool-ip does not implement DC23/DC24.
+ *
+ * The answer is a LoadBinary/PartBinary transfer to value1 followed by a
+ * ReturnValue whose address is the LBA served (the loader refuses any other
+ * value once the host has echoed once) and whose size is the host's clock trim
+ * in parts per million (1000000 = none; see cdda_scale_from_host). The host
+ * sends it without acknowledgement round trips, and does not send it at all if
+ * producing it took longer than its give-up time. */
 #define CMD_CDDAREAD "DC23"
+/* CD-DA as 4-bit Yamaha ADPCM, already split into channels. value0 = LBA,
+ * value1 = destination, value2 = frames (= bytes), with bit 31 set to restart
+ * the encoder. The sector count is value2 / 588. The payload is the left
+ * channel's value2/2 bytes followed by the right channel's. Answered like DC23.
+ *
+ * It is a stream, not independent blocks: the AICA decodes in long-stream mode
+ * and keeps its predictor across the ring wrap, so the host's encoder state
+ * must follow the decoder's. The encoder carries on from request to request,
+ * answers a repeated request from the bytes it already sent, and resets only
+ * on bit 31, which the loader sets on the first fetch after a key-on (the only
+ * event that resets the AICA's decoder). */
+#define CMD_CDDAREAD_ADPCM "DC24"
 
 extern unsigned short dcload_syscall_port;
 
 extern unsigned int syscall_retval;
 extern unsigned char* syscall_data;
+extern unsigned int syscall_retsize;
 
 typedef struct __attribute__ ((packed, aligned(4))) {
 	unsigned char id[4];

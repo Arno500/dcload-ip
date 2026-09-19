@@ -18,21 +18,18 @@
  *
  * A variable marked HIRAM_BUF is emitted into the .hiram output section,
  * which dcload.x places at a fixed high-RAM address and marks NOLOAD, so it
- * costs nothing in dcload.bin and nothing in _end. Nothing zeroes it --
- * dcload-crt0.s only clears _edata.._end -- so a HIRAM_BUF object must be
- * one that is written before it is read. Both packet buffers qualify: a
- * frame is copied in before it is parsed, and a packet is built before it
- * is transmitted (dhcp.c zeroes the transmit buffer itself where it needs
- * to).
+ * costs nothing in dcload.bin and nothing in _end. dcload-crt0.s zeroes it at
+ * start-up, as it does BSS. It holds the two 1536-byte packet buffers and,
+ * with WITH_CDDA, the CD-DA staging buffer; 12 KB is reserved.
  *
- * THE TRADE, STATED PLAINLY
+ * THE TRADE
  *
  * This moves the buffers out of the region a title's stack roams and into
  * the region a title's allocator might claim. The first risk is measured
- * and has bitten this loader; the second is not, and 0x8cfe8000 is what
- * isoldr's own free-high-RAM heuristic picks. If a title ever turns out to
- * own the top of RAM, build with PKT_BUFS_IN_HIRAM=0: the buffers go back
- * into BSS, _end climbs by ~3 KB, and everything else is unchanged.
+ * and has bitten this loader; the second has not been seen, and 0x8cfe8000 is
+ * what isoldr's own free-high-RAM heuristic picks. If a title ever turns out
+ * to own that RAM, build with PKT_BUFS_IN_HIRAM=0: the buffers go back into
+ * BSS and _end climbs by ~5.4 KB (measured with the default options).
  */
 
 #ifndef __HIRAM_H__

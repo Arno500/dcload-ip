@@ -35,7 +35,69 @@ static int payload1024 = 0;
  */
 unsigned int g_lbin_count = 0;
 unsigned int g_pbin_ok = 0;
+/* LoadBinary windows opened without echoing the command back -- see
+ * bin_echo_suppress(). */
+unsigned int g_lbin_noecho = 0;
+static unsigned int echo_suppressed = 0;
+
+/*
+ * Do not echo LoadBinary commands back to the host while set.
+ *
+ * On the upload and disc-read paths the host waits for the echo before sending
+ * any part, so there it is flow control and must stay. The host's audio path
+ * (send_audio) sends the whole answer -- LoadBinary, parts, ReturnValue -- in
+ * one burst without waiting, so the echo is read by nobody, and transmitting it
+ * from inside cmd_loadbin() puts a frame on the wire in the middle of that
+ * burst. Failed audio fetches were seen receiving their LoadBinary and one part
+ * and then nothing, with no receive errors counted, which is what a collision
+ * with that echo would look like. cdda_fetch() therefore sets this for its own
+ * wait. g_lbin_noecho counts the echoes skipped.
+ */
+void bin_echo_suppress(unsigned int on)
+{
+	echo_suppressed = on;
+}
+
+/*
+ * While set, cmd_partbin() ends the bb->loop() wait as soon as the LoadBinary
+ * window is complete, with syscall_retval = 0, instead of waiting for the
+ * host's ReturnValue. Used by cdda_fetch(): the payload is what matters, and a
+ * lost ReturnValue should not fail a fetch whose bytes all arrived.
+ *
+ * Consequence for callers: syscall_retval may still be 0 when the wait ends,
+ * because the ReturnValue (which cdda_fetch() needs for its LBA echo) had not
+ * been processed yet. cdda_fetch() handles that case.
+ */
+static unsigned int complete_escape = 0;
+/* Transfers finished by their last part rather than by a ReturnValue. In a
+ * healthy session this is nearly every CD-DA sub-fetch. */
+unsigned int g_bin_data_done = 0;
+
+void bin_complete_escape(unsigned int on)
+{
+	complete_escape = on;
+}
 unsigned int g_pbin_rejected = 0;
+
+/*
+ * The CD-DA staging "door".
+ *
+ * The host sends audio without acknowledgement round trips, so an answer to a
+ * sub-fetch that already gave up can still arrive, naming the same staging
+ * buffer and size as every other audio answer. If its LoadBinary were
+ * accepted it would reset the current window: during a later audio fetch that
+ * splices two blocks into one buffer, and between fetches it resets a disc
+ * read's window.
+ *
+ * cdda_fetch() publishes the staging range and, while it waits, the one
+ * destination it expects. cmd_loadbin() refuses any other LoadBinary into that
+ * range without touching the window (g_cdda_stale_lbin). `want` is 0 whenever
+ * no audio fetch is waiting, so the door is shut then.
+ */
+unsigned int g_bin_stage_lo = 0;    /* CD-DA staging buffer, first byte */
+unsigned int g_bin_stage_hi = 0;    /* one past its last byte; 0 = no CD-DA yet */
+unsigned int g_bin_stage_want = 0;  /* destination of the fetch in flight, 0 = none */
+unsigned int g_cdda_stale_lbin = 0; /* abandoned answers refused at the door */
 unsigned int g_dbin_count = 0;
 unsigned int g_dbin_incomplete = 0;
 unsigned int g_last_load_addr = 0;
@@ -173,7 +235,19 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 
 void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
-	bin_info.load_address = ntohl(command->address);
+	unsigned int dest = ntohl(command->address);
+
+	/* An abandoned CD-DA answer: refuse it without opening a window (see
+	 * g_bin_stage_lo). Inert until the first audio fetch publishes the range,
+	 * and always inert without CD-DA, since hi stays 0. */
+	if ((dest >= g_bin_stage_lo) && (dest < g_bin_stage_hi)
+		&& (dest != g_bin_stage_want))
+	{
+		g_cdda_stale_lbin++;
+		return;
+	}
+
+	bin_info.load_address = dest;
 	bin_info.load_size = ntohl(command->size);
 	g_lbin_count++;
 	g_last_load_addr = bin_info.load_address;
@@ -237,15 +311,62 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		payload1024 = 0;
 	}
 
-	make_ip(ntohl(ip->src), our_ip, UDP_H_LEN + COMMAND_LEN, IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
-	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
-	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
+	if (echo_suppressed)
+	{
+		/* The response was built into pkt_buf above and is simply not sent.
+		 * Building it costs nothing and keeps this function one shape. */
+		g_lbin_noecho++;
+	}
+	else
+	{
+		make_ip(ntohl(ip->src), our_ip, UDP_H_LEN + COMMAND_LEN, IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
+		make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
+		bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
+	}
 
 	if (!running) {
 		if (!booted)
 			disp_info();
 		disp_status("receiving data...");
 	}
+}
+
+/* Is every chunk of the current LoadBinary window accounted for?
+ *
+ * The map is already maintained for cmd_donebin, so this costs a handful of
+ * byte tests and NO ROUND TRIP -- which is the whole point: it lets a caller
+ * find out that its transfer has a hole in it without asking the host, at the
+ * moment it matters rather than several hundred milliseconds later. */
+int bin_window_complete(void)
+{
+	unsigned int chunks;
+	unsigned int i;
+
+	if (!bin_info.load_size)
+	{
+		return 0;
+	}
+	chunks = (bin_info.load_size + 1439u) / 1440u;
+	if (chunks > BIN_INFO_MAP_SIZE)
+	{
+		return 0;
+	}
+	for (i = 0; i < chunks; i++)
+	{
+		if (!bin_info.map[i])
+		{
+			return 0;
+		}
+	}
+	return 1;
+}
+
+void bin_window_close(void)
+{
+	/* Zero size: every branch of cmd_partbin's window test then refuses, and
+	 * counts. Nothing else reads the window until the next cmd_loadbin, which
+	 * sets both fields afresh. */
+	bin_info.load_size = 0;
 }
 
 void cmd_partbin(command_t * command)
@@ -358,6 +479,14 @@ void cmd_partbin(command_t * command)
 	bin_info.map[index] = 1;
 	g_pbin_ok++;
 	g_last_pbin_addr = cmd_addr;
+
+	if (complete_escape && bin_window_complete())
+	{
+		/* Exactly what cmd_retval would have done, a packet earlier. */
+		g_bin_data_done++;
+		syscall_retval = 0;
+		escape_loop = 1;
+	}
 }
 
 void cmd_donebin(ip_header_t * ip, udp_header_t * udp, command_t * command)
@@ -646,6 +775,7 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
 
 		syscall_retval = ntohl(command->address);
+		syscall_retsize = ntohl(command->size);
 		syscall_data = command->data;
 		escape_loop = 1;
 	}

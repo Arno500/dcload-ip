@@ -37,6 +37,9 @@
 unsigned short dcload_syscall_port = 31313; // Legacy mode default port, gets overridn in v2.0.0+ by value from dc-tool
 unsigned int syscall_retval = 0;
 unsigned char* syscall_data; // Used by cmd_retval and gdbpacket syscall
+/* The ReturnValue's size field. Zero for every syscall the host has no
+ * side-channel for; CD-DA uses it to carry the clock trim (cdda.c). */
+unsigned int syscall_retsize = 0;
 
 static struct dirent our_dir; // Here's a global array
 

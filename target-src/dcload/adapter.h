@@ -89,6 +89,26 @@ extern int timeout_loop;
  * in cdfs_syscalls.c for why an un-drained ring is not a harmless condition. */
 extern volatile int drain_iters;
 
+/* SH4 TMU channel 2's down-counter, at Pck/4 = 12.5 ticks per microsecond,
+ * free running from 0xffffffff. The loader's millisecond deadline clock: the
+ * CD-DA fetches, the GD read wait and the GD lock watchdog all measure on it.
+ *
+ * `timeout_loop` counts whole seconds on the performance counter, which is too
+ * coarse (a 2 s timeout fires at 3 s, measured on hardware) and reads 0 under
+ * an emulator without PMCR support.
+ *
+ * Only moves once something has started TMU2: cdda.c does before its first
+ * fetch, and setup_machine() does at EXEC when ISOLDR_SETUP_MACHINE=1. In the
+ * default build nothing else starts it. */
+#define TMU2_COUNT (*(volatile unsigned int *)0xffd80024)
+
+/* When non-zero, bb->loop() gives up this many TMU2 ticks after
+ * `fine_deadline_start` was latched, exactly as the seconds deadline does:
+ * timeout_loop = -1, escape_loop = 1. Set both, call, then clear. */
+extern volatile unsigned int fine_deadline_ticks;
+extern volatile unsigned int fine_deadline_start;
+extern unsigned int g_fine_timeouts;
+
 /* Diagnostics for the clock-free deadline in rtl_bb_loop. */
 extern unsigned int g_pmcr_backwards;
 extern unsigned int g_idle_polls_max;

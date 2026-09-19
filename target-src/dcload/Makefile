@@ -63,7 +63,7 @@ INCLUDE	= -I../../target-inc
 #
 #                            .hiram GREW FROM 4 KB TO 12 KB for CDDA (cdda.c):
 #                            the packet buffers take 3 KB of it and the audio
-#                            staging buffer takes 7056 bytes more. It is
+#                            staging buffer up to 7056 bytes more (PCM). It is
 #                            reserved WHETHER OR NOT WITH_CDDA is set, so the
 #                            host's copy of this table (dcload-ip-rs,
 #                            loaders::live_footprint) is right for every build
@@ -231,14 +231,15 @@ CFLAGS += -DGD_TRACE=$(GD_TRACE)
 # Let the linker drop functions and data nothing references. No behavioural
 # change and no cost; the only symbols it removes today are genuinely dead
 # ones (memmove, memcmp, PMCR_RegRead, a shadowed loop_secs_elapsed global).
-# Worth 160 bytes today, and it is also what tells you something went dead.
+# Worth 328 bytes (2026-09-12), and it is also what tells you something went
+# dead.
 DCLOAD_GC_SECTIONS ?= 1
 ifeq ($(DCLOAD_GC_SECTIONS),1)
   CFLAGS += -ffunction-sections -fdata-sections -Wl,--gc-sections
 endif
 
-# Link-time optimisation. Worth 1856 bytes, which is not nothing when the
-# stock margin is barely 1 KB -- but it is OFF BY DEFAULT on purpose:
+# Link-time optimisation. Worth 2428 bytes (2026-09-12) -- but it is OFF BY
+# DEFAULT on purpose:
 #
 #  - It inlines across translation units, which changes the depth of the C
 #    frame parked by the GD coroutine (cdfs_redir.s copies it into a 96-long
@@ -255,9 +256,9 @@ ifeq ($(DCLOAD_LTO),1)
   CFLAGS += -flto
 endif
 
-# Put the two 1536-byte packet buffers in high RAM (a NOLOAD section in
-# dcload.x) instead of in BSS. Worth 3088 bytes of _end, more than every
-# other knob here put together. See hiram.h for the trade this makes.
+# Put the large buffers (the two 1536-byte packet buffers and the CD-DA
+# staging buffer) in high RAM, a NOLOAD section in dcload.x, instead of in
+# BSS. Worth 5440 bytes of _end (2026-09-12). See hiram.h for the trade.
 PKT_BUFS_IN_HIRAM ?= 1
 CFLAGS += -DPKT_BUFS_IN_HIRAM=$(PKT_BUFS_IN_HIRAM)
 
@@ -268,18 +269,104 @@ WITH_LAN_ADAPTER ?= 1
 CFLAGS += -DWITH_LAN_ADAPTER=$(WITH_LAN_ADAPTER)
 
 # Serve the MAPL command (host-to-DC Maple passthrough) and the driver behind
-# it. Worth 640 bytes. A session that only boots a title never uses it;
+# it. Worth 656 bytes. A session that only boots a title never uses it;
 # with this at 0 a MAPL packet is simply not answered.
 WITH_MAPLE ?= 1
 CFLAGS += -DWITH_MAPLE=$(WITH_MAPLE)
 
-# CDDA -- Redbook audio playback, on isoldr's model. Read cdda.h before
-# touching it. Costs ~2 KB of image and 7056 bytes of .hiram (which is
-# reserved either way, see the layout table above), and is what a title with
-# music on its disc needs: without it PLAY_TRACKS is answered "COMPLETED, the
-# drive is spinning" and nothing is ever heard.
+# ---------------------------------------------------------------------------
+# CD-DA (cdda.c). The design is described at the top of cdda.c, the counters
+# and status in AGENTS.md 4.13.
+#
+# Most knobs below are empty by default, and then cdda.c's own default applies.
+# Each is added to CFLAGS inside its own ifneq: keep it that way, because a
+# CFLAGS line placed inside ANOTHER variable's ifneq is silently dropped when
+# that variable is empty. Building two variants and comparing their md5 is how
+# that mistake has been caught.
+# ---------------------------------------------------------------------------
+
+# Play the disc's audio tracks. Costs ~6.8 KB of _end; the 12 KB .hiram
+# reservation is the same either way (see the layout table above). Without it,
+# PLAY_TRACKS is answered "completed" and nothing is heard.
 WITH_CDDA ?= 1
 CFLAGS += -DWITH_CDDA=$(WITH_CDDA)
+
+# 1: 4-bit Yamaha ADPCM (DC24), a quarter of the bytes on the network and on
+# the G2 bus, which is time the title is frozen; lossy, and a lost block
+# damages one ear until the next key-on. 0: 16-bit PCM (DC23), lossless.
+# ADPCM became the default because the PCM build made the title itself lag.
+CDDA_ADPCM ?= 1
+CFLAGS += -DCDDA_ADPCM=$(CDDA_ADPCM)
+
+# Feed the CD-DA ring between the chunks of one disc read (cdfs_syscalls.c).
+# Default 1: during a long read it is the only thing feeding the music.
+GD_CDDA_BETWEEN_CHUNKS ?=
+ifneq ($(GD_CDDA_BETWEEN_CHUNKS),)
+CFLAGS += -DGD_CDDA_BETWEEN_CHUNKS=$(GD_CDDA_BETWEEN_CHUNKS)
+endif
+
+# Sub-fetches in the ring (default 26): its size, and so the margin for the
+# loader not being called in time. 26 is 1.39 s in ADPCM (60 KB of sound RAM)
+# or 1.04 s in PCM (179 KB), close to the 65536-sample limit of a channel.
+CDDA_RING_FETCHES ?=
+ifneq ($(CDDA_RING_FETCHES),)
+CFLAGS += -DCDDA_RING_FETCHES=$(CDDA_RING_FETCHES)u
+endif
+
+# Sub-fetches of audio kept ahead of the AICA (default 20 of 26 = 1.07 s, 893
+# ms once the trigger's lag is taken off). The fetches then come one every
+# 53 ms instead of a burst of 13 per half; what is left of the ring is the
+# margin against the model running ahead of the AICA. cdda.c explains the trade.
+CDDA_LEAD_FETCHES ?=
+ifneq ($(CDDA_LEAD_FETCHES),)
+CFLAGS += -DCDDA_LEAD_FETCHES=$(CDDA_LEAD_FETCHES)u
+endif
+
+# Sub-fetches one service call may do (default 2). Each is a round trip the
+# title waits for; this caps the freeze, and is the catch-up rate.
+CDDA_FETCHES_PER_SERVICE ?=
+ifneq ($(CDDA_FETCHES_PER_SERVICE),)
+CFLAGS += -DCDDA_FETCHES_PER_SERVICE=$(CDDA_FETCHES_PER_SERVICE)u
+endif
+
+# Poll iterations (and at most 1 ms) spent listening to the network when a
+# service call has nothing to fill, at most every 20 ms (default 256), so
+# --diag and dc-counters get answered while a title runs. 0 removes it.
+CDDA_SERVICE_DRAIN_ITERS ?=
+ifneq ($(CDDA_SERVICE_DRAIN_ITERS),)
+CFLAGS += -DCDDA_SERVICE_DRAIN_ITERS=$(CDDA_SERVICE_DRAIN_ITERS)
+endif
+
+# How late the fill trigger reads the position model, as a right shift of one
+# loop (default 3 = an eighth, 173 ms: the early margin).
+CDDA_LAG_SHIFT ?=
+ifneq ($(CDDA_LAG_SHIFT),)
+CFLAGS += -DCDDA_LAG_SHIFT=$(CDDA_LAG_SHIFT)
+endif
+
+# Top of the sound RAM the rings sit under (default 0x150000, block 20). Move
+# it for a title whose sound banks reach there.
+CDDA_RING_TOP ?=
+ifneq ($(CDDA_RING_TOP),)
+CFLAGS += -DCDDA_RING_TOP=$(CDDA_RING_TOP)
+endif
+
+# TMU1 (Pck/16) ticks per 8192 AICA samples: the clock ratio the position
+# model runs on. Default 578960 (isoldr's constant, the console; the host
+# trims the rest). flycast's clocks are exact and give 580480 (4535 * 128);
+# the console's value is 2622 ppm short there. Flycast sets set it.
+CDDA_TICKS_X8192 ?=
+ifneq ($(CDDA_TICKS_X8192),)
+CFLAGS += -DCDDA_TICKS_X8192=$(CDDA_TICKS_X8192)u
+endif
+
+# Ceiling for the channels' send level into the AICA mixer, 0..0xf (default
+# 0xf), about 3 dB a step. The level used mirrors the game's CD input level,
+# clamped to this.
+CDDA_DISDL ?=
+ifneq ($(CDDA_DISDL),)
+CFLAGS += -DCDDA_DISDL=$(CDDA_DISDL)
+endif
 
 # Serve the PMCR command (host-driven SH4 performance counters). Worth 808
 # bytes. This does NOT remove perfctr.c: dcload uses counter 1 itself for
@@ -389,7 +476,19 @@ exception: $(EXCOBJECTS)
 # those bases (isoldr's `low`/`syscalls` option is its answer to the same
 # problem). That is a design decision, not an oversight -- until it is made,
 # building these would only produce a loader that bricks the session.
-LOADER_BASES = 0x8c004000 0x8ce00000 0x8cef8000 0x8cfe8000
+# EMPTY ON PURPOSE, AND THE RELOCATABLE IMAGE IS THE WHOLE SET.
+#
+# There used to be one pre-linked ELF per base here. Since the host relocates
+# across BOTH layout families -- four deltas classified by the value of the
+# symbol each relocation names, plus the .guestvbr words patched by content and
+# re-scanned -- a native link is reproduced byte for byte at every base that was
+# ever built, the stock one included. So the pre-linked set answered nothing the
+# relocatable one does not, while being four more artefacts to keep in step
+# across three deployment directories: AGENTS.md 14.19 is a session lost to
+# exactly that, two builds of the same base differing by eight bytes.
+#
+# Set this to a list of bases to get them back; nothing else has to change.
+LOADER_BASES =
 LOADER_DIR   = loaders
 # The base the relocatable image is linked at. Any base does: the host rewrites
 # every address in it, in either layout family. This one is SCRATCH_BASE on the
@@ -404,7 +503,7 @@ loaders:
 	@# on bricking it.
 	@rm -rf $(LOADER_DIR)
 	@mkdir -p $(LOADER_DIR)
-	@for base in $(LOADER_BASES); do \
+	@for base in $(LOADER_BASES) ; do \
 	  echo "[loaders] linking dcload for $$base"; \
 	  $(MAKE) --no-print-directory clean >/dev/null || exit 1; \
 	  $(MAKE) --no-print-directory DCLOAD_BASE=$$base dcload exception.bin >/dev/null || exit 1; \
