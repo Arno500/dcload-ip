@@ -73,6 +73,7 @@
 #include "commands.h"
 #include "cdfs.h"
 #include "cdda.h"
+#include "hiram.h"
 
 /* Command codes, from the BIOS GD driver (same numbering as isoldr). */
 #define CMD_PIOREAD            16
@@ -85,6 +86,7 @@
 #define CMD_RELEASE            23
 #define CMD_INIT               24
 #define CMD_SEEK               27
+#define CMD_DMAREAD_STREAM     28
 #define CMD_NOP                29
 #define CMD_REQ_MODE           30
 #define CMD_SET_MODE           31
@@ -92,6 +94,9 @@
 #define CMD_GETSCD             34
 #define CMD_GETSES             35
 #define CMD_REQ_STAT           36
+#define CMD_PIOREAD_STREAM     37
+#define CMD_DMAREAD_STREAM_EX  38
+#define CMD_PIOREAD_STREAM_EX  39
 #define CMD_GET_VERS           40
 #define CMD_MAX                47
 
@@ -134,17 +139,30 @@
  * timeout_loop during the wait, which is how a CD-DA fetch nested in a read
  * once left it waiting forever (see g_gd_in_transfer).
  *
- * A healthy 16 KB chunk takes well under a millisecond and the host gives up on
- * a transfer after ~0.7 s, so 1.2 s waits past the host rather than racing it.
- * On expiry the chunk fails and data_transfer_emu_async() retries it after
- * giving the title a frame.
+ * 250 ms, AND IT IS NOW THE PRIMARY RECOVERY, not a backstop (2026-09-20).
  *
- * NOTE: in the default build nothing starts TMU2 before CD-DA does (cdda.c);
- * setup_machine() also starts it, but only runs with ISOLDR_SETUP_MACHINE=1.
- * Until then TMU2_COUNT does not move and this deadline cannot expire.
+ * It used to be 1.2 s, sized to "wait past the host rather than race it"
+ * because the host gave up on a transfer after ~0.7 s. That premise is gone:
+ * since send_sectors() the host does not wait for anything on this path, so
+ * there is no give-up to wait past -- it sends the window, the parts and the
+ * ReturnValue and moves on. Nothing but this deadline notices an answer that
+ * never arrives.
+ *
+ * A healthy 16 KB chunk takes ~1.4 ms, so 250 ms is 175x the normal case and
+ * still leaves four retries inside a second. Measured on Crazy Taxi,
+ * 2026-09-20: with the deadline unable to fire (see below) one lost answer
+ * froze the title for 7.0 s, which is the coarse backstop, and the player saw
+ * the game stop dead. Lower it with the same acceptance test as the host's
+ * pacing (g_cdfs_read_fails, _holes, _retries, g_rx_overflow, g_rx_missed).
+ *
+ * THIS DEADLINE ONLY WORKS IF TMU2 RUNS. Until 2026-09-20 nothing started it
+ * unless a title played CD-DA (cdda.c) or ISOLDR_SETUP_MACHINE was set, so for
+ * a title that streams its music as data -- Crazy Taxi -- neither this nor the
+ * lock watchdog could ever expire, and every lost chunk cost the full 7 s.
+ * gd_deadline_timer_start() is called from main() now.
  */
 #ifndef GD_READ_DEADLINE_TICKS
-#define GD_READ_DEADLINE_TICKS 15000000u
+#define GD_READ_DEADLINE_TICKS 3125000u
 #endif
 
 /* The adapter loop's seconds timeout for GD waits: a coarse backstop behind
@@ -153,6 +171,161 @@
 
 /* How many times a chunk may be re-requested before the read is failed. */
 #define GD_READ_RETRIES 4
+
+/*
+ * The same with the MMU on, i.e. under Windows CE: 20 x 250 ms = 5 s. A Katana
+ * title handed FAILED asks again; CE's GD driver gives the read up, and the
+ * title stops with a black screen. The ring has been measured delivering
+ * nothing for ~1 s under CE (docs/wince-investigation.md 7l), which four
+ * retries barely outlast.
+ */
+#define GD_READ_RETRIES_MMU 20
+
+/*
+ * TMU2, the free-running deadline clock: Pck/4 = 12.5 MHz counting down from
+ * 0xffffffff, so `start - TCNT2` is elapsed ticks (adapter.h).
+ *
+ * It lives here rather than in cdda.c because the read deadline and the lock
+ * watchdog depend on it and both are always compiled, while CD-DA is optional
+ * -- which is exactly how a title that plays no music came to have no working
+ * deadline at all. cdda.c calls this instead of keeping its own copy.
+ *
+ * Idempotent on purpose: restarting it between the chunks of a disc read would
+ * break that read's deadline and every mark in flight, so a timer already
+ * running as programmed is left alone.
+ */
+#define TMU_TSTR       (*(volatile unsigned char *)0xffd80004)
+#define TMU_TCOR2      (*(volatile unsigned int *)0xffd80020)
+#define TMU_TCR2       (*(volatile unsigned short *)0xffd80028)
+#define TMU_START_TMU2 0x04
+#define TMU_TCR_PCK4   0
+
+void gd_deadline_timer_start(void)
+{
+	if ((TMU_TSTR & TMU_START_TMU2) != 0u && TMU_TCOR2 == 0xffffffffu
+	    && (TMU_TCR2 & 0x7u) == TMU_TCR_PCK4)
+	{
+		return;
+	}
+	TMU_TSTR = (unsigned char)(TMU_TSTR & ~TMU_START_TMU2);
+	TMU_TCR2 = TMU_TCR_PCK4;
+	TMU_TCOR2 = 0xffffffffu;
+	TMU2_COUNT = 0xffffffffu;
+	TMU_TSTR = (unsigned char)(TMU_TSTR | TMU_START_TMU2);
+}
+
+/*
+ * STOP THE REAL DRIVE ONCE, AT BOOT (WITH_GD_SPINDOWN).
+ *
+ * Nothing in a dcload session reads the disc again. A title's GD syscalls are
+ * answered from the host (cdfs_redir.s), CD-DA comes off the network too, and
+ * a homebrew uploaded over UDP never touches the drive at all. The disc the
+ * BIOS spun up to boot 1st_read.bin therefore keeps turning for nothing.
+ *
+ * WHAT THIS IS WORTH, honestly: the drive's own firmware already stops it.
+ * The SPI mode page's Standby Time defaults to B4h = 180 s of <PAUSE> before
+ * the unit goes to <STANDBY> (Cdif131e.txt, "Standby Time (Byte 4-5)"), and
+ * the spec's own note is that a large value hurts MTBF. So this buys three
+ * minutes of rotation per boot, immediately and audibly -- not hours -- and it
+ * makes the stopped state deterministic instead of something the next command
+ * would postpone.
+ *
+ * HOW. Through the BIOS syscall vector, which main() has just pointed back at
+ * the BIOS (cdfs_redir_save/cdfs_redir_disable) -- so this must be called
+ * after those two, and it is the only place in the loader that calls the real
+ * driver. The vector's ABI is the one cdfs_redir.s decodes for a title:
+ * r7 = function index (0 ReqCmd, 1 GetCmdStat, 2 ExecServer, 3 InitSystem),
+ * r6 = 0, because r6 = -1 selects a misc syscall.
+ *
+ * The BIOS driver is a coroutine (see the header of this file): ReqCmd only
+ * queues the command, and it progresses only while we call ExecServer. The
+ * loop below is therefore not a poll of the drive, it is the driver's own
+ * scheduler -- and leaving before the command completes leaves it queued in a
+ * driver nobody will ever run again.
+ *
+ * InitSystem IS THE FALLBACK, NOT THE FIRST MOVE. KOS's cdrom_init() opens
+ * with it and loader.s does zero-fill 0x8c004000-0x8c010000 behind the BIOS,
+ * so there is a case for it -- but ReqCmd, ExecServer and GetCmdStat are
+ * non-blocking by construction (a title calls ExecServer every frame), and
+ * InitSystem is the one call here that may bring hardware up. The BIOS just
+ * read the disc with this driver, so the ordinary path never needs it; it is
+ * tried only if the driver refuses the command.
+ *
+ * BOUNDED, like every other hardware wait (AGENTS.md 4.8) -- on a spin count,
+ * in the style of RTL_LINK_SPIN_LIMIT and MAPLE_DMA_SPIN_LIMIT, rather than on
+ * TMU2, which is not running this early and whose deadline would cost more of
+ * the footprint (4.6) than this whole function is worth. What one ExecServer
+ * costs here has not been measured: the bound is on iterations, not on time.
+ * A drive that will not answer is left spinning rather than spun on -- three
+ * minutes of firmware standby is a better outcome than a loader that never
+ * reaches its command loop.
+ *
+ * REVERSIBLE. <STANDBY> is a drive state, not a shutdown: a title run without
+ * a disc image, or a KOS program calling cdrom_init(), spins it back up, at
+ * the cost of that first read's spin-up latency.
+ */
+#if WITH_GD_SPINDOWN
+
+typedef int (*gd_syscall_t)(int, int, int, int);
+
+/* The BIOS GD syscall entry point, read through P2: the word is written by
+ * the BIOS and by cdfs_redir_enable/disable, and the caches are off here
+ * anyway. */
+#define GD_SYSCALL_VECTOR (*(volatile gd_syscall_t *)0xac0000bcu)
+
+/* ExecServer calls one STOP may take. It answers in a handful; this is the
+ * "the drive is not answering at all" bound, in the style of the loader's
+ * other hardware waits (RTL_LINK_SPIN_LIMIT, MAPLE_DMA_SPIN_LIMIT). */
+#define GD_SPINDOWN_SPIN_LIMIT 200000u
+
+/*
+ * How it went, for --diag: the final command status + 2, so that 0 still
+ * means the call never ran -- 1 FAILED, 2 IDLE, 4 COMPLETED (what a drive
+ * that stopped reports), 5 STREAMING -- plus 7 "the driver would not take the
+ * command" and 8 "it never finished". A loader built with WITH_GD_SPINDOWN=0
+ * reports 0, as does one whose syscall vector was empty.
+ */
+unsigned int g_gd_spindown;
+
+void gd_spin_down_drive(void)
+{
+	gd_syscall_t gd = GD_SYSCALL_VECTOR;
+	int status[GDC_PARAMS_COUNT];
+	unsigned int spins = GD_SPINDOWN_SPIN_LIMIT;
+	int chn;
+	int st;
+
+	if (!gd)
+		return;
+
+	chn = gd(CMD_STOP, 0, 0, 0);		/* gdGdcReqCmd(CMD_STOP, NULL) */
+	if (chn == GDC_CHN_ERROR)
+	{
+		(void)gd(0, 0, 0, 3);		/* gdGdcInitSystem(), see above */
+		chn = gd(CMD_STOP, 0, 0, 0);
+	}
+	if (chn == GDC_CHN_ERROR)
+	{
+		g_gd_spindown = 7;
+		return;
+	}
+
+	do
+	{
+		(void)gd(0, 0, 0, 2);		/* gdGdcExecServer() */
+		st = gd(chn, (int)status, 0, 1);	/* gdGdcGetCmdStat() */
+		if ((st != CMD_STAT_PROCESSING) && (st != CMD_STAT_BUSY))
+		{
+			g_gd_spindown = (unsigned int)(st + 2);
+			return;
+		}
+	}
+	while (--spins);
+
+	g_gd_spindown = 8;
+}
+
+#endif /* WITH_GD_SPINDOWN */
 
 /* Trace reads landing at or above this destination to the host console. Set
  * to 0xffffffff to switch that tracing off entirely. */
@@ -174,6 +347,14 @@
 /* Trace the GD request/answer contract to the host console. */
 #ifndef GD_TRACE
 #define GD_TRACE 0
+#endif
+
+/* With GD_TRACE, also trace where a title's virtual TOC buffer lands (the
+ * M/U/P/V lines, below GetTOC's staging buffer). Eight more round trips per
+ * boot, each a write() that waits for its RETV with no deadline: one lost
+ * packet there hung a Sega Rally 2 run for good (2026-09-27). */
+#ifndef GD_TRACE_VADDR
+#define GD_TRACE_VADDR 0
 #endif
 
 /*
@@ -205,10 +386,8 @@
 #define GD_BULK_SECTORS 0
 #endif
 
-/* dcload's own image, in physical (29-bit) SH4 address space. A title must
- * never be handed disc data on top of the loader serving it. */
-#define DCLOAD_RESIDENT_START_PHYS 0x0c004000U
-#define DCLOAD_RESIDENT_END_PHYS   0x0c010000U
+/* What a disc read must never land on is the loader serving it -- and where
+ * that is comes from the linker (overlaps_dcload()), not from constants. */
 
 typedef struct gd_state {
 	int req_count;
@@ -280,6 +459,25 @@ unsigned int g_cdfs_sync_chunks;
 unsigned int g_cdfs_sync_reentered;
 unsigned int g_cdfs_read_fails;
 unsigned int g_cdfs_read_retries;
+/*
+ * Chunks whose ReturnValue arrived over a window with a hole in it.
+ *
+ * The host no longer waits for the LoadBinary echo and no longer probes with
+ * DoneBinary before answering a disc read (both were ~1.9 ms of frozen title
+ * per 16 KB chunk out of 5). What it gave up is the only two ways IT could
+ * have learned that a packet went missing, so the loader has to say so itself
+ * -- which costs nothing, because bin_window_complete() reads a map that is
+ * maintained anyway. A hole here fails the chunk and data_transfer_emu_async()
+ * asks for it again.
+ *
+ * Distinct from g_cdfs_read_fails on purpose: fails means the host never
+ * answered, holes means it answered and the answer was short. Different ends
+ * of the link, different fix.
+ */
+unsigned int g_cdfs_read_holes;
+/* ReturnValues that arrived over an incomplete window and were waited past
+ * (ReadSectors): the late answer to an earlier attempt, most likely. */
+unsigned int g_cdfs_read_stale;
 /* Longs of server stack parked at the last yield. saved_regs[] holds 96, of
  * which 11 go to registers and the count, so anything approaching 80 here
  * means the buffer needs enlarging before it silently overruns. */
@@ -389,52 +587,6 @@ static void gd_lock_watchdog(void)
 }
 
 /*
- * Post-mortem block, in high RAM.
- *
- * Every counter above lives in dcload's BSS, and that is exactly the memory
- * under suspicion when a title misbehaves: sampled during a failure it can
- * read as foreign data, and a moment later the machine has re-booted and
- * zeroed it. An instrument inside the blast radius cannot report on the blast.
- *
- * CAVEAT, measured 2026-08-10: 0x8cf0c000 is NO LONGER out of reach. It was
- * chosen when dcload lived at 0x8cf00000 and Sonic Adventure's allocator
- * stopped dead at 0x0cf00000; with dcload back at the low base nothing caps
- * the title there any more, and it overwrites this block (it reads back
- * boots = 1, reads = 0, i.e. re-claimed). Treat these values as advisory.
- */
-#define PM_BASE   0x8cf0c000U
-#define PM_MAGIC  0x33444d50U		/* "PMD3" */
-#define PM_SLOTS  12
-
-#define PM_BOOTS      1
-#define PM_SP_LAST    2
-#define PM_SP_LOW     3
-#define PM_READS      4
-#define PM_LAST_LBA   5
-#define PM_LAST_DEST  6
-#define PM_LAST_SECS  7
-#define PM_CHUNKS     8
-#define PM_PARK_MAX   9
-
-static volatile unsigned int *const pm = (volatile unsigned int *)PM_BASE;
-
-void cdfs_pm_boot(void)
-{
-	int i;
-
-	if (pm[0] != PM_MAGIC)
-	{
-		for (i = 0; i < PM_SLOTS; i++)
-		{
-			pm[i] = 0;
-		}
-		pm[0] = PM_MAGIC;
-		pm[PM_SP_LOW] = 0xffffffffU;
-	}
-	pm[PM_BOOTS]++;
-}
-
-/*
  * Params each command consumes. Reading past this would touch memory the
  * caller never set up, so it is not merely cosmetic. Table covers 16..40.
  */
@@ -452,9 +604,15 @@ static int get_params_count(int cmd)
 	return cmdp[cmd - 16];
 }
 
+static int is_stream_cmd(int cmd)
+{
+	return (cmd == CMD_DMAREAD_STREAM) || (cmd == CMD_PIOREAD_STREAM)
+	    || (cmd == CMD_DMAREAD_STREAM_EX) || (cmd == CMD_PIOREAD_STREAM_EX);
+}
+
 static int is_transfer_cmd(int cmd)
 {
-	return (cmd == CMD_PIOREAD) || (cmd == CMD_DMAREAD);
+	return (cmd == CMD_PIOREAD) || (cmd == CMD_DMAREAD) || is_stream_cmd(cmd);
 }
 
 static unsigned int sh4_phys_addr(unsigned int addr)
@@ -462,26 +620,112 @@ static unsigned int sh4_phys_addr(unsigned int addr)
 	return addr & 0x1fffffffU;
 }
 
+/*
+ * WHERE DISC DATA LANDS WHEN THE TITLE'S BUFFER CANNOT BE HANDED TO THE HOST
+ * (2026-09-27).
+ *
+ * The host writes through cmd_partbin, whose copies (memfuncs.c) store at
+ * src + memdiff(dst, src) with both addresses masked to 29 bits: into the
+ * SOURCE's segment. With the MMU off that is harmless -- every address a
+ * Katana title hands us is RAM in any segment. With it on (Windows CE), a
+ * virtual buffer becomes P1 of a number that is not its physical address:
+ * 0x080df2e0 went to area 2, which is empty (docs/wince-investigation.md 7f).
+ * So a read into a translated address is received here and copied to the
+ * title with memcpy.S, whose stores go through the title's own translation,
+ * as the BIOS's PIO copy does. The TOC comes through here too.
+ *
+ * Three sectors: .hiram holds 12 KB and the packet and CD-DA buffers take 5.3
+ * of them. overlaps_dcload() lets a disc read land on exactly this range.
+ * Every chunk is one host round trip, and under Windows CE the title waits for
+ * the whole read: Sega Rally 2's menu music is 604 KB read every 3.5 s, which
+ * at two sectors a trip stopped the menu for ~0.45 s each time
+ * (docs/wince-investigation.md 7r). Letting CE's thread sleep between chunks
+ * only made the read, and the stop, longer (7s): throughput is what counts.
+ */
+#ifndef GD_STAGE_SECTORS
+#define GD_STAGE_SECTORS 3
+#endif
+HIRAM_BUF static unsigned int gd_stage[GD_STAGE_SECTORS * 512]
+	__attribute__((aligned(32)));
+
+/*
+ * THE BIG STAGE, FOR A TITLE THAT RUNS WITH THE MMU ON.
+ *
+ * gd_stage above is all .hiram has room for, and every chunk is one host round
+ * trip whose fixed cost (~1.5 ms) dwarfs its wire time (~0.17 ms a sector):
+ * three sectors a trip still stopped Sega Rally 2's menu for ~0.25 s every
+ * time it read its 604 KB (docs/wince-investigation.md 7u). This one lives in
+ * the loader's own stack region above _end (dcload.x.in, .gdstage), which is
+ * dead while a title runs -- so only a title under the MMU may use it: in the
+ * LOW family that range is inside a Katana title's stack. The network exchange
+ * no longer runs there either (gd_on_loader_stack uses the Maple page).
+ * Five sectors is what fits under _stack in the HIGH family.
+ */
+#ifndef GD_STAGE_BIG_SECTORS
+#define GD_STAGE_BIG_SECTORS 5
+#endif
+static unsigned int gd_stage_big[GD_STAGE_BIG_SECTORS * 512]
+	__attribute__((section(".gdstage"), aligned(32)));
+
+/* The title runs with address translation on (MMUCR.AT): Windows CE. */
+static int gd_mmu_on(void)
+{
+	return *(volatile unsigned int *)0xff000010U & 1U;
+}
+
+static int gd_retries_left(int retries)
+{
+	return retries <= (gd_mmu_on() ? GD_READ_RETRIES_MMU : GD_READ_RETRIES);
+}
+
+/* An address the title's MMU translates: P0/U0 with MMUCR.AT set. */
+static int gd_is_virtual(unsigned int addr)
+{
+	return (addr < 0x80000000U) && gd_mmu_on();
+}
+
+/*
+ * The loader's footprint, from the symbols the linker owns (AGENTS.md 14.11):
+ * the image [dcload_base, end) and the packet and CD-DA buffers in .hiram. Not
+ * the Maple DMA buffer: it is written only while a MAPL command runs, which
+ * never happens under a title, and each cycle rewrites it whole.
+ *
+ * This used to be the constant range 0x0c004000..0x0c010000, the stock base's
+ * image and stack -- and therefore wrong for every relocated session: it
+ * protected nothing of a loader at 0x8ce00000, and it refused reads into
+ * 0x8c008000..0x8c010000 (IP.BIN, the guest VBR and, at a low base, the
+ * title's own stack) that nothing of ours occupies.
+ */
+extern char dcload_base[];
+extern char end[];
+extern char _hiram_start[], _hiram_end[];
+
 static int overlaps_dcload(unsigned int addr, unsigned int size)
 {
-	unsigned int phys_addr;
-	unsigned int addr_end;
+	unsigned int a;
+	unsigned int e;
 
 	if (!size)
 	{
 		return 0;
 	}
 
-	phys_addr = sh4_phys_addr(addr);
-	addr_end = phys_addr + size;
+	/* In P1, where the linker put every symbol compared against below. */
+	a = sh4_phys_addr(addr) | 0x80000000U;
+	e = a + size;
 	/* Overflow means an invalid range; treat as a protection hit. */
-	if (addr_end < phys_addr)
+	if (e < a)
 	{
 		return 1;
 	}
+	/* The one range of ours a disc read is meant to land on. */
+	if ((a == (unsigned int)gd_stage) && (size <= sizeof(gd_stage)))
+	{
+		return 0;
+	}
 
-	return (phys_addr < DCLOAD_RESIDENT_END_PHYS) &&
-	       (addr_end > DCLOAD_RESIDENT_START_PHYS);
+	return (a < (unsigned int)end && e > (unsigned int)dcload_base)
+	    || (a < (unsigned int)_hiram_end && e > (unsigned int)_hiram_start);
 }
 
 static void write_hex8(unsigned int value)
@@ -553,6 +797,74 @@ void gd_trace_always(char tag, unsigned int a, unsigned int b, unsigned int c)
 #endif
 
 /*
+ * ONE NETWORK EXCHANGE, WITHOUT A THREAD SWITCH AND OFF THE TITLE'S STACK.
+ *
+ * A Katana title's interrupt handlers run on top of a GD syscall and return.
+ * Windows CE's timer interrupt enters its scheduler, which runs other threads
+ * -- for as long as a busier one wants the CPU -- while the loader is half way
+ * through an exchange; the host's answer and the LAN's broadcasts meanwhile
+ * fill the ring, and the attempt dies of an RX overflow. Caught under flycast
+ * on Sega Rally 2 three times (docs/wince-investigation.md 7o-7q): the GD
+ * thread parked with g_gd_in_transfer 1, and every failed read one overflow.
+ * Masking interrupts was not enough, because CE calls the driver on a thread
+ * stack at a VIRTUAL address, and a TLB miss or an uncommitted stack page
+ * there enters CE's kernel with interrupts back on. So under the MMU the
+ * exchange runs masked AND on the loader's own stack (P1, no TLB). Reception
+ * goes off at the end whatever happened: after a deadline it used to stay on
+ * while the title ran, and the ring filled for the next attempt to overflow.
+ * A Katana title sees only that bb->stop(), which a successful answer's
+ * cmd_retval() already did.
+ */
+void gd_exchange(void (*fn)(void))
+{
+	unsigned int irq = bb_irq_hold();
+
+	if (irq)
+	{
+		gd_on_loader_stack(fn);
+	}
+	else
+	{
+		fn();
+	}
+	bb->stop();
+	bb_irq_restore(irq);
+}
+
+/* ReadSectors' and GetTOC's exchange. The command is in pkt_buf already. */
+static void gd_read_exchange(void)
+{
+	syscall_retval = (unsigned int)-1;
+	timeout_loop = GD_SYSCALL_TIMEOUT_SECONDS;
+	fine_deadline_start = TMU2_COUNT;
+	fine_deadline_ticks = GD_READ_DEADLINE_TICKS;
+	build_send_packet(sizeof(command_3int_t));
+	bb->loop(0);
+	/*
+	 * A RETURNVALUE OVER A HOLE IS NOT NECESSARILY OURS: WAIT OUT THE DEADLINE.
+	 *
+	 * A disc read's ReturnValue carries nothing (address 0), so the one that
+	 * ends this wait can be the late answer to an EARLIER attempt, queued in
+	 * the ring while nothing was listening. Our own window is then still
+	 * filling, and failing it here fails the attempt in a millisecond -- and
+	 * the next one on the next stale answer. Measured 2026-09-27 on Sega Rally
+	 * 2: the ring delivered nothing for ~1 s, then four stale answers burnt
+	 * four retries in 5 ms and the stream failed; Windows CE never recovers
+	 * from that (docs/wince-investigation.md 7l). A stale answer for the same
+	 * LBA brings the same bytes to the same place, so its parts count; ours
+	 * complete the window when they come. cmd_retval() stopped RX: restart it.
+	 */
+	while (((int)syscall_retval >= 0) && !bin_window_complete()
+	       && ((fine_deadline_start - TMU2_COUNT) <= fine_deadline_ticks))
+	{
+		g_cdfs_read_stale++;
+		syscall_retval = (unsigned int)-1;
+		bb->start();
+		bb->loop(0);
+	}
+}
+
+/*
  * Ask the host for `count` sectors starting at `lba`, landing at `dest`.
  *
  * This blocks in bb->loop() until the host has delivered the whole chunk and
@@ -565,26 +877,6 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 	command_3int_t *command =
 		(command_3int_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
 	unsigned int bytes = count * _GDS.sec_size;
-	unsigned int sp;
-
-	/* dcload runs on the TITLE's stack, so record where that stack is. If a
-	 * disc read ever lands on it, or if the title drives it down into our own
-	 * image, we would overwrite our return addresses mid-transfer. Measured
-	 * 2026-08-10: it does not -- r15 never leaves 0x8c00f3xx. */
-	__asm__ volatile ("mov r15,%0" : "=r" (sp));
-	pm[PM_SP_LAST] = sp;
-	if (sp < pm[PM_SP_LOW])
-	{
-		pm[PM_SP_LOW] = sp;
-	}
-	pm[PM_LAST_LBA] = lba;
-	pm[PM_LAST_DEST] = dest;
-	pm[PM_LAST_SECS] = count;
-	pm[PM_READS]++;
-	if (g_gd_park_longs > pm[PM_PARK_MAX])
-	{
-		pm[PM_PARK_MAX] = g_gd_park_longs;
-	}
 
 	if (overlaps_dcload(dest, bytes))
 	{
@@ -648,14 +940,39 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 		drain_iters = 0;
 	}
 
-	syscall_retval = (unsigned int)-1;
-	timeout_loop = GD_SYSCALL_TIMEOUT_SECONDS;
-	fine_deadline_start = TMU2_COUNT;
-	fine_deadline_ticks = GD_READ_DEADLINE_TICKS;
+	/*
+	 * JUDGE THIS CHUNK ON ITS OWN WINDOW.
+	 *
+	 * bin_window_complete() below is the only thing that now notices a lost
+	 * packet, and a window left installed by the PREVIOUS chunk is already
+	 * complete. So if this chunk's LoadBinary were the packet that went
+	 * missing, every part would be refused and the stale window would still
+	 * answer "complete" -- the read would pass having delivered nothing, and
+	 * the title would run the previous chunk's bytes.
+	 *
+	 * This is the same defect the CD-DA path carried until 2026-09-19
+	 * (AGENTS.md 4.13, "Fetch integrity", item 1), where it replayed a stale
+	 * sub-fetch for weeks with every counter clean. Closing the window costs
+	 * one store.
+	 */
+	bin_window_close();
+
+	/*
+	 * AND DO NOT ECHO THE LoadBinary BACK.
+	 *
+	 * The host no longer waits for it, so it is read by nobody -- and sending
+	 * it from cmd_loadbin() puts one of our frames on the wire in the middle
+	 * of the host's incoming burst. That collision is already on record on the
+	 * audio path, where a fetch received its LoadBinary and one part and then
+	 * nothing, with no receive error counted (commands.c, bin_echo_suppress).
+	 * Cleared before we return, so the upload path keeps its flow control.
+	 */
+	bin_echo_suppress(1);
+
 	g_gd_in_transfer++;
-	build_send_packet(sizeof(command_3int_t));
-	bb->loop(0);
+	gd_exchange(gd_read_exchange);
 	g_gd_in_transfer--;
+	bin_echo_suppress(0);
 	fine_deadline_ticks = 0;
 	timeout_loop = 0;
 
@@ -673,8 +990,33 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 		return CMD_STAT_FAILED;
 	}
 
+	/*
+	 * THE HOST NO LONGER CHECKS, SO WE DO.
+	 *
+	 * Until 2026-09-20 the host waited for the LoadBinary echo before sending
+	 * the parts and probed with DoneBinary after them, which cost two round
+	 * trips -- about 1.9 ms of the 5 ms a 16 KB chunk froze the title, on
+	 * every chunk forever, to catch a loss this link does not have
+	 * (g_rx_missed, g_rx_overflow, g_pbin_rejected and g_cdfs_read_retries
+	 * were all 0 across a Crazy Taxi session serving 4000 chunks).
+	 *
+	 * It now sends the request, the parts and the ReturnValue without pausing
+	 * for either. The map that cmd_partbin maintains says whether the chunk is
+	 * whole, at no network cost, and a hole simply fails the chunk: the caller
+	 * yields to the title and asks again, which is one extra round trip on a
+	 * loss instead of two on every chunk.
+	 *
+	 * A SHORT CHUNK MUST NEVER BE REPORTED COMPLETED. The title would run the
+	 * bytes, and a title that executes short data is far worse off than one
+	 * that waits (the host's own comment on this path, for the same reason).
+	 */
+	if (!bin_window_complete())
+	{
+		g_cdfs_read_holes++;
+		return CMD_STAT_FAILED;
+	}
+
 	g_cdfs_sync_chunks++;
-	pm[PM_CHUNKS]++;
 	return CMD_STAT_COMPLETED;
 }
 
@@ -703,15 +1045,17 @@ static void data_transfer_emu_async(void)
 	unsigned int sc;
 	unsigned int sc_size;
 	int retries = 0;
+	/* A translated buffer goes through gd_stage_big, a stage at a time. */
+	unsigned int virt = gd_is_virtual(_GDS.param[2]);
+	unsigned int most = virt ? GD_STAGE_BIG_SECTORS : (unsigned int)GD_EMU_ASYNC;
 
 	while ((_GDS.param[1] > 0) && (_GDS.cmd_abort == 0))
 	{
-		sc = (_GDS.param[1] <= (unsigned int)GD_EMU_ASYNC)
-			? _GDS.param[1]
-			: (unsigned int)GD_EMU_ASYNC;
+		sc = (_GDS.param[1] <= most) ? _GDS.param[1] : most;
 		sc_size = _GDS.sec_size * sc;
 
-		if (ReadSectors(_GDS.param[2], _GDS.param[0], sc) == CMD_STAT_FAILED)
+		if (ReadSectors(virt ? (unsigned int)gd_stage_big : _GDS.param[2],
+				_GDS.param[0], sc) == CMD_STAT_FAILED)
 		{
 			/*
 			 * RE-REQUEST THE SAME CHUNK, FROM THE NEXT ExecServer.
@@ -725,18 +1069,54 @@ static void data_transfer_emu_async(void)
 			 * again.
 			 */
 			g_cdfs_read_retries++;
-			gd_trace_always('F', _GDS.param[0], _GDS.param[2],
-					(unsigned int)retries);
-			if (++retries > GD_READ_RETRIES)
+			/*
+			 * NOT gd_trace_always. AN INSTRUMENT INSIDE THE BLAST RADIUS.
+			 *
+			 * This used to report every failed chunk unconditionally, and it
+			 * is reached exactly when the link has just failed to deliver one.
+			 * The cost is not one packet: write() is a syscall that transmits
+			 * and waits, and the host fetches the written bytes BACK off the
+			 * console with SendBinQ (fs.rs, download_data) -- so a read that
+			 * could not be answered spawned an instrument read that could not
+			 * be answered either. On 2026-09-20 that pair wedged the host in an
+			 * unbounded re-request loop and froze the title for good.
+			 *
+			 * The counters already say all of it, at no network cost:
+			 * g_cdfs_read_retries here, g_cdfs_read_fails (the host never
+			 * answered) and g_cdfs_read_holes (it answered short). Build with
+			 * GD_TRACE=1 when the sequence itself is wanted.
+			 */
+			gd_trace('F', _GDS.param[0], _GDS.param[2],
+				 (unsigned int)retries);
+			if (!gd_retries_left(++retries))
 			{
 				_GDS.status = CMD_STAT_FAILED;
 				_GDS.drv_stat = CD_STATUS_PAUSED;
 				return;
 			}
+			/*
+			 * NOT "WAITING FOR AN INTERRUPT" WHILE WE WAIT FOR A RETRY
+			 * (2026-09-27). Windows CE's GD thread reads PROCESSING with
+			 * status[3] == CMD_WAIT_IRQ as "the drive will interrupt",
+			 * returns STATUS_PENDING and sleeps on the GD interrupt -- which
+			 * this transport never raises -- so it never called ExecServer
+			 * again and the retry never ran: one lost request, black screen
+			 * (docs/wince-investigation.md 7i). With status[3] clear it
+			 * sleeps 5 ms and polls, which is the retry. Katana titles keep
+			 * what they have always seen.
+			 */
+			if (gd_mmu_on())
+			{
+				_GDS.ata_status = CMD_WAIT_INTERNAL;
+			}
 			gdcExitToGame();
 			continue;
 		}
 		retries = 0;
+		if (virt)
+		{
+			memcpy((void *)_GDS.param[2], gd_stage_big, sc_size);
+		}
 
 		_GDS.param[1] -= sc;
 		_GDS.transfered += sc_size;
@@ -817,10 +1197,12 @@ static void data_transfer(void)
 	 * has always died on, so this is not a hypothetical difference.
 	 */
 #if GD_BULK_SECTORS > 0
-	if ((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1) ||
-	    (_GDS.param[1] >= (unsigned int)GD_BULK_SECTORS))
+	if (((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1) ||
+	     (_GDS.param[1] >= (unsigned int)GD_BULK_SECTORS))
+	    && !gd_is_virtual(_GDS.param[2]))
 #else
-	if ((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1))
+	if (((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1))
+	    && !gd_is_virtual(_GDS.param[2]))
 #endif
 	{
 		_GDS.status = ReadSectors(_GDS.param[2], _GDS.param[0], _GDS.param[1]);
@@ -839,7 +1221,235 @@ static void data_transfer(void)
 	_GDS.ata_status = CMD_WAIT_INTERNAL;
 }
 
-/* Read TOC. The host writes the table straight into the title's buffer. */
+/*
+ * STREAMS (2026-09-27): *READ_STREAM and *READ_STREAM_EX.
+ *
+ * The command names a run of sectors and nothing else; the title then hands
+ * over one piece at a time -- ReqPioTrans / ReqDmaTrans, {address, bytes} --
+ * and polls CheckPioTrans / CheckDmaTrans for it. A piece need not be a whole
+ * number of sectors, so the stream is a byte stream from param[0]'s first
+ * byte, read a stage at a time into gd_stage and copied out: to the address
+ * as given for PIO (a virtual one, for Windows CE), to the physical page
+ * through P2 for DMA, since the title will read what a DMA wrote without
+ * trusting its cache.
+ *
+ * WHO ASKS FOR THE NEXT PIECE. For PIO, the callback the title registered
+ * with SetPioCallback, which the BIOS calls when a piece is done -- and which
+ * is called here, from the server, while more is owed (isoldr does the same,
+ * loader/syscalls.c data_transfer_pio_stream). Windows CE's callback just
+ * requests the next piece, so a whole stream is served inside the ExecServer
+ * that finds the first one. For DMA, the title's G1 DMA-end interrupt, which
+ * nothing here raises: a DMA stream finishes only if its first piece is all
+ * of it. Windows CE chains DMA pieces from that interrupt (wsegacd.dll), and
+ * the host steers it to PIO instead (dcload-ip-rs, dispatch.rs).
+ *
+ * Until 2026-09-27 these commands were force-completed with nothing
+ * delivered, which is how CE came to stop after its first executable header.
+ */
+static unsigned int gd_piece_addr;	/* the piece asked for and not yet served */
+static unsigned int gd_piece_size;	/* its bytes; 0 = none pending */
+
+static void data_stream(void)
+{
+	unsigned int dma = (_GDS.cmd == CMD_DMAREAD_STREAM)
+			|| (_GDS.cmd == CMD_DMAREAD_STREAM_EX);
+	unsigned int pos = 0;		/* stream bytes handed over */
+	unsigned int base = 0;		/* stream byte stage[0] holds */
+	unsigned int have = 0;		/* stream bytes stage holds */
+	unsigned int sectors = _GDS.requested >> 11;
+	unsigned int dst, left, n, sec;
+	int retries = 0;
+	/* The big stage only under the MMU: see gd_stage_big. */
+	unsigned int *stage = gd_mmu_on() ? gd_stage_big : gd_stage;
+	unsigned int cap = gd_mmu_on() ? GD_STAGE_BIG_SECTORS : GD_STAGE_SECTORS;
+
+	gd_piece_size = 0;
+	_GDS.status = CMD_STAT_STREAMING;
+
+	while (_GDS.requested && !_GDS.cmd_abort)
+	{
+		if (!gd_piece_size)
+		{
+			gdcExitToGame();
+			continue;
+		}
+		gd_trace('Q', gd_piece_addr, gd_piece_size, _GDS.requested);
+		dst = dma ? (sh4_phys_addr(gd_piece_addr) | 0xa0000000U)
+			  : gd_piece_addr;
+		left = gd_piece_size;
+		while (left && !_GDS.cmd_abort)
+		{
+			if (pos >= base + have)
+			{
+				sec = pos >> 11;
+				n = sectors - sec;
+				if (n > cap)
+				{
+					n = cap;
+				}
+				if (ReadSectors((unsigned int)stage,
+						_GDS.param[0] + sec, n) == CMD_STAT_FAILED)
+				{
+					/* Asked again AT ONCE, not from the next ExecServer
+					 * as data_transfer_emu_async() does: a title polls a
+					 * STREAMING channel only when the drive interrupts
+					 * (Windows CE does), so a yield here would be the
+					 * last thing it ever saw. The failed wait (250 ms)
+					 * has already let the host go idle. */
+					g_cdfs_read_retries++;
+					if (!gd_retries_left(++retries))
+					{
+						_GDS.status = CMD_STAT_FAILED;
+						break;
+					}
+					continue;
+				}
+				retries = 0;
+				base = sec << 11;
+				have = n << 11;
+#if GD_CDDA_BETWEEN_CHUNKS
+				cdda_service_between_chunks();
+#endif
+			}
+			n = base + have - pos;
+			if (n > left)
+			{
+				n = left;
+			}
+			memcpy((void *)dst, (char *)stage + (pos - base), n);
+			dst += n;
+			pos += n;
+			left -= n;
+		}
+		if (_GDS.status == CMD_STAT_FAILED)
+		{
+			break;
+		}
+		_GDS.transfered += gd_piece_size - left;
+		_GDS.requested -= gd_piece_size - left;
+		_GDS.lba = _GDS.param[0] + ((pos + 2047) >> 11);
+		gd_piece_size = 0;
+		if (_GDS.requested && !dma && _GDS.callback)
+		{
+			((void (*)(unsigned int))_GDS.callback)(_GDS.callback_param);
+		}
+	}
+
+	gd_piece_size = 0;
+	if (_GDS.cmd_abort)
+	{
+		_GDS.status = CMD_STAT_IDLE;
+	}
+	else if (_GDS.status != CMD_STAT_FAILED)
+	{
+		_GDS.status = CMD_STAT_COMPLETED;
+	}
+	_GDS.drv_stat = CD_STATUS_PAUSED;
+	_GDS.ata_status = CMD_WAIT_INTERNAL;
+}
+
+/*
+ * THE TABLE OF CONTENTS COMES INTO gd_stage, AND THE TITLE GETS A CPU COPY OF
+ * IT -- WHICH IS WHAT THE BIOS DOES (2026-09-26).
+ *
+ * GETTOC2 is not a DMA: the BIOS reads the table into its own work area and
+ * copies it into the caller's buffer with ordinary stores, in the caller's
+ * context. Windows CE hands the driver a buffer on a thread stack by VIRTUAL
+ * address (0x080df2e0). Written there by the host, the table never arrived
+ * (see gd_stage for why), CE's mount took the 0xff its driver had pre-filled,
+ * and 0xffffff read as MSF 144:16:15 is exactly the FAD 0x9e80f it then asked
+ * for (docs/wince-investigation.md 7e, 7f). Copied with a plain loop.
+ */
+
+#if GD_TRACE && GD_TRACE_VADDR
+/*
+ * WHERE A TITLE'S VIRTUAL ADDRESS LANDS (GD_TRACE_VADDR, 2026-09-26).
+ *
+ *   'M' MMUCR, SR, PTEH   -- translation on (AT, bit 0)? FD/BL/IMASK? ASID?
+ *   'U' va, UTLB address word, UTLB data word -- the entry mapping va, or 0 0
+ *   'P' words 0, 2 and 99 of the page behind it, read through P2 (memory)
+ *   'V' the same three words through va (what the title sees)
+ *
+ * 'P' and 'V' are read only when the UTLB already maps the page, and with
+ * interrupts masked from the probe to the last read, so the instrument itself
+ * can take no TLB miss inside the loader. Everything is read first and traced
+ * afterwards: each trace is a network round trip, long enough for the title's
+ * interrupts to replace the entry.
+ */
+static unsigned int gd_utlb_a, gd_utlb_d;
+
+/* log2 of the page size, by the data word's SZ1:SZ0 (1 KB, 4 KB, 64 KB, 1 MB) */
+static const unsigned char gd_page_shift[4] = { 10, 12, 16, 20 };
+
+static unsigned int gd_page_size(unsigned int d)
+{
+	return 1U << gd_page_shift[((d >> 6) & 2U) | ((d >> 4) & 1U)];
+}
+
+/* Runs from its P2 alias: the TLB arrays are read from uncached code. */
+static void gd_utlb_probe(unsigned int va)
+{
+	unsigned int asid = *(volatile unsigned int *)0xff000000U & 0xffU;
+	unsigned int i;
+
+	gd_utlb_a = 0;
+	gd_utlb_d = 0;
+	for (i = 0; i < 64; i++)
+	{
+		unsigned int a = *(volatile unsigned int *)(0xf6000000U | (i << 8));
+		unsigned int d = *(volatile unsigned int *)(0xf7000000U | (i << 8));
+		unsigned int mask = ~(gd_page_size(d) - 1U);
+
+		if (!(a & 0x100U) || ((a ^ va) & mask)
+		    || (!(d & 2U) && ((a & 0xffU) != asid)))
+		{
+			continue;
+		}
+		gd_utlb_a = a;
+		gd_utlb_d = d;
+		return;
+	}
+}
+
+static void gd_trace_vaddr(unsigned int va, int with_mmu)
+{
+	void (*probe)(unsigned int) = (void (*)(unsigned int))
+		((unsigned int)gd_utlb_probe | 0xa0000000U);
+	unsigned int sr, masked, pa;
+	unsigned int w[6] = { 0, 0, 0, 0, 0, 0 };
+
+	__asm__ volatile ("stc sr,%0" : "=r" (sr));
+	masked = sr | 0xf0U;
+	__asm__ volatile ("ldc %0,sr" : : "r" (masked));
+	probe(va);
+	if (gd_utlb_d)
+	{
+		unsigned int d = gd_utlb_d;
+		unsigned int size = gd_page_size(d);
+		volatile unsigned int *p, *v = (volatile unsigned int *)va;
+
+		pa = (d & 0x1ffffc00U & ~(size - 1U)) | (va & (size - 1U));
+		p = (volatile unsigned int *)(pa | 0xa0000000U);
+		w[0] = p[0]; w[1] = p[2]; w[2] = p[99];
+		w[3] = v[0]; w[4] = v[2]; w[5] = v[99];
+	}
+	__asm__ volatile ("ldc %0,sr" : : "r" (sr));
+
+	if (with_mmu)
+	{
+		gd_trace_always('M', *(volatile unsigned int *)0xff000010U, sr,
+				*(volatile unsigned int *)0xff000000U);
+	}
+	gd_trace_always('U', va, gd_utlb_a, gd_utlb_d);
+	if (gd_utlb_d)
+	{
+		gd_trace_always('P', w[0], w[1], w[2]);
+		gd_trace_always('V', w[3], w[4], w[5]);
+	}
+}
+#endif
+
+/* Read TOC: into gd_stage, then copied to the title (see above). */
 static void GetTOC(void)
 {
 	command_3int_t *command =
@@ -847,16 +1457,12 @@ static void GetTOC(void)
 
 	memcpy(command->id, CMD_CDFSTOC, 4);
 	command->value0 = htonl(_GDS.param[0]);	/* session / area */
-	command->value1 = htonl(_GDS.param[1]);	/* destination */
+	command->value1 = htonl((unsigned int)gd_stage);
 	command->value2 = 0;
 
-	syscall_retval = (unsigned int)-1;
-	timeout_loop = GD_SYSCALL_TIMEOUT_SECONDS;
-	fine_deadline_start = TMU2_COUNT;
-	fine_deadline_ticks = GD_READ_DEADLINE_TICKS;
+	/* The same exchange as a sector read (gd_exchange), window and all. */
 	g_gd_in_transfer++;
-	build_send_packet(sizeof(command_3int_t));
-	bb->loop(0);
+	gd_exchange(gd_read_exchange);
 	g_gd_in_transfer--;
 	fine_deadline_ticks = 0;
 	timeout_loop = 0;
@@ -868,7 +1474,20 @@ static void GetTOC(void)
 		return;
 	}
 
-	/* 99 entries + first + last + leadout. */
+#if GD_TRACE && GD_TRACE_VADDR
+	gd_trace_vaddr(_GDS.param[1], 1);
+#endif
+	/* 99 entries + first + last + leadout. Not memcpy_32bit: see above. */
+	{
+		volatile unsigned int *toc = (volatile unsigned int *)_GDS.param[1];
+		unsigned int i;
+
+		for (i = 0; i < 102; i++)
+			toc[i] = gd_stage[i];
+	}
+#if GD_TRACE && GD_TRACE_VADDR
+	gd_trace_vaddr(_GDS.param[1], 0);
+#endif
 	_GDS.transfered = 102 * 4;
 	_GDS.status = CMD_STAT_COMPLETED;
 }
@@ -1053,6 +1672,12 @@ void gdcServerMain(void)
 			case CMD_DMAREAD:
 				data_transfer();
 				break;
+			case CMD_DMAREAD_STREAM:
+			case CMD_PIOREAD_STREAM:
+			case CMD_DMAREAD_STREAM_EX:
+			case CMD_PIOREAD_STREAM_EX:
+				data_stream();
+				break;
 			case CMD_GETTOC:
 			case CMD_GETTOC2:
 				GetTOC();
@@ -1176,9 +1801,6 @@ static unsigned int gd_last_sp;
  * is readable while the title is still healthy -- which is the point, because
  * after the overlap nothing this loader reports can be trusted.
  */
-extern char dcload_base[];
-extern char end[];
-
 unsigned int g_gd_sp_min = 0xffffffffU;
 unsigned int g_gd_sp_in_image = 0;
 
@@ -1324,6 +1946,17 @@ int gdGdcReqCmd(int cmd, int *param)
 			_GDS.param[i] = (unsigned int)param[i];
 		}
 
+		/* A DMA destination is PHYSICAL: the BIOS hands it to the G1 DMA,
+		 * which knows nothing of the MMU. Windows CE computes it that way
+		 * (the page frames of a locked buffer, 0x0ce99000), and with its MMU
+		 * on, the same number used as a CPU address is a virtual one in
+		 * process slot 6. P1 reaches the physical page whatever the title
+		 * does with the MMU; with the MMU off it is P0's twin. */
+		if (cmd == CMD_DMAREAD)
+		{
+			_GDS.param[2] = sh4_phys_addr(_GDS.param[2]) | 0x80000000U;
+		}
+
 		if (is_transfer_cmd(cmd))
 		{
 			_GDS.requested = _GDS.param[1] * _GDS.sec_size;
@@ -1395,6 +2028,12 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 		_GDS.status = CMD_STAT_IDLE;
 		status[2] = _GDS.transfered;
 		status[3] = _GDS.ata_status;
+		break;
+
+	case CMD_STAT_STREAMING:
+		status[2] = _GDS.transfered;
+		status[3] = _GDS.ata_status;
+		rv = CMD_STAT_STREAMING;
 		break;
 
 	case CMD_STAT_FAILED:
@@ -1511,10 +2150,39 @@ int gdGdcReadAbort(int gd_chn)
 }
 
 /*
- * DMA plumbing. Data has already landed at its destination by the time a
- * transfer completes, so a requested DMA is finished the moment it is asked
- * for. Signatures must stay BIOS-compatible; titles do validate the channel.
+ * The transfer half of a stream (see data_stream()). A piece is accepted only
+ * while the channel's stream is running, none is pending, and it fits in what
+ * is still owed; the server serves it at its next ExecServer. Check*Trans
+ * answers 1 while a piece is pending, else 0 with the bytes still owed -- the
+ * BIOS contract Windows CE's driver sizes its next piece from. Signatures
+ * must stay BIOS-compatible; titles do validate the channel.
  */
+static int gd_piece_request(int gd_chn, unsigned int *buf)
+{
+	if (!buf || (gd_chn != _GDS.req_count)
+	    || (_GDS.status != CMD_STAT_STREAMING) || gd_piece_size
+	    || (buf[1] > _GDS.requested))
+	{
+		return -1;
+	}
+	gd_piece_addr = buf[0];
+	gd_piece_size = buf[1];
+	return 0;
+}
+
+static int gd_piece_check(int gd_chn, unsigned int *size)
+{
+	if ((gd_chn != _GDS.req_count) || (_GDS.status != CMD_STAT_STREAMING))
+	{
+		return -1;
+	}
+	if (size)
+	{
+		*size = gd_piece_size ? _GDS.transfered : _GDS.requested;
+	}
+	return gd_piece_size ? 1 : 0;
+}
+
 void gdGdcG1DmaEnd(unsigned int func, unsigned int param)
 {
 	g_gd_idx_counts[5]++;
@@ -1529,32 +2197,13 @@ void gdGdcG1DmaEnd(unsigned int func, unsigned int param)
 int gdGdcReqDmaTrans(int gd_chn, unsigned int *dmabuf)
 {
 	g_gd_idx_counts[6]++;
-
-	if (!dmabuf || (gd_chn != _GDS.req_count))
-	{
-		return -1;
-	}
-	if (_GDS.requested < dmabuf[1])
-	{
-		return -1;
-	}
-	_GDS.requested -= dmabuf[1];
-	return 0;
+	return gd_piece_request(gd_chn, dmabuf);
 }
 
 int gdGdcCheckDmaTrans(int gd_chn, unsigned int *size)
 {
 	g_gd_idx_counts[7]++;
-
-	if (gd_chn != _GDS.req_count)
-	{
-		return -1;
-	}
-	if (size)
-	{
-		*size = _GDS.requested;
-	}
-	return 0;
+	return gd_piece_check(gd_chn, size);
 }
 
 void gdGdcSetPioCallback(unsigned int func, unsigned int param)
@@ -1567,27 +2216,13 @@ void gdGdcSetPioCallback(unsigned int func, unsigned int param)
 int gdGdcReqPioTrans(int gd_chn, int *piobuf)
 {
 	g_gd_idx_counts[12]++;
-
-	if (!piobuf || (gd_chn != _GDS.req_count))
-	{
-		return -1;
-	}
-	return 0;
+	return gd_piece_request(gd_chn, (unsigned int *)piobuf);
 }
 
 int gdGdcCheckPioTrans(int gd_chn, int *size)
 {
 	g_gd_idx_counts[13]++;
-
-	if (gd_chn != _GDS.req_count)
-	{
-		return -1;
-	}
-	if (size)
-	{
-		*size = (int)_GDS.requested;
-	}
-	return 0;
+	return gd_piece_check(gd_chn, (unsigned int *)size);
 }
 
 void gdGdcChangeDisc(int disc_num)

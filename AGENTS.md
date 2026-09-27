@@ -166,7 +166,7 @@ Compiler flags disable everything that could move code behind your back:
 | `memfuncs.c/.h`, `memcpy.S`, `memcmp.c` | aligned mem* fast paths. |
 | `maple.c/.h` | Maple bus driver; its DMA buffer is outside the image (§4.4). |
 | `cdda.c/.h` | CD-DA playback (§4.13). The header of `cdda.c` is the design description. |
-| `cdfs.h`, `cdfs_redir.s`, `cdfs_syscalls.c` | GD-ROM emulation (§4.5). Both carry explanatory headers. |
+| `cdfs.h`, `cdfs_redir.s`, `cdfs_syscalls.c` | GD-ROM emulation (§4.5); also the boot-time drive spin-down (§4.14). Both carry explanatory headers. |
 | `syscalls.c/.h` | host syscalls `DC00`–`DC24` (§8). |
 | `commands.c/.h` | the command dispatcher and the LoadBinary window (`bin_info`). |
 | `exception.S` | exception display **and** the VBR table handed to the title; `+0x600` is `nop; rte; nop` (no interrupt is hooked). |
@@ -178,8 +178,10 @@ GD constants are in §4.5, CD-DA flags in §4.13.
 
 **Size knobs.** Footprint is correctness (§4.6). Measured 2026-09-12 as the
 change in `_end` from the defaults of then (`_end = 0x8c00c58c`; since the CD-DA
-simplification of 2026-09-19 and the paced fill of 09-20 the defaults give
-`0x8c00bee0`):
+simplification of 2026-09-19, the paced fill of 09-20 and the Maple copy fix
+of the same day, the unacknowledged sector path of 09-20 and the drive
+spin-down of 09-20 the defaults gave `0x8c00bfc8`; the third GD door and the
+symbol-derived read block of 09-26 (§4.5) bring them to `0x8c00c000`):
 
 | Flag | Default | Effect | `_end` saved |
 | --- | --- | --- | --- |
@@ -188,11 +190,12 @@ simplification of 2026-09-19 and the paced fill of 09-20 the defaults give
 | `WITH_LAN_ADAPTER` | `1` | HIT-0300 driver; 0 = BBA only | 2040 B if 0 |
 | `WITH_PMCR_CMD` | `1` | serve `PMCR` (perfctr.c stays) | 808 B if 0 |
 | `WITH_MAPLE` | `1` | serve `MAPL` | 656 B if 0 |
+| `WITH_GD_SPINDOWN` | `1` | stop the real drive at boot (§4.14) | 160 B if 0 |
 | `DCLOAD_GC_SECTIONS` | `1` | `--gc-sections`; also reveals dead code | 328 B |
 | `DCLOAD_LTO` | `0` | `-flto`. **Off on purpose**: it changes the depth of the C frame the GD coroutine parks (§4.5 — check `g_gd_park_longs` on hardware) and suppresses the `*.asm` listings | 2428 B if 1 |
 
-Combinations: `WITH_LAN_ADAPTER=0 WITH_MAPLE=0 WITH_PMCR_CMD=0` gives
-`0x8c00b7e4`; adding `DCLOAD_LTO=1` gives `0x8c00adb0`.
+Combinations, re-measured 2026-09-20: `WITH_LAN_ADAPTER=0 WITH_MAPLE=0
+WITH_PMCR_CMD=0` gives `0x8c00b200`; adding `DCLOAD_LTO=1` gives `0x8c00a8c0`.
 
 **Diagnostic and experimental flags** (all default 0 unless stated):
 
@@ -221,12 +224,12 @@ a build variable because it is per-game (§4.11). Defaults (LOW layout):
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` = `0xdeadbeef` magic, `+8` = syscall trampoline pointer (the example-program ABI). |
-| `0x8c00bee0` | `_end` with default flags (2026-09-20). Code and BSS are all below it. |
+| `0x8c00c434` | `_end` with default flags (2026-09-27; over the `0x8c00c000` bound, §4.6). Code and BSS are all below it. |
+| `_end`..`_stack` | the loader's stack; also `.gdstage` (NOLOAD, 10 KB), the big GD stage, used only under a CE title (§4.15). |
 | `0x8c00f400` | `_stack` (LOW layout), **the VBR handed to the title**, the link address of `exception`, and the BIOS VBR. Only `_stack` moves with the base. |
 | `0x8c010000` | the title's load address; `exception.bin` ends just before it. |
 | `0x8cfe8000` | Maple DMA buffer (2 KB), outside the image (`_maple_dma_buffer`). |
 | `0x8cfe9000` | `.hiram`, 12 KB reserved (NOLOAD, zeroed by crt0): packet buffers and CD-DA staging buffer. `dcload.x` asserts it does not reach the Maple buffer. |
-| `0x8cf0c000` | post-mortem block (`PM_BASE`). **Advisory**: titles overwrite it. |
 
 Link-time asserts: `(_stack - _end) > 800` and `_end` within `ram`. There is
 no resident/transient split any more.
@@ -252,12 +255,54 @@ model. The driver a title is written against is a **coroutine**, so:
   round trip each, **without yielding to the title between chunks** (it yields
   only before retrying a failed chunk). Between chunks it feeds CD-DA
   (`GD_CDDA_BETWEEN_CHUNKS`).
+- **A chunk is one round trip, and the loader judges it** (2026-09-20). The
+  host sends the LoadBinary, the parts and the ReturnValue without pausing for
+  the echo or for a DoneBinary probe (`send_sectors`, §16). `ReadSectors`
+  therefore calls `bin_window_close()` **before** building the request — so
+  completion is judged on this chunk's own window and not on the previous,
+  already complete one — and tests `bin_window_complete()` when the
+  ReturnValue releases it. A hole fails the chunk (`g_cdfs_read_holes`) and
+  `data_transfer_emu_async` asks again: one extra round trip on a loss instead
+  of two on every chunk. **A short chunk must never be reported COMPLETED**;
+  the title would run the bytes. **But a ReturnValue over a hole is not
+  necessarily ours** (2026-09-27): a disc read's carries nothing, so the late
+  answer to an earlier attempt, queued in the ring, can end the wait of the
+  next one. `ReadSectors` then keeps waiting until its own deadline
+  (`g_cdfs_read_stale`) instead of failing in a millisecond; the late answer's
+  parts are the same bytes for the same place, so they count. It also sets `bin_echo_suppress(1)` for the
+  wait: nobody reads the echo any more, and sending it would put one of our
+  frames on the wire inside the host's burst — the collision already on record
+  on the audio path.
 - `gdGdcGetCmdStat` reports progress (`COMPLETED` consumed once, then `IDLE`;
   `req_count` never 0 or 1). `gdGdcGetDrvStat` reports PLAYING while a read or
   CD-DA is live and calls `cdda_service()` **before** taking the GD lock.
 - `CMD_REQ_STAT` and `CMD_GETSCD` report the CD-DA position while music plays.
   Unmodelled commands are force-completed, never failed (a title that gets
   FAILED for a routine command tends to give up).
+
+**Three doors, not one** (2026-09-26). The BIOS GD driver is reachable three
+ways, and a title served from the host must not get through any of them to the
+real drive:
+
+| Door | Who uses it | How it is held |
+| --- | --- | --- |
+| vector `0xac0000bc` (misc group in front, `r6 == -1`) | every Katana title measured, 13 literals each | `cdfs_redir_enable()` |
+| vector `0xac0000c0` (the driver alone) | Windows CE's `COREDLL.DLL` | `cdfs_redir_enable()`, since 09-26; saved and restored with `0xbc` |
+| the driver body `0x8c0010f0` itself | Windows CE's GD driver: 23 literals in Sega Rally 2's `0WINCEOS.BIN`, called with `r6 = 0`, `r7` = index | **the host** rewrites the literals to `_gd_bios_entry` (`dispatch::gd_body_patches`), as isoldr's `gdc_syscall_patch()` does |
+
+The third is patched from the host, not by overwriting the BIOS's copy of the
+driver here, because `gd_spin_down_drive()` needs the real driver at the next
+boot and `cdfs_saved` survives only as long as the image. None of the four
+Katana test titles carries `0x8c0010f0` or `0x8c0000c0`, so neither change
+reaches them.
+
+**What a disc read may not land on** is derived from the linker (09-26):
+`[dcload_base, end)` and `[_hiram_start, _hiram_end)`, compared in P1. It used
+to be the constants `0x0c004000..0x0c010000` — the stock base's image and
+stack — which protected nothing of a relocated loader and refused reads into
+IP.BIN, the guest VBR and a low title's own stack (§14.11). The Maple DMA buffer
+is deliberately not in the list: it is written only while a `MAPL` command runs,
+never under a title.
 
 **Invariants, each paid for:**
 
@@ -278,7 +323,7 @@ model. The driver a title is written against is a **coroutine**, so:
 3. **No function live across a yield may take the address of a local**: a
    parked frame is restored onto whatever `r15` the next ExecServer has.
 4. **Every wait needs a millisecond deadline on TMU2** (`fine_deadline_*`,
-   `GD_READ_DEADLINE_TICKS` 1.2 s for disc reads). The seconds timeout counts
+   `GD_READ_DEADLINE_TICKS` 250 ms for disc reads). The seconds timeout counts
    whole seconds on the PMCR (2 s fires at 3 s on hardware; never under a
    flycast without the local PMCR patch), `RTL_IDLE_POLL_LIMIT` only counts
    polls with no frame, and both are disarmed when `timeout_loop` is cleared
@@ -298,8 +343,9 @@ nesting in invariant 2. `g_gd_lock_owner`/`_stuck_owner` say who held it.
 | `GD_BULK_SECTORS` | `0` | isoldr reads ≥100-sector requests in one shot; **do not**: into an 11-frame RX ring that lost 840 packets in one run. |
 | `GD_YIELD_BETWEEN_CHUNKS` | `0` | With the yield, Sonic Adventure died on delivery of chunk 1. |
 | `GD_CDDA_BETWEEN_CHUNKS` | `1` | Feed CD-DA between chunks. Must stay on with invariant 2, or the ring runs dry during level loads (measured `g_cdda_room_min` 0). |
-| `GD_READ_DEADLINE_TICKS` | `15000000` | 1.2 s at Pck/4. |
+| `GD_READ_DEADLINE_TICKS` | `3125000` | 250 ms at Pck/4. **The primary recovery**, not a backstop: since `send_sectors` the host waits for nothing, so nothing else notices an answer that never arrives. Was 1.2 s, sized to outwait a host that gave up at ~0.7 s — a premise that no longer exists. |
 | `GD_READ_RETRIES` | `4` | re-requests before failing a read. |
+| `GD_READ_RETRIES_MMU` | `20` | the same with the MMU on (Windows CE, 5 s): CE's driver gives a failed read up for good. |
 | `GD_SYSCALL_TIMEOUT_SECONDS` | `6` | coarse seconds backstop (fires at 7 s). |
 | `GD_DRAIN_ITERS` | `0` | pre-request RX drain; measured useless at 256 and 50000, kept so nobody re-tests it blind. |
 | `GD_SERVICE_ITERS` | `256` | used by `GD_SERVICE_EVERY_SYSCALL` (§4.3). |
@@ -308,10 +354,18 @@ nesting in invariant 2. `g_gd_lock_owner`/`_stuck_owner` say who held it.
 
 **Known gaps:**
 
-- **TMU2 is not started at boot in the default build.** The read deadline and
-  the lock watchdog measure on it, but only `cdda.c` (before its first fetch)
-  and `setup_machine()` (only with `ISOLDR_SETUP_MACHINE=1`) start it. Until a
-  title plays music, those two bounds cannot expire.
+- ~~TMU2 is not started at boot~~ — **fixed 2026-09-20, and it had teeth.**
+  `gd_deadline_timer_start()` (`cdfs_syscalls.c`, called from `main()`) now
+  starts it; `cdda.c` calls the same function instead of keeping its own copy,
+  and it stays idempotent because restarting it mid-read would break that
+  read's deadline. Before this, only `cdda.c` and `setup_machine()`
+  (`ISOLDR_SETUP_MACHINE=1`) started it, so **for a title that streams its
+  music as data rather than as CD-DA — Crazy Taxi — neither the read deadline
+  nor the lock watchdog could ever expire.** One lost chunk fell through to the
+  coarse PMCR backstop and froze the game for **7.0 s** (`GD_SYSCALL_TIMEOUT_
+  SECONDS` 6, which fires at 7). It was invisible until the host stopped
+  repairing losses on its own: the lesson is that a bound nothing has ever been
+  seen to fire may simply be unable to.
 - **No `g2_lock()` around CPU reads of the BBA.** `cdda.c` locks G2 for the
   AICA; the BBA ring is polled unlocked. One freeze dump showed AICA reads at
   zero together with `g_rx_hdr_defer` +6147 and resyncs, which fits a G2 burst
@@ -319,8 +373,25 @@ nesting in invariant 2. `g_gd_lock_owner`/`_stuck_owner` say who held it.
   (2026-08-09) no title G2 DMA was ever in flight at `rtl_bb_loop()` entry,
   and that a first attempt which *waited* on the DMA-busy bits rebooted the
   machine — observe before acting.
-- `*_STREAM` commands complete without being served; `GETTOC2` does not model
-  low/high density areas.
+- `CMD_INIT`, `CMD_REQ_MODE` and `CMD_SET_MODE` are force-completed with
+  **nothing written back**. No Katana title has minded; an OS driver that reads
+  its mode structure back gets stale memory. Count first
+  (`g_gd_cmd_counts[24]`, `[30]`, `[31]`) before spending bytes on it.
+- **Streams are served since 2026-09-27** (`data_stream()`; before, they were
+  force-completed with nothing delivered). PIO pieces are chained through the
+  title's `SetPioCallback` callback, called from the server; **DMA pieces
+  after the first need the G1 DMA-end interrupt, which nothing raises** -- a
+  DMA stream completes only if its first piece is the whole of it. Windows CE
+  is steered to PIO by the host (§4.15). No Katana test title has been run
+  with this. `GETTOC2` does not model low/high density areas.
+- **Reads into a translated address are staged** (`gd_stage_big`, 10 KB in
+  `.gdstage` above `_end` -- the loader's own stack region, dead while a title
+  runs, and used only under the MMU because in the LOW family it is a Katana
+  title's stack; `gd_stage`, 6 KB in `.hiram`, for the TOC and a stream under
+  a Katana title; and `gd_is_virtual()`: P0 with MMUCR.AT set): received there and
+  copied with `memcpy.S`. The host cannot write such an address: every copy in
+  `memfuncs.c` stores in the source's segment (§8). With the MMU off nothing
+  changes.
 
 ### 4.6 The footprint rule
 
@@ -350,11 +421,21 @@ the stack test comfortably: `g_gd_sp_min` 0x8c00e460, 6424 B over `_end`.
 isoldr does not meet this because its image is 13 KB and ends at `0x8c007400`,
 which is why 593 DreamShell presets can say `0x8c004000`.
 
-**Where that stands now:** since the CD-DA simplification of 2026-09-19 the
-defaults give `_end = 0x8c00bee0`, **below** `0x8c00c000` again, but still
-above Sonic Adventure's SP (`0x8c00b9d0`). Even the smallest build
-(`0x8c00adb0`) leaves 3104 B under SA's stack, below the 4096 B the host
-requires. The host places a title by these rules (§4.11, §16): it refuses a
+**Where that stands now (2026-09-27): over the bound.** The defaults gave
+`_end = 0x8c00c000` on 09-26, the image's last byte just under the painted
+range, with no margin left. The Windows CE work (§4.15: staging, streams,
+the exchange mask and stack switch, retries, CD-DA level follow and catch-up)
+puts the tree at **`_end = 0x8c00c434`, 1076 B over**. The deployed
+`loaders/` is still the `0x8c00c000` build; deploying the current one loses
+the low base to painted titles as described below. The user's decision
+(2026-09-21) is that this is acceptable where it has to happen: the host
+already refuses a low base whose image reaches a range the title paints
+(`low_loader_painted_by_title`), so a taller build costs the low family for
+Katana titles, not correctness -- but say so when it happens, and
+`WITH_GD_SPINDOWN=0` (160 B) is the first flag to spend. It is still above Sonic Adventure's
+SP (`0x8c00b9d0`). The smallest build without LTO (`0x8c00b200`) leaves 2000 B
+under SA's stack and the smallest with it (`0x8c00a8c0`) 4368 B, against the
+4096 B the host requires. The host places a title by these rules (§4.11, §16): it refuses a
 low base whose image reaches a constant-range fill it finds in the title, or
 whose stack margin is short, and a title the preset database does not know is
 searched from `0x8ce00000`. Measured 2026-08-29: at a margin of 2444 B the
@@ -685,7 +766,7 @@ to 2026-09-05) and `docs/cdda-double-buffer-investigation.md` (this engine,
 | `CDDA_ADPCM` | `1` | 0 = 16-bit PCM |
 | `CDDA_RING_FETCHES` | `26` | ring size, as large as LEA allows |
 | `CDDA_LEAD_FETCHES` | `20` | audio kept ahead of the AICA; the rest of the ring is the margin the other way |
-| `CDDA_FETCHES_PER_SERVICE` | `2` | sub-fetches per service call: the catch-up cap |
+| `CDDA_FETCHES_PER_SERVICE` | `2` | sub-fetches per service call, plus one per sub-fetch of audio the gap since the last call consumed, up to the lead (2026-09-27: Windows CE calls the driver hundreds of ms apart) |
 | `CDDA_LAG_SHIFT` | `3` | how late the fill trigger reads the model, as a shift of one loop |
 | `CDDA_TICKS_X8192` | `578960` | the model's clock ratio (Pck/16 ticks per 8192 samples); flycast's is exactly `580480`, which the flycast sets use |
 | `CDDA_SERVICE_DRAIN_ITERS` | `256` | idle listening window (≤ 1 ms, at most every 20 ms); 0 removes it |
@@ -782,7 +863,9 @@ Open questions and limits:
   find its window boundaries in the idle tail between halves, and there is no
   longer one.
 - A title that stops calling the GD driver stops the music (isoldr too).
-- The mixer level is read at key-on only.
+- The game's CD input level is followed by the channel watchdog (every
+  `CDDA_CHECK_FETCHES` sub-fetches, 2026-09-27); 0 means full only until the
+  game has set a level, and mutes after two zero reads in a row.
 - An ADPCM range's odd final sector is skipped (~13 ms, once per pass). A play
   range shorter than the lead keys on early and is untested on hardware, and
   one shorter than the host's history (~2.5 s) would be answered from it on the
@@ -840,6 +923,162 @@ Open questions and limits:
   The host's deflate index cost 140 ms on the first read of a track, which is
   the whole fetch budget several times over; it now happens on a thread before
   the title asks for music.
+
+### 4.14 The drive is stopped at boot
+
+`gd_spin_down_drive()` (`cdfs_syscalls.c`, `WITH_GD_SPINDOWN=1`, called from
+`main()`) puts the real GD-ROM in `<STANDBY>`. Nothing in a session reads the
+disc again — a title's GD syscalls are answered from the host, CD-DA comes off
+the network, and an uploaded homebrew never touches the drive — so the disc the
+BIOS spun up to boot `1st_read.bin` would otherwise keep turning.
+
+What it is actually worth: **the drive's firmware already does this after
+180 s**. The SPI mode page's Standby Time defaults to `B4h` seconds of
+`<PAUSE>` before the unit goes to `<STANDBY>` (`Cdif131e.txt`, "Standby Time
+(Byte 4-5)", whose own note is that a large value hurts MTBF). So this buys
+three minutes of rotation per boot, immediately and audibly, and makes the
+stopped state deterministic rather than something the next command postpones.
+It is **reversible**: a title run without a disc image, or a KOS program
+calling `cdrom_init()`, spins the drive back up, paying that read's spin-up.
+
+Three things it depends on:
+
+1. **It calls the real BIOS driver**, through the syscall vector at
+   `0xac0000bc` — so it must run after `cdfs_redir_save()`/`cdfs_redir_disable()`
+   have put the BIOS back on that vector, and it is the only place in the
+   loader that does. The ABI is the one `cdfs_redir.s` decodes for a title:
+   r7 = function index, r6 = 0.
+2. **The BIOS driver is a coroutine too** (§4.5). `ReqCmd` only queues the
+   STOP; it progresses while we call `ExecServer`, so the loop is the driver's
+   scheduler and not a poll of the drive. Leaving early leaves the command
+   queued in a driver nobody will run again. `InitSystem` is the **fallback**
+   and not the first call: `ReqCmd`/`ExecServer`/`GetCmdStat` are non-blocking
+   by construction, `InitSystem` is the one that may bring hardware up, and
+   the BIOS has just read the disc with this driver.
+3. **Bounded on a spin count** (`GD_SPINDOWN_SPIN_LIMIT`), not on TMU2, which
+   is not running that early — and a TMU2 deadline would cost more footprint
+   than the whole function is worth (§4.6: it already spent 160 of the 216 B
+   that were under `0x8c00c000`). What one `ExecServer` costs has not been
+   measured, so the bound is on iterations and not on time. A drive that will
+   not answer is left spinning rather than spun on.
+
+`g_gd_spindown` says how it went: the final command status + 2 (**4** =
+COMPLETED, the healthy answer; 1 FAILED, 2 IDLE, 5 STREAMING), plus 7 "the
+driver would not take the command" and 8 "it never finished". 0 means the call
+never ran — `WITH_GD_SPINDOWN=0`, or an empty syscall vector.
+
+**Not yet measured on hardware.** The check that needs no instrument is that
+the drive goes quiet a second or two after the loader's screen appears.
+
+### 4.15 Windows CE titles
+
+Established 2026-09-20..27 on Sega Rally 2 PAL (GDI), which now boots, plays
+and saves under the loader; the history is `docs/wince-investigation.md`.
+**Booting a CE title boots an operating system**: the disc carries `NK.EXE`,
+`COREDLL.DLL`, `GWES.EXE`, `FILESYS.EXE`, ~250 files and the game;
+`0WINCEOS.BIN` is the ROM image that starts it and then loads the rest off the
+disc through CE's own GD driver (`wsegacd.dll`).
+
+**Boot** (host, `src/wince.rs` and `boot::WinCe`; automatic, `--no-wince` to
+disable):
+
+- The first 2048-byte sector of `0WINCEOS.BIN` is dropped and the rest loaded
+  at `0x8c010000`, as isoldr does (parity, not proof).
+- The title is entered through the disc's own second bootstrap
+  (`--boot-ipbin`), which hands over SR `0x700000f0` and zeroes
+  `0x8c00fc00..0x8c010000` -- the two places `go.S` differs from a real boot.
+  IP.BIN is stock; CE reads its header at `0x8c008000` at run time.
+
+**Memory.** CE's ROMHDR gives its kernel `0x8c143000..0x8cef0000`, allocated
+top-down, and driver globals `0x8cef0000..0x8d000000`. The host places the
+loader at `0x8cee0000` (HIGH layout) and lowers `ulRAMEnd` to it in the
+upload. **Nothing in the loader may write outside its own span while a title
+runs** -- the old post-mortem block at `0x8cf0c000` did, into CE's driver
+globals, on every read (§11). Inside the span, three regions are dead while a
+title runs and are reused for it:
+
+| Region | Before `EXEC` | Under a CE title |
+| --- | --- | --- |
+| `.gdstage` (above `_end`, under `_stack`) | the loader's own stack | `gd_stage_big`, 5 sectors |
+| Maple DMA page (4 KB) | `MAPL` commands | the network exchange's stack |
+| `gd_stage` (`.hiram`, 3 sectors) | -- | the TOC; streams under a Katana title |
+
+`.gdstage` is used only under the MMU: in the LOW family that range is a
+Katana title's stack.
+
+**The GD driver.**
+
+- CE calls the BIOS driver body `0x8c0010f0` directly (§4.5, third door); the
+  host points those calls at `_gd_bios_entry`. This is what makes CE servable
+  over the network at all.
+- **CE runs with the MMU on.** DMAREAD's destination is a physical page frame
+  (`gdGdcReqCmd()` makes it P1). Every other buffer is a **virtual** address
+  only the title's translation reaches (`gd_is_virtual()`: P0 with MMUCR.AT):
+  such a read is received into a stage and copied out with `memcpy.S`; never
+  through `memfuncs.c`, whose copies store in the source's segment (§8), and
+  never from the host.
+- **Streams** (`PIOREAD_STREAM_EX` 39 and friends) are served by
+  `data_stream()`: PIO pieces are chained through the title's callback. DMA
+  stream pieces would need the G1 DMA-end interrupt, which nothing raises, so
+  the host turns the branch that picks DMA for an aligned read into a branch
+  to PIO (`0x8c099f74` in Sega Rally 2; §7h of the investigation).
+- **Status words matter.** A PROCESSING status with status[3] = `WAIT_IRQ`
+  makes CE sleep on the GD interrupt; the retry path therefore clears it under
+  the MMU so CE polls. A failed read is fatal to CE's driver, so under the MMU
+  a read gets `GD_READ_RETRIES_MMU` (20) retries.
+
+**A preemptive OS calls us.** A Katana title's interrupt handlers run on top
+of a GD syscall and return; CE's timer interrupt enters its scheduler, which
+can run other threads for a whole quantum while the loader is half way
+through a network exchange -- the answer then overflows the ring and the
+deadline runs out while the loader is not running at all. Masking interrupts
+is not enough: CE calls the driver on a thread stack at a virtual address, and
+a TLB miss or an uncommitted stack page enters CE's kernel, which sets IMASK 0.
+So every network exchange of the GD path (`ReadSectors`, `GetTOC`,
+`cdda_fetch`) goes through `gd_exchange()`: under the MMU it masks interrupts
+(`bb_irq_hold()`, `adapter.h`) and then runs on the Maple page
+(`gd_on_loader_stack`, `cdfs_redir.s`) -- in that order, because it is one
+stack for every thread. The adapter loops mask too, and every exchange ends
+with reception off (after a deadline it used to stay on, and the LAN filled
+the ring for the next attempt). Katana titles see only that `bb->stop()`,
+which a successful answer's `cmd_retval()` already did.
+
+**Performance: the title waits for the whole read.** Yielding between chunks
+so CE's thread could sleep made reads longer and the menu stop longer. A
+round trip costs ~1.5 ms fixed plus ~0.17 ms a sector, so the number of trips
+is what counts: hence the 5-sector big stage, and the host scaling its
+post-LoadBinary pause to the window (§16). Sega Rally 2 still stops its menu
+~0.1 s each time it reads 604 KB of streamed audio; removing that needs the
+read served asynchronously, i.e. an interrupt (below).
+
+**CD-DA: CE never calls `GetDrvStat`.** The music is fed only when CE runs the
+GD server (ExecServer), hundreds of ms apart. `cdda_fill()` therefore budgets
+the sub-fetches the gap consumed plus two, up to the whole lead (§4.13).
+Gaps close to the lead (704 ms measured against 893) still cost audible
+glitches; the fix is the same interrupt.
+
+**Next: the interrupt hook** (isoldr's `exception_init` + `wince_entry`: three
+instructions at `VBR+0x600`, a trampoline at `VBR+0x5EC`, a fixed interrupt
+stack, r0/r1/T rebuilt from bank-1 r7 and `*(VBR+0x68c)`; 42 of 98 DreamShell
+CE presets ask for it with `irq=1`). It would let the loader serve reads and
+CD-DA on its own schedule instead of when CE calls. A mistake there shows no
+screen and no exception.
+
+Also not done: `CMD_REQ_MODE`/`SET_MODE`/`INIT` answered for real (§4.5 known
+gaps; measure first).
+
+**Debugging CE.**
+
+- Under flycast, the GDB stub stops the emulation on every MMU exception while
+  a client is attached (`debugger::debugTrap`), and every CE API call is one
+  (a jump to a trap address like `0xfffffd3b`). One attach halts flycast for
+  good: read everything in that attach (`scripts/dc-integrity.py --elf
+  <relocated ELF>` for the loader's integrity, a dump of the loader span for
+  its counters), then restart flycast.
+- A console recording of the music, aligned against the disc's track, names
+  what the AICA played (the ring replaying itself was found that way).
+- In a dump, `pc` is SPC, and an exception taken in a delay slot sets SPC to
+  the **branch** before it: a `pc` on a `bra` means the fault is at `pc+2`.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
@@ -960,6 +1199,13 @@ reading it back with `SBIQ` at the same P2 address returns, from byte 8 on, the
 previous transfer's bytes. Either direction alone, and the physical window
 `0x0c…`, are fine (32/32). The suspect is `SH4_aligned_memcpy` in
 `cmd_partbin`/`cmd_sendbinq`. Hosts should address RAM through `0x0c…`.
+**Probable mechanism (2026-09-26, not re-tested):** every copy in `memfuncs.c`
+stores at `src + memdiff(dst, src)`, and `memdiff()` masks both addresses to
+29 bits — so the stores go to the destination's physical address **in the
+source's segment**. A P2 destination fed from a P1 packet buffer is written
+cached, and `cmd_loadbin` does not purge a P2 destination. The same rule sends
+a Windows CE virtual address to area 2 (`docs/wince-investigation.md` §7f):
+**no `memfuncs.c` copy may target an address the title's MMU translates.**
 
 **A `DBIN` names its range.** `cmd_donebin()` answers with the first missing
 part of the LoadBinary window (or `0, 0` when complete); `cmd_sendbinq()` ends a
@@ -967,6 +1213,94 @@ memory read with a `DBIN` carrying the address and size it served. Without that
 distinction a counter read during a transfer swallowed the transfer's `DBIN`
 and credited a read with holes as complete. Hosts match on the ID only, so only
 the filter that needs it sees the fields.
+
+**`MAPL` carries the loader's own argument block**, not a Maple frame: one byte
+each of port (0-3), unit (0 = the controller, 1-5 = its sub-units), Maple
+command and **payload length in LONGWORDS**, then that many longwords
+(`cmd_maple`). The reply is a `MAPL` whose `size` is the number of bytes copied
+out of the Maple receive buffer and whose data is the raw response frame --
+response code, destination, source, length in longwords, then the data. A
+response code is **signed**: -1 is "nothing at that address", -4 is "busy, ask
+again" (retried 64 times inside `cmd_maple`, then handed to the host). dc-tool
+never sends one; the Rust host does, for the VM2 game ID below.
+
+**VM2 / VMUPro game ID.** A VM2, a VMUPro and the Maple adapters that answer
+like them (`"VM2 by Dreamware"`, `"8BITMODS VMUPro "`, `"USB RP2040 EMU  "`,
+`"Pico2Maple USBBT"`, in the 40-byte `extended` field an `ALLINFO` response
+carries after the standard 112-byte device info) select a game's saves when
+they are told the product number of the title that is starting. openMenu does
+it from the console; here it is **entirely host-side** (`src/vm2.rs` in the Rust
+host, §16), over `MAPL`: `ALLINFO` (command 2) to units 1 and 2 of each port to
+find them, then **Maple command 33** with a payload of the memory-card function
+code big-endian (`00 00 00 02`), 12 bytes of product number and optionally 128
+bytes of title -- 4 or 36 longwords. Nothing was added to the loader for it,
+because it needed none of the bytes §4.6 has left.
+
+**Three defects made that passthrough unusable or unsafe, and were fixed on
+2026-09-20 when the first payload longer than one longword appeared:**
+
+1. `maple_docmd()` handed `datalen` -- LONGWORDS -- to `SH4_aligned_memcpy`,
+   which counts BYTES, so three quarters of every payload stayed behind and a
+   12-character ID arrived as 3. The line it replaced in 2025 had it right
+   (`memcpy(sendbuf, data, datalen << 2)`, still there in a comment).
+2. `cmd_maple()` read the response back through `to_p1(res)`. The Maple DMA
+   writes that buffer and the operand cache does not snoop DMA, so the first
+   read left clean lines resident and **every later `MAPL` returned the first
+   one's response** -- four ports would all report the same device. The same
+   applied in the other direction: the write-back covered the block holding the
+   three control words, which are written through P2, so a resident line pushed
+   the *previous* command's port and frame header back over them.
+
+3. `cmd_maple()` sized the reply with `res[3]`, the device's own length field,
+   read through a `char` -- which is **signed** on sh-elf. A device claiming 128
+   or more longwords (the protocol allows 255) made the length negative, and
+   `SH4_aligned_memcpy` takes it unsigned: a four-gigabyte copy out of a 1 KB
+   buffer, from a byte the device chooses. Cast to `unsigned char`.
+
+The first two are gone by moving the payload copy and the response read to P2.
+**A loader older than this cannot serve a VM2**, and there is no feature bit to
+test for -- the host chainloads its own loader for every disc image, so keeping
+`loaders/` deployed is what keeps the two in step (§14.19).
+
+**A cycle that writes nothing is not a device that says nothing.** Measured the
+same day on a console with a VMUPro in port A: the session's first two `MAPL`
+commands both answered `response 0, 255 longwords`, the loader served 1024
+bytes of it, and every command after them worked. `maple_docmd()` never cleared
+the receive buffer, so an untouched buffer was served as a Maple response --
+stale RAM, indistinguishable from an answer. Three things now:
+
+- the response header is stamped with `MAPLE_NO_REPLY` (`0xeeeeeeee`, a
+  negative response code) before every cycle, so an untouched buffer is
+  **nameable**, and distinct from the `-1` the controller itself writes when a
+  device does not answer in time;
+- a cycle whose sentinel survives is run again, up to `MAPLE_DMA_TRIES` (3),
+  re-arming the DMA list pointer each time because the controller consumes it.
+  This answers a measured condition, not a guessed cause; `g_maple_dma_empty`
+  counts how often it was needed, so the cause stays visible;
+- `maple_wait_dma()` is **bounded** (`MAPLE_DMA_SPIN_LIMIT`, `g_maple_dma_timeouts`).
+  It span forever on a bit the Maple controller owns, inside the command loop:
+  a device that wedged the bus took the loader with it, silently (§4.8).
+
+**The busy bit is not a completion signal, and treating it as one damaged the
+bus.** Reported on hardware 2026-09-20: after a scan the console could no
+longer see its VMUs at all -- not from the BIOS, not from a game -- until the
+controller was physically unplugged. `MAPLE(0x18)` is read immediately after
+the trigger is written to it, so it may not be set yet; the wait then returns
+at once with the buffer untouched, and the caller either reads stale RAM or
+(worse, once the retry above existed) **starts a second Maple cycle on top of
+the first**. KOS never faces this because it takes the DMA completion interrupt
+and gates the next burst on `dma_in_progress` (`maple_irq.c`). This driver
+polls, so it waits for the **answer** instead, which is a positive signal and
+always arrives: when nothing is at the address the controller writes -1 itself
+when its 50000-tick timeout expires (`MAPLE_ANSWER_SPIN_LIMIT`). A cycle is
+only ever re-triggered from a controller that has been confirmed idle.
+
+**The whole receive buffer is cleared before each cycle**, as KOS does in
+`maple_frame_init()` (`memset(frame->recv_buf, 0, 1024)`). A device that answers
+with a short frame leaves everything past it as it was, and the caller reads
+that as part of the answer. Not with `memset_zeroes_64bit()`, which forces its
+destination to P1: dirty cache lines over a buffer the DMA writes are the
+defect above in reverse.
 
 ## 9. Example programs (`example-src`)
 
@@ -1029,8 +1363,13 @@ network only during GD waits, audio fetches and the CD-DA idle window.
   1 — a free check of the array alignment),
   `g_gd_cmd_counts[]` (per GD command, counted before the lock),
   `g_gd_park_longs`, `g_cdfs_sync_chunks`, `g_cdfs_sync_reentered`,
-  `g_cdfs_read_retries`/`_fails`, `g_gd_in_transfer`, and the lock group
-  (`g_gd_lock_stuck`/`_stuck_owner`/`_stuck_ticks`/`g_gd_lock_owner`/`_gen`).
+  `g_gd_spindown` (how the boot-time drive stop went, §4.14),
+  `g_cdfs_read_retries`/`_fails`/`_holes`, `g_gd_in_transfer`, and the lock
+  group (`g_gd_lock_stuck`/`_stuck_owner`/`_stuck_ticks`/`g_gd_lock_owner`/
+  `_gen`). **`_fails` and `_holes` are different ends of the link**: fails means
+  the host never answered, holes means it answered and the answer was short.
+  Since the host stopped acknowledging on the sector path (§4.5, §16),
+  `_holes` is the only place a lost packet in a disc read shows up.
 - Transfers: `g_lbin_count`, `g_lbin_noecho`, `g_bin_data_done`,
   `g_dbin_count`, `g_dbin_incomplete`, `g_pbin_ok`/`_rejected`/`_clamped`,
   `g_last_load_addr`/`_size`, `g_last_reject_*`.
@@ -1042,7 +1381,17 @@ network only during GD waits, audio fetches and the CD-DA idle window.
   freeze. `g_pmcr_backwards`.
 - DHCP / warm start: `g_dhcp_replies`, `g_dhcp_not_ours`, `g_warm_start`,
   `g_warm_ip`.
-- The post-mortem block at `PM_BASE` survives a reboot but not a title (§4.4).
+- Maple: `g_maple_dma_empty` (cycles that wrote nothing and were re-run) and
+  `g_maple_dma_timeouts` (the bounded DMA wait gave up) — §8.
+- **No post-mortem block any more** (removed 2026-09-27). It sat at the fixed
+  address `0x8cf0c000`, outside every loader placement, and `ReadSectors()`
+  wrote nine words there -- two of them read-modify-write -- on every disc
+  read, into whatever the title kept at that address. Nothing read it back.
+  Under Windows CE that address is inside the driver globals
+  (`0x8cef0000..0x8d000000`, §4.15). **The loader writes nothing outside its
+  own footprint while a title runs**; an instrument that needs to must justify
+  the address against the title (`GUEST_TICK_BLOCK` is the one such address,
+  off by default).
 
 Signatures worth knowing: `ExecServer` advancing one-for-one with
 `g_cdfs_sync_reentered` = the server never comes back (§4.5); `g_rx_polls` per
@@ -1097,6 +1446,18 @@ against a capture on the wire) to tell lost TX from lost RX.
    `scripts/frontier_fuzz.c` fuzzes accounting removed with `ABIN`; both
    report success. The host's CD-DA trim tests passed on a geometry the console
    no longer had. Prove a check can fail before trusting it.
+   **A timeout is a check too**, and the read deadline could not fire for two
+   months because nothing started TMU2 unless a title played CD-DA (§4.5). It
+   went unnoticed while the host repaired every loss on its own; the first
+   session that relied on it froze the game for 7 s. `g_gd_lock_stuck` has
+   "never fired" for the same reason — read that as unproven, not as healthy.
+   **And a bound guards the loop it is in, not the function.**
+   `receive_data()`'s first loop carries a carefully argued budget ("what keeps
+   a silent console bounded"); the repair loop right below it had none, so a
+   console answering nothing became an unbounded `SendBinQ` flood. This host is
+   single-threaded, so while it spun there it served no disc reads at all and
+   the title froze permanently — a worse outcome, from an instrument, than the
+   fault it was measuring.
 10. **Testing the old image.** `make` does not regenerate the CDI, and
     regenerating does not deploy it. Run `mkdcdisc`, copy, then prove the
     deployed image contains the new `1st_read.bin` **by content** (search for
@@ -1106,7 +1467,16 @@ against a capture on the wire) to tell lost TX from lost RX.
     rebooted at `EXEC` with no trace. Compare against the symbol.
 12. **Adding DC-side state without checking `_end`** — §4.6.
 13. **Leaving an instrument on.** `GD_TRACE`/`GD_TRACE_CALLER` can stop a title
-    booting.
+    booting. **And an instrument on a failure path is inside the blast
+    radius.** The failed-chunk trace used to be `gd_trace_always`, so it fired
+    exactly when the link had just failed to deliver something — and a
+    `write()` is not one packet: it transmits, waits, and the host then fetches
+    the written bytes back with `SendBinQ` (`fs.rs`, `download_data`). A disc
+    read that could not be answered therefore produced an instrument read that
+    could not be answered either, and on 2026-09-20 that pair wedged the host
+    in an unbounded re-request loop and froze the title for good. It is
+    `gd_trace` now; `g_cdfs_read_retries`/`_fails`/`_holes` say the same thing
+    at no network cost.
 14. **`REIOS: Booting up` in `flycast.log` is not a reset** — the SH4 executed
     address 0, e.g. a null jump. Check flycast's `[BBA-DIAG]` line in
     `Do_Exception` (verify the string is in the binary). **Unless `SYS_MISC 1`
@@ -1152,6 +1522,17 @@ against a capture on the wire) to tell lost TX from lost RX.
   so milliseconds per chunk matter more than KB/s. Upload loss was congestion,
   proven by `RT_RXMISSED` (887 drops in one upload before windowed flow
   control).
+- **A title that stutters while it runs** → the per-chunk cost, not the total
+  bandwidth. A title that streams reads *during* gameplay pays that cost inside
+  a frame it has already half spent, so what the player feels is a block of
+  dropped frames, not a slowdown (§16, Crazy Taxi). Measure it from the host's
+  `debug!` timestamps for consecutive `ReadSector` requests — they are the
+  chunks of one read — and against `g_cdfs_sync_chunks`; then decide between
+  the fixed per-chunk cost and the schedule. **`--diag` is inside what it
+  measures**: its `SBIQ` reads are answered from within the read's own wait, and
+  they show up as `Received non-DBIN packets while waiting for DoneBinary
+  response`, as `g_dbin_incomplete`, and once as a 521 ms stall. Take one run
+  without it.
 - **Base address / memory map** → `target-src/dcload/Makefile` (the layout
   table) first, then `dcload.x.in`, `target-src/1st_read/`, `dcload-crt0.s`,
   `go.S`, `exception.S`, `commands.c` (`_dcload_base`), `maple.c`, `hiram.h`,
@@ -1197,6 +1578,16 @@ What it does that concerns the DC side:
 - **`--diag`**: the counter panel (`d` toggles, `w` writes `dcload-diag.txt`;
   the header shows the measured sample interval, not the requested one).
   `stackwatch` reads `g_gd_sp_min` every 10 s in every session.
+- **Tells a VM2/VMUPro which game is starting** (`src/vm2.rs`), over `MAPL`,
+  in the idle seconds before `EXEC` and with a disc image only -- the product
+  number comes from IP.BIN. `--no-vm2` turns it off. It costs the loader
+  nothing, and §8 has the protocol and the `MAPL` defects it uncovered.
+  **It enumerates the way KOS does**: `DEVINFO` to a port's unit 0, then the
+  occupied slots out of that answer's **sender byte** (bit 5 = the port's own
+  peripheral, bits 0..4 = one per slot), then only those units. A slot the
+  controller does not report is never addressed and a silent port is left
+  alone -- on a console with two controllers, probing all eight slots blind
+  was twelve transactions aimed at nothing.
 
 **Contracts the DC side must keep in step with:**
 
@@ -1210,10 +1601,64 @@ What it does that concerns the DC side:
   references only through the jump table (§4.11).
 - **Counter names** are read from the ELF by name (`src/diag.rs`,
   `src/stackwatch.rs`, `scripts/dc-counters.py`); renaming one breaks them.
+  So are **`_gd_stage`** and **`_gd_stage_big`** (the ranges a disc read may
+  land on inside the loader, `loader_stage` in `main.rs`), and
+  **`_gd_bios_entry`** (`cdfs_redir.s`), the address the host writes
+  over a title's direct calls to the BIOS GD driver (§4.5); a loader without it
+  leaves those calls on the real drive, and the host says so.
 - Disc reads are served **one at a time**, to completion, inside the request
-  handler. `send_data()` verifies the LoadBinary echo; recovery resends a run
-  from the address `DoneBinary` reports, doubling up to 64 parts (resending a
-  part is harmless).
+  handler, by `send_sectors()` — **no LoadBinary echo, no DoneBinary probe**
+  (§4.5). Everything else still uses `send_data()`, which verifies the echo and
+  whose recovery resends a run from the address `DoneBinary` reports, doubling
+  up to 64 parts (resending a part is harmless); `send_sectors` falls back to it
+  above `MAX_XFER`, since the loader's check speaks for one window only.
+  **This is a two-sided contract with no feature bit**: a loader that does not
+  test `bin_window_complete()` accepts the ReturnValue as proof and would hand
+  the title short data in silence. What keeps them in step is that the host
+  chainloads its own loader from `loaders/` for every disc image, so that
+  directory is redeployed with any change here (§14.19).
+- **`send_sectors` pauses once after the LoadBinary, before the first part.**
+  `cmd_loadbin` zeroes the part map and purges the cache over the whole
+  destination range — 512 cache blocks for a 16 KB chunk — and waiting for the
+  echo used to cover that work by accident. That is the one thing the echo did
+  for the *loader* rather than for the host. Dropped without replacing it, the
+  first parts arrive while the loader is still purging; the ring overflows, and
+  an overflow does not cost one part but the **whole answer** (§4.8 rule 5
+  drains or re-initialises). Measured on Crazy Taxi, 2026-09-20: reads that
+  completed only after 7.0 s, which was the loader waiting out a deadline for
+  an answer that no longer existed.
+- **Measured 2026-09-20, Crazy Taxi**, which streams both its music (73 sectors
+  from a sequential LBA every ~3.5 s) and its city (3–8 sectors every ~60 ms)
+  **while rendering**, unlike Sonic Adventure which reads on loading screens.
+  A 16 KB chunk froze the title for ~5 ms: 1.3 ms of wire, 1.8 ms of deliberate
+  pause, ~1.9 ms for the two acknowledgement round trips. Ten chunks is a 58 ms
+  stall, several times a second — ~77 ms of frozen title per second, delivered
+  in blocks of 18 to 58 ms, which is what a player feels as micro-freezes
+  rather than as slowdown. The pause and the round trips were 74 % of it, and
+  every loss counter (`g_rx_missed`, `g_rx_overflow`, `g_pbin_rejected`,
+  `g_cdfs_read_retries`) was 0 across 4000 chunks — the acknowledgements were
+  protecting against nothing on that link.
+- **`runtime_pacing()` is 6 packets / 600 µs** (was 10 / 1800, which for a
+  12-packet chunk meant exactly one 1.8 ms pause). Six packets is ~9 KB in
+  front of a 16 KB ring, so it is the safer of the two as well as the cheaper.
+  It is not zero because outrunning the ring does not drop a frame, it desyncs
+  CAPR from CBR and the loader receives nothing further — a wedge that does not
+  recover. `DCLOAD_RT_BURST` / `DCLOAD_RT_DELAY_US` tune it without a rebuild.
+  **Do not shorten it further**, measured 2026-09-20 over 2302 chunks:
+  `g_rx_missed` 0 (the chip never dropped a frame for want of space, so the
+  pacing is adequate) but `g_rx_overflow` 3 and `g_rx_resync` 2 — the ring is
+  at its back-pressure limit already.
+- **What the residual loss actually is, and it is not congestion.** That same
+  session: 2 failed chunks in 2302 (0.09 %), `g_cdfs_read_holes` **0** — no
+  chunk has ever arrived short, so what the title is handed is right — and
+  `g_cdfs_read_fails` 2 = `g_fine_timeouts` 2, i.e. both were the 250 ms
+  deadline with nothing arriving at all, and both retries then succeeded. They
+  line up with `g_rx_resync` 2: a resync is the status-word race of §4.8
+  rule 4, and it **discards the queue**, taking the answer with it. A shorter
+  pause cannot buy that off. What would is ending the wait the moment a resync
+  happens under `g_gd_in_transfer`, instead of sitting out the deadline —
+  250 ms down to ~2 ms — but that is the RX path, which is where the
+  unrecoverable wedges live, for two events per session.
 - **No lazy work on a syscall path.** A zipped track's deflate index takes
   ~130 ms per 17 MiB to build, and until 2026-09-13 the audio tracks' were
   built inside the first CD-DA read of each track, which put a hole in the
@@ -1242,6 +1687,10 @@ What it does that concerns the DC side:
   took Sonic Adventure from 45.6 ms to 1.5 ms of freeze per 16 KB chunk.
 - CD-DA reads are excluded from `game-memory.tsv` (they land in the loader's
   staging buffer).
+- **`MAPL`'s argument block** (port, unit, command, length in LONGWORDS) and the
+  signed response code are the interface `src/vm2.rs` is written against; the
+  reply's `size` is how many bytes `cmd_maple` copied, and is the only length to
+  trust.
 
 ## 17. Sources of truth
 
@@ -1268,6 +1717,7 @@ Code first. Then:
 | `sonic-adventure-investigation.md` | 2026-08-07→10: every cause eliminated, and the footprint root cause. |
 | `cdda-crackle-investigation.md` | 2026-08-29→09-05: the first CD-DA engine (integrator). Transport and AICA measurements still hold. |
 | `cdda-double-buffer-investigation.md` | 2026-09-06→09-12: the current engine brought up on hardware, with a table of what was later superseded. |
+| `wince-investigation.md` | 2026-09-20→27: Sega Rally 2 from black screen to playable -- the three GD doors, virtual buffers, streams, CE's RAM, preemption inside a network exchange, CD-DA under CE, and what the interrupt hook must solve next. |
 | `flycast-debug-loop.md` | the emulator-as-target workflow. |
 | `read-back-verification.md` | what read-back verification proves and does not. |
 | `dreamshell-presets/` | 6168 archived DreamShell presets. |

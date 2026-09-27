@@ -101,33 +101,50 @@
 	.set _gd_park_end, saved_regs_end
 .align 2
 
+! TWO VECTORS, not one. The BIOS publishes the GD driver at 0xac0000bc (with
+! the misc group in front, r6 == -1) and at 0xac0000c0 (the driver alone), and
+! isoldr takes both (gdc_syscall.s). Every Katana title measured calls only
+! 0xbc, so this changes nothing for them; Windows CE's COREDLL names 0xc0.
+! The pair is saved, restored and armed together: the 0xc0 word and its saved
+! copy sit four bytes after their 0xbc counterparts, hence the @(4,rN).
+!
+! There is a THIRD door that no vector covers: the driver body itself, which
+! the vectors point at (0x8c0010f0). Windows CE's GD driver calls it directly,
+! 23 times in Sega Rally 2's 0WINCEOS.BIN, with r6 = 0 and r7 = the index.
+! The host rewrites those literals to _gd_bios_entry (dispatch.rs,
+! gd_body_patches), as isoldr's gdc_syscall_patch() does -- from the host,
+! because overwriting the BIOS's own copy of the driver here would take away
+! the real driver gd_spin_down_drive() needs at the next boot.
 _cdfs_redir_save:
-	mov.l cdfs_saved_k, r0
-	mov.l @r0, r0
+	mov.l cdfs_saved_k, r1
+	mov.l @r1, r0
 	tst r0,r0
 	bf already_saved
-	mov.l cdfs_entry_k, r0
-	mov.l @r0,r0
-	mov.l cdfs_saved_k, r1
+	mov.l cdfs_entry_k, r2
+	mov.l @r2,r0
 	mov.l r0, @r1
+	mov.l @(4,r2),r0
+	mov.l r0, @(4,r1)
 already_saved:
 	rts
 	nop
 
 _cdfs_redir_disable:
-	mov.l cdfs_saved_k, r0
-	mov.l @r0, r0
-	mov.l cdfs_entry_k, r1
-	mov.l r0, @r1
+	mov.l cdfs_saved_k, r1
+	mov.l cdfs_entry_k, r2
+	mov.l @r1, r0
+	mov.l r0, @r2
+	mov.l @(4,r1), r0
 	rts
-	nop
+	mov.l r0, @(4,r2)
 
 _cdfs_redir_enable:
 	mov.l cdfs_entry_k, r0
 	mov.l cdfs_redir_k, r1
 	mov.l r1, @r0
+	mov.l cdfs_redir_c0_k, r1
 	rts
-	nop
+	mov.l r1, @(4,r0)
 
 .align 2
 cdfs_entry_k:
@@ -135,9 +152,12 @@ cdfs_entry_k:
 cdfs_saved_k:
 	.long cdfs_saved
 cdfs_saved:
-	.long 0
+	.long 0		! 0xac0000bc as the BIOS left it
+	.long 0		! 0xac0000c0 as the BIOS left it
 cdfs_redir_k:
 	.long cdfs_redir
+cdfs_redir_c0_k:
+	.long cdfs_redir_c0
 
 ! int gd_lock(void) -- returns 0 when acquired, 1 when already held.
 ! TAS.B sets T when the byte WAS zero, i.e. when we just took it.
@@ -366,11 +386,14 @@ is_live_k:
 ! Syscall entry. r7 selects the function, r6 == -1 marks the non-GD ("misc")
 ! calls that share this vector and that we must not claim.
 !
+	.global _gd_bios_entry
+_gd_bios_entry:
 cdfs_redir:
 	mov #-1, r1
 	cmp/eq r6, r1
 	bt/s misc_syscall
 	mov #0, r6
+cdfs_redir_c0:
 	mov r7,r0
 	mov #18,r1			! 18 entries in gd_first_k below
 	cmp/hi r0,r1			! T = (18 > r7); cmp/hs here would admit 18
@@ -425,6 +448,42 @@ gdGdcCartRead:
 	.long _gdGdcCartRead
 gdGdcUnk4:
 	.long _gdGdcDummy
+
+!
+! void gd_on_loader_stack(void (*fn)(void))
+!
+! Call fn on a stack of the loader's own (the Maple DMA page, P1) and come back
+! to the caller's.
+! A Windows CE title calls the GD driver on a thread stack at a VIRTUAL address:
+! every push there goes through the TLB, and a miss or an uncommitted stack
+! page enters CE's kernel -- which re-enables interrupts and may switch threads
+! -- whatever IMASK the loader set. Caught under flycast (2026-09-27): the GD
+! thread left in the middle of a network exchange with IMASK 15, and the ring
+! overflowed while it was away (docs/wince-investigation.md 7q). P1 has no TLB.
+! The CALLER masks interrupts first: this is one stack for every thread, so
+! nothing may be switched in while it is in use. fn keeps r8-r15 (C ABI).
+!
+! Why the Maple page and not _stack: the loader's own stack region, above
+! _end, holds the big GD stage while a CE title runs (dcload.x.in, .gdstage).
+! The page is 4 KB in both layout families and only a MAPL command uses its
+! first 2 KB -- never while a title runs.
+!
+.globl _gd_on_loader_stack
+.align 2
+_gd_on_loader_stack:
+	mov.l	r14,@-r15
+	sts.l	pr,@-r15
+	mov	r15,r14
+	mov.l	ols_stack_k,r15
+	jsr	@r4
+	nop
+	mov	r14,r15
+	lds.l	@r15+,pr
+	rts
+	mov.l	@r15+,r14
+.align 2
+ols_stack_k:
+	.long	_maple_dma_buffer + 0x1000
 
 !
 ! Coroutine state. Lives in .text (RAM) so the linker initialises it; moving

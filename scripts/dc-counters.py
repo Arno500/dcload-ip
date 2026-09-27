@@ -83,8 +83,9 @@ GROUPS = [
     ]),
     ("GD emulation (cdfs_syscalls.c)", [
         "g_gd_park_longs", "g_gd_idx_counts", "g_gd_cmd_counts",
-        "g_cdfs_read_retries", "g_cdfs_read_fails",
+        "g_cdfs_read_retries", "g_cdfs_read_fails", "g_cdfs_read_holes", "g_cdfs_read_stale",
         "g_cdfs_sync_chunks", "g_cdfs_sync_reentered",
+        "g_gd_spindown",
     ]),
     ("CDDA (cdda.c) -- AGENTS.md 4.13 says what to read first", [
         "g_cdda_plays", "g_cdda_fetches", "g_cdda_fetch_fails",

@@ -598,6 +598,7 @@ static char reg_agg_temp[9] = {0};
 /* Loop doing something interesting */
 void la_bb_loop(int is_main_loop)
 {
+	unsigned int irq_held = bb_irq_hold();
 	int result;
 	int link_change_message = 0;
 	unsigned int loop_start[2] = {0};
@@ -740,4 +741,5 @@ void la_bb_loop(int is_main_loop)
 	DEBUG("bb_loop exited\r\n");
 
 	escape_loop = 0;
+	bb_irq_restore(irq_held);
 }

@@ -368,6 +368,16 @@ ifneq ($(CDDA_DISDL),)
 CFLAGS += -DCDDA_DISDL=$(CDDA_DISDL)
 endif
 
+# Stop the real GD-ROM drive at boot, through the BIOS driver, once the
+# syscall vector has been pointed back at the BIOS. Nothing in a session reads
+# the disc again -- the host serves it -- so the disc that booted 1st_read.bin
+# would otherwise turn until the drive's own firmware parks it, which its mode
+# page does after 180 s of pause (Cdif131e.txt). This makes that immediate and
+# deterministic; a later read spins the drive back up. See gd_spin_down_drive()
+# in cdfs_syscalls.c, and g_gd_spindown for how it went.
+WITH_GD_SPINDOWN ?= 1
+CFLAGS += -DWITH_GD_SPINDOWN=$(WITH_GD_SPINDOWN)
+
 # Serve the PMCR command (host-driven SH4 performance counters). Worth 808
 # bytes. This does NOT remove perfctr.c: dcload uses counter 1 itself for
 # the DHCP lease and for the adapter loops' timeouts. Only the host-facing

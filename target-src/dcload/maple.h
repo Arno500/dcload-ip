@@ -1,5 +1,11 @@
 /* Maple Bus command and response codes */
 
+/* Written into the response header before every DMA cycle, so that "the
+ * controller wrote nothing" is distinguishable from a real answer and from the
+ * -1 the controller itself writes on a timeout. See maple.c. */
+#define MAPLE_NO_REPLY         0xeeeeeeee
+#define MAPLE_RESPONSE_NO_REPLY -18  /* 0xee as a signed response code */
+
 #define MAPLE_RESPONSE_FILEERR -5
 #define MAPLE_RESPONSE_AGAIN   -4  /* request should be retransmitted */
 #define MAPLE_RESPONSE_BADCMD  -3
@@ -44,6 +50,9 @@ struct maple_devinfo {
   unsigned short max_power;       /* little endian */
 };
 
+
+extern unsigned int g_maple_dma_timeouts;
+extern unsigned int g_maple_dma_empty;
 
 void maple_init(void);
 void maple_wait_dma(void);

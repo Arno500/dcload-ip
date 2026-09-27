@@ -43,15 +43,18 @@ static unsigned int echo_suppressed = 0;
 /*
  * Do not echo LoadBinary commands back to the host while set.
  *
- * On the upload and disc-read paths the host waits for the echo before sending
- * any part, so there it is flow control and must stay. The host's audio path
- * (send_audio) sends the whole answer -- LoadBinary, parts, ReturnValue -- in
- * one burst without waiting, so the echo is read by nobody, and transmitting it
- * from inside cmd_loadbin() puts a frame on the wire in the middle of that
- * burst. Failed audio fetches were seen receiving their LoadBinary and one part
- * and then nothing, with no receive errors counted, which is what a collision
- * with that echo would look like. cdda_fetch() therefore sets this for its own
- * wait. g_lbin_noecho counts the echoes skipped.
+ * On the UPLOAD path the host waits for the echo before sending any part, so
+ * there it is flow control and must stay.
+ *
+ * The audio path (send_audio) and, since 2026-09-20, the disc-read path
+ * (send_sectors) both send the whole answer -- LoadBinary, parts, ReturnValue
+ * -- in one burst without waiting. The echo is then read by nobody, and
+ * transmitting it from inside cmd_loadbin() puts a frame on the wire in the
+ * middle of that burst. Failed audio fetches were seen receiving their
+ * LoadBinary and one part and then nothing, with no receive errors counted,
+ * which is what a collision with that echo would look like. cdda_fetch() and
+ * ReadSectors() therefore set this for their own wait, and the two can never
+ * overlap (g_gd_in_transfer). g_lbin_noecho counts the echoes skipped.
  */
 void bin_echo_suppress(unsigned int on)
 {
@@ -785,23 +788,45 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
 	char *res;
-	int i;
+	int i, tries;
 	unsigned char *buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
 	command_t * response = (command_t *)buffer;
 
 	memcpy(response, command, COMMAND_LEN);
 
+	/* MAPLE_RESPONSE_AGAIN is "busy, ask me again", and a VM2/VMUPro answers it
+	 * while it swaps memory-card images (AGENTS.md 8). BOUNDED: an unbounded
+	 * retry is a hardware wait with no deadline sitting in the command loop,
+	 * and a device that never clears would leave the loader deaf with no way
+	 * for the host to recover. The host gets the AGAIN and decides. */
+	tries = 64;
 	do {
 		res = maple_docmd(command->data[0], command->data[1], command->data[2], command->data[3], command->data + 4);
-	} while (*res == MAPLE_RESPONSE_AGAIN);
+	} while ((*res == MAPLE_RESPONSE_AGAIN) && --tries);
 
-	/* Send response back over socket */
-	i = ((res[0] < 0) ? 4 : ((res[3] + 1) << 2));
+	/* Send response back over socket.
+	 *
+	 * res[3] is UNSIGNED: it is the device's own length field, in longwords,
+	 * and `char` is signed on sh-elf. A device claiming 128 or more -- the
+	 * protocol allows up to 255 -- made `i` negative, and SH4_aligned_memcpy
+	 * takes an unsigned length, so that is a four-gigabyte copy out of a 1 KB
+	 * buffer. Cast, and the worst case is the 1024 bytes the receive buffer
+	 * holds, which response->data has room for. */
+	i = ((res[0] < 0) ? 4 : (((unsigned char)res[3] + 1) << 2));
 	response->size = htonl(i);
 	// By aligning the transmit buffer, response->data is always aligned to 8 bytes.
 	// 'res' may or may not be, but if it is, this will be a rocket.
 //	memcpy(response->data, res, i);
-	SH4_aligned_memcpy(to_p1(response->data), to_p1(res), i);
+	/* READ THE RESPONSE THROUGH P2, NOT to_p1(res).
+	 *
+	 * `res` points at the buffer the Maple DMA just wrote, and the SH4's
+	 * operand cache does not snoop DMA. Reading it through P1 was fine exactly
+	 * once: that read left clean lines resident over the receive buffer, and
+	 * every later MAPL command hit them and handed the host the PREVIOUS
+	 * command's response. Probing four ports for a VM2 would report port A's
+	 * device on all of them. Uncached here; the copy is at most 196 bytes on a
+	 * host-driven path. */
+	SH4_aligned_memcpy(to_p1(response->data), (void *)res, i);
 
 	make_ip(ntohl(ip->src), ntohl(ip->dest), UDP_H_LEN + COMMAND_LEN + i, IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
 	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN + i, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));

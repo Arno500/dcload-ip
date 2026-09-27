@@ -26,8 +26,24 @@ extern unsigned int gd_park_end;
 /* The server task itself; entered from the assembly, never returns. */
 void gdcServerMain(void);
 
-/* Claim/refresh the post-mortem block in high RAM. Call once per dcload boot,
- * before anything else can write to it. */
-void cdfs_pm_boot(void);
+/* Run fn on the loader's own stack (cdfs_redir.s). Interrupts must already be
+ * masked: see gd_exchange() in cdfs_syscalls.c. */
+void gd_on_loader_stack(void (*fn)(void));
+
+/* Run fn without a thread switch and, under Windows CE, off the title's
+ * virtual stack (cdfs_syscalls.c). */
+void gd_exchange(void (*fn)(void));
+
+/* Start TMU2, the free-running deadline clock the disc-read deadline and the
+ * GD lock watchdog both measure on. Idempotent; called from main() so it runs
+ * whether or not a title ever plays CD-DA (cdfs_syscalls.c). */
+void gd_deadline_timer_start(void);
+
+/* Put the real GD-ROM drive in <STANDBY> through the BIOS driver, once, at
+ * boot. Only valid after cdfs_redir_save()/cdfs_redir_disable() have pointed
+ * the syscall vector back at the BIOS. Built only when WITH_GD_SPINDOWN=1;
+ * the result is latched in g_gd_spindown (cdfs_syscalls.c). */
+void gd_spin_down_drive(void);
+extern unsigned int g_gd_spindown;
 
 #endif

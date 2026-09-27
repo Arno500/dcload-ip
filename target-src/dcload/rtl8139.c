@@ -1217,6 +1217,7 @@ unsigned int g_rx_missed = 0;
 
 void rtl_bb_loop(int is_main_loop)
 {
+	unsigned int irq_held = bb_irq_hold();
 	unsigned int intr = 0;
 	unsigned int idle_polls = 0;
 	unsigned int loop_start[2] = {0};
@@ -1554,4 +1555,5 @@ void rtl_bb_loop(int is_main_loop)
 		}
 	}
 	escape_loop = 0;
+	bb_irq_restore(irq_held);
 }

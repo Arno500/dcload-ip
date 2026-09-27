@@ -33,12 +33,48 @@ void maple_init()
 
 
 /*
- * Wait for Maple DMA to finish
+ * Wait for Maple DMA to finish.
+ *
+ * BOUNDED (AGENTS.md 4.8: every hardware wait is). This used to spin forever
+ * on a bit the Maple controller owns, in a function the command loop calls
+ * with the network standing still -- a device that wedged the bus took the
+ * loader with it, with no counter to say so.
+ *
+ * The limit is deliberately huge: a Maple cycle is tens of microseconds and
+ * the controller's own timeout is 50000 of its ticks, so nothing healthy comes
+ * close. `g_maple_dma_timeouts` is the only thing that can tell a wedged bus
+ * from a quiet one.
  */
+#define MAPLE_DMA_SPIN_LIMIT 2000000
+
+/* How many times to run a cycle that produced nothing. See maple_docmd(). */
+#define MAPLE_DMA_TRIES 3
+
+/*
+ * How long to wait for the ANSWER, once the controller reports idle.
+ *
+ * The busy bit is not a completion signal you can poll immediately after the
+ * trigger: it may not be set yet, and then the wait above returns at once with
+ * the buffer untouched. KOS never has to care -- it takes the DMA completion
+ * interrupt (maple_dma_irq_hnd) and gates the next burst on dma_in_progress --
+ * but this driver polls, so it needs a positive signal of its own. The answer
+ * itself is that signal, and it always comes: when no device is there the
+ * controller writes -1 into the buffer when its own 50000-tick timeout expires.
+ */
+#define MAPLE_ANSWER_SPIN_LIMIT 2000000
+
+unsigned int g_maple_dma_timeouts = 0;
+unsigned int g_maple_dma_empty = 0;
+
 void maple_wait_dma()
 {
-  while(MAPLE(0x18) & 1)
+  unsigned int spins = MAPLE_DMA_SPIN_LIMIT;
+
+  while((MAPLE(0x18) & 1) && --spins)
     ;
+
+  if(!spins)
+    g_maple_dma_timeouts++;
 }
 
 
@@ -105,8 +141,8 @@ volatile unsigned char *const dmabuffer = (volatile unsigned char *)maple_dma_bu
  */
 void *maple_docmd(int port, int unit, int cmd, int datalen, void *data)
 {
-  unsigned int *sendbuf, *recvbuf;
-  int to, from;
+  unsigned int *sendbuf, *recvbuf, *dmalist;
+  int to, from, tries;
 
   port &= 3;
 
@@ -131,11 +167,12 @@ void *maple_docmd(int port, int unit, int cmd, int datalen, void *data)
   sendbuf =
     (unsigned int *) ((unsigned int)recvbuf + 1024);
 
+  /* Kept, because the three writes below advance `sendbuf` past it and the
+   * cycle may have to be run again. */
+  dmalist = sendbuf;
+
   /* Make sure no DMA operation is currently in progress */
   maple_wait_dma();
-
-  /* Set hardware DMA pointer to beginning of send buffer */
-  MAPLE(0x04) = (unsigned int)sendbuf & 0x0fffffff;
 
   /* Setup DMA data.  Each message consists of two control words followed
      by the request frame.  The first control word determines the port,
@@ -155,24 +192,116 @@ void *maple_docmd(int port, int unit, int cmd, int datalen, void *data)
      because of the Maple Bus big-endianness.                       */
   *sendbuf++ = (cmd & 0xff) | (to << 8) | (from << 16) | (datalen << 24);
 
-  /* Copy parameter data, if any */
+  /* Copy parameter data, if any.
+   *
+   * THROUGH P2, LIKE THE THREE CONTROL WORDS ABOVE.
+   *
+   * This used to copy through P1 and then CacheBlockWriteBack the region, for
+   * the speed of the copy-back area. Two things were wrong with that, and both
+   * only bite a payload longer than one longword -- which nothing in the tree
+   * sent until the VM2/VMUPro game ID (AGENTS.md 8, CMD_MAPLE):
+   *
+   *  1. `datalen` is LONGWORDS (it is shifted into the frame header as such),
+   *     but SH4_aligned_memcpy's third argument is BYTES. It was handed
+   *     `datalen - 1`, so three quarters of the payload never left `data`: a
+   *     12-byte VM2 ID arrived as 3 bytes. The line it replaced in 2025 -- the
+   *     commented-out memcpy just below -- had it right with `datalen << 2`.
+   *
+   *  2. The write-back covered `4*datalen` bytes from the 32-byte block that
+   *     CONTAINS the payload's start, not from the payload's start, so it fell
+   *     up to 12 bytes short whenever 4*datalen was a multiple of 32 (or 24 or
+   *     28 past one). Worse, that first block also holds the three control
+   *     words, which are written through P2: a cache line left resident by the
+   *     previous call is not re-read, so the write-back pushed the PREVIOUS
+   *     call's port, receive address and frame header back over the ones this
+   *     call had just written. Two MAPL commands to different ports in a row
+   *     is all it takes.
+   *
+   * An uncached copy needs neither argument reasoned about. A Maple payload is
+   * at most 1020 bytes and this path is host-driven, so the copy-back area buys
+   * nothing here. sendbuf is 4-byte aligned (base + 1024 + 12) and so is `data`
+   * (pkt_buf is raw_pkt_buf + 2, and command->data + 4 lands on a multiple of
+   * 4), which is all memcpy_32bit asks for.
+   */
   if(datalen > 0)
   {
-//    memcpy(sendbuf, data, datalen << 2); // sendbuf is 32-byte aligned, offset by 12. data is 8-byte aligned, offset by 4 due to port, unit, cmd, & datalen
-    // So memcpy_32bit the first 4 bytes to make it all 8-byte aligned (remaining sendbuf will be 16-byte aligned and remaining data will be 8-byte aligned)
-    memcpy_32bit(sendbuf, data, 4/4);
-    SH4_aligned_memcpy(to_p1((void *)sendbuf + 4), to_p1((void *)data + 4), datalen - 1); // use copy-back memory area for speed boost
-    CacheBlockWriteBack(to_p1((void *)((unsigned int)sendbuf & ~0x1f)), ((datalen * 4) + 31)/32); // Synchronize memory with opcache in 32-byte blocks, sendbuf is already 32-byte aligned
-    // Need to do that so DMA sees the data in memory
+    memcpy_32bit(sendbuf, data, datalen);
   }
 
-  /* Frame is finished, and DMA list is terminated with the flag bit.
-     Time to activate the DMA channel.                                */
-  MAPLE(0x18) = 1;
+  /*
+   * RUN THE CYCLE UNTIL IT PRODUCES SOMETHING, AT MOST MAPLE_DMA_TRIES TIMES.
+   *
+   * A cycle that writes nothing is not the same as a device that says nothing:
+   * the controller writes -1 itself when a device does not answer in time, so
+   * an untouched buffer means the cycle did not happen. Measured 2026-09-20 on
+   * a console with a VMUPro in port A: the first two commands of the session
+   * both came back as the same stale RAM, and every command after them worked.
+   *
+   * Re-running it is the bounded answer to a measurable condition, not a guess
+   * at the cause -- `g_maple_dma_empty` counts how often it was needed, so the
+   * cause stays visible. The DMA list pointer is re-armed each time because the
+   * controller consumes it.
+   *
+   * STAMP THE RESPONSE HEADER BEFORE STARTING THE DMA.
+   *
+   * Nothing clears this buffer, so a cycle in which the controller writes
+   * nothing leaves whatever was in RAM -- and the caller reads it as a Maple
+   * response. That is not theoretical: the first MAPL command of a session
+   * came back as "response 0, 255 longwords", which the loader duly served as
+   * a 1024-byte frame, and there was no way to tell it from a device that had
+   * genuinely said that (measured 2026-09-20, a VMUPro in port A).
+   *
+   * 0xee in the first byte is a negative response code, so a caller that
+   * checks the sign already treats it as a failure, and the host can name it:
+   * "the DMA wrote nothing" is a different fault from -1, "the device did not
+   * answer in time", which the controller itself writes here.
+   */
+  for(tries = MAPLE_DMA_TRIES; tries; tries--)
+  {
+    unsigned int i;
 
-  /* Wait for the complete cycle to finish, so that the response
-     buffer is valid.                                            */
-  maple_wait_dma();
+    /*
+     * CLEAR THE WHOLE BUFFER, as KOS does in maple_frame_init():
+     *   memset(frame->recv_buf, 0, 1024);
+     * A device that answers with a short frame leaves everything past it as it
+     * was, and the caller reads that as part of the answer. Uncached, in a
+     * plain loop: memset_zeroes_64bit() forces its destination to P1, which
+     * would put dirty cache lines over a buffer the Maple DMA writes.
+     */
+    for(i = 0; i < 1024 / 4; i++)
+      recvbuf[i] = 0;
+    *recvbuf = MAPLE_NO_REPLY;
+
+    /* Set hardware DMA pointer to beginning of the send list */
+    MAPLE(0x04) = (unsigned int)dmalist & 0x0fffffff;
+
+    /* Frame is finished, and DMA list is terminated with the flag bit.
+       Time to activate the DMA channel.                                */
+    MAPLE(0x18) = 1;
+
+    /* Idle, as far as the controller is concerned... */
+    maple_wait_dma();
+
+    /* ...and then the answer itself, which is the signal that can be
+       trusted. See MAPLE_ANSWER_SPIN_LIMIT. */
+    i = MAPLE_ANSWER_SPIN_LIMIT;
+    while((*recvbuf == MAPLE_NO_REPLY) && --i)
+      ;
+
+    if(*recvbuf != MAPLE_NO_REPLY)
+      break;
+
+    /*
+     * NEVER RE-TRIGGER ON TOP OF A RUNNING CYCLE. That is what the old code
+     * did whenever the busy bit had not come up yet, and starting a second
+     * Maple cycle over the first is the shape of abuse that leaves devices
+     * unable to answer until they are physically unplugged (reported on
+     * hardware 2026-09-20: after a scan, the console could not see the VMUs
+     * again, not even from the BIOS, until the controller was replugged).
+     */
+    g_maple_dma_empty++;
+    maple_wait_dma();
+  }
 
   /* Return a pointer to the response frame */
   return recvbuf;

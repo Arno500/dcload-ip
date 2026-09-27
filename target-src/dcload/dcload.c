@@ -1032,9 +1032,18 @@ int main(void)
 
 	set_ip_from_file();
 
-	cdfs_pm_boot();
 	cdfs_redir_save(); /* will only save value once */
 	cdfs_redir_disable();
+
+#if WITH_GD_SPINDOWN
+	/*
+	 * The disc is not read again in this session -- the host serves it -- so
+	 * park the drive now instead of letting it turn for the 180 s its own
+	 * firmware waits. AFTER cdfs_redir_disable(), which is what puts the real
+	 * BIOS driver back on the syscall vector this calls through.
+	 */
+	gd_spin_down_drive();
+#endif
 
 #if WITH_MAPLE
 	maple_init();
@@ -1058,6 +1067,17 @@ int main(void)
 #else
 	PMCR_Init(DCLOAD_PMCR, PMCR_ELAPSED_TIME_MODE, PMCR_COUNT_RATIO_CYCLES);
 #endif
+
+	/*
+	 * START THE DEADLINE CLOCK BEFORE ANY TITLE CAN RUN.
+	 *
+	 * TMU2 is what the disc-read deadline and the GD lock watchdog measure on,
+	 * and until 2026-09-20 nothing started it unless a title played CD-DA. A
+	 * title that streams its music as data instead -- Crazy Taxi -- therefore
+	 * had no working read deadline at all: a lost chunk fell through to the
+	 * coarse PMCR backstop and froze the game for 7 s (AGENTS.md 4.5).
+	 */
+	gd_deadline_timer_start();
 
 	while (1) {
 

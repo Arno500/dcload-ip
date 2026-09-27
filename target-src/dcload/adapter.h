@@ -109,6 +109,45 @@ extern volatile unsigned int fine_deadline_ticks;
 extern volatile unsigned int fine_deadline_start;
 extern unsigned int g_fine_timeouts;
 
+/*
+ * NO THREAD SWITCH INSIDE A WAIT (2026-09-27).
+ *
+ * A Katana title's interrupt handlers run on top of us and return. Windows
+ * CE's do not: its timer interrupt enters the scheduler, which runs another
+ * thread -- for a whole quantum -- while this loop is half way through a
+ * wait. Caught under flycast on Sega Rally 2: g_gd_in_transfer 1 with the CPU
+ * in another thread's user code, and 49 reads in a row failed, each with an
+ * RX overflow and a deadline that ran out while the loader was not running at
+ * all (docs/wince-investigation.md 7o). So while the title runs with the MMU
+ * on, the adapter loop runs with IMASK 15. Exceptions still reach the title's
+ * handlers; nothing here takes one. A wait is ~2 ms, 250 ms at worst.
+ */
+static inline unsigned int bb_irq_hold(void)
+{
+	unsigned int sr;
+
+	__asm__ volatile ("stc sr,%0" : "=r" (sr));
+	if ((*(volatile unsigned int *)0xff000010U & 1U) && (~sr & 0xf0U))
+	{
+		__asm__ volatile ("ldc %0,sr" : : "r" (sr | 0xf0U) : "memory");
+		return sr | 1U << 31;	/* SR bit 31 is reserved: "held" */
+	}
+	return 0;
+}
+
+static inline void bb_irq_restore(unsigned int held)
+{
+	if (held)
+	{
+		/* Put back IMASK only; the rest of SR is whatever it is now. */
+		unsigned int sr;
+
+		__asm__ volatile ("stc sr,%0" : "=r" (sr));
+		sr = (sr & ~0xf0U) | (held & 0xf0U);
+		__asm__ volatile ("ldc %0,sr" : : "r" (sr) : "memory");
+	}
+}
+
 /* Diagnostics for the clock-free deadline in rtl_bb_loop. */
 extern unsigned int g_pmcr_backwards;
 extern unsigned int g_idle_polls_max;

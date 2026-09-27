@@ -208,6 +208,8 @@
 #define CDDA_CHECK_FETCHES 13u
 
 #define FETCH_FRAMES       (FETCH_SECTORS * FRAMES_PER_SECTOR)
+/* One sub-fetch of audio in TMU2 ticks (Pck/4 = 12.5 MHz): 44100 Hz. */
+#define CDDA_FETCH_TMU2    (FETCH_FRAMES * 2834u / 10u)
 #define RING_SAMPLES       (CDDA_RING_FETCHES * FETCH_FRAMES)   /* per channel */
 #define RING_BYTES         SAMPLE_BYTES(RING_SAMPLES)
 #define LEAD_FRAMES        (CDDA_LEAD_FETCHES * FETCH_FRAMES)
@@ -359,6 +361,8 @@ static struct {
 
 	/* --- channels: [0] = left, [1] = right --- */
 	unsigned int disdl[2];      /* send level mirrored from the game */
+	unsigned int level_seen;    /* the game has set a CD input level */
+	unsigned int zero_run[2];   /* consecutive reads of a zero level */
 	unsigned int ch_check_ok;   /* the watchdog read back clean at key-on */
 	unsigned int ch_bad_run;    /* consecutive checks that found a theft */
 	unsigned int need_restream; /* channel stolen: start over */
@@ -472,22 +476,11 @@ static void cdda_scale_from_host(unsigned int ppm)
 	}
 }
 
-/* Start TMU2 as the free-running deadline clock unless it already runs as
- * programmed: restarting it between the chunks of a disc read would break the
- * read's deadline and the marks in flight. */
-static void cdda_deadline_timer_start(void)
-{
-	if ((TMU_TSTR & TMU_START_TMU2) != 0u && TMU_TCOR2 == 0xffffffffu
-	    && (TMU_TCR2 & 0x7u) == TMU_TCR_PCK4)
-	{
-		return;
-	}
-	TMU_TSTR = (unsigned char)(TMU_TSTR & ~TMU_START_TMU2);
-	TMU_TCR2 = TMU_TCR_PCK4;
-	TMU_TCOR2 = 0xffffffffu;
-	TMU_TCNT2 = 0xffffffffu;
-	TMU_TSTR = (unsigned char)(TMU_TSTR | TMU_START_TMU2);
-}
+/* The deadline clock is started at boot now and owned by cdfs_syscalls.c, so
+ * that a title which never plays CD-DA still gets a working read deadline --
+ * which is what Crazy Taxi did not have (AGENTS.md 4.5). Kept as a call rather
+ * than dropped: these three sites are the ones that must not run before it. */
+#define cdda_deadline_timer_start() gd_deadline_timer_start()
 
 /* Start TMU1 as the loop clock, in the key-on critical section. The first
  * count starts one lag above TCOR, which cdda_elapsed() reads as "the loop has
@@ -642,6 +635,8 @@ static void aica_channel_mix(unsigned int ch)
 	g2_unlock(sr);
 }
 
+static void cdda_read_game_level(int at_key_on);
+
 /* Every CDDA_CHECK_FETCHES sub-fetches: a theft confirmed twice in a row
  * restarts the stream (a bad read does not persist); a drifted mix is
  * rewritten. Disabled
@@ -665,25 +660,37 @@ static void cdda_check_channels(void)
 		return;
 	}
 	cd.ch_bad_run = 0;
+	cdda_read_game_level(0);
 	aica_channel_mix(CDDA_CH_LEFT);
 	aica_channel_mix(CDDA_CH_RIGHT);
 }
 
 /*
  * Real CD-DA enters the AICA through its CD input, whose level the game sets in
- * 0x2040/0x2044. Mirror the game's EFSDL as our send level (0 = never set =
- * full; clamped to CDDA_DISDL), so a title that turns its CD input down does
- * not get full-scale music summing into clipping. Raise the master volume if,
- * and only if, it is zero.
+ * 0x2040/0x2044. Mirror the game's EFSDL as our send level (clamped to
+ * CDDA_DISDL), so a title that turns its CD input down does not get
+ * full-scale music summing into clipping.
+ *
+ * FOLLOWED, NOT SAMPLED, AND 0 IS A LEVEL (2026-09-27). This read the level
+ * at key-on only and took 0 for "never set" = full. A title that fades its
+ * music by lowering the CD input and starts the next track from 0 then got
+ * the next track at full volume, and a change between two key-ons was
+ * undone by the channel watchdog -- Sega Rally 2 under Windows CE: "the
+ * volume gets reset to the maximum at some random time". Now the watchdog
+ * re-reads it every CDDA_CHECK_FETCHES sub-fetches, and 0 means full only
+ * until the game has set any level at all. A zero must be read twice in a
+ * row before it mutes: AICA reads from the SH4 sometimes return 0 (§4.13
+ * rule 8). The master volume is raised only at key-on and only while the
+ * game has set nothing, i.e. before its sound driver is up.
  */
-static void cdda_read_game_level(void)
+static void cdda_read_game_level(int at_key_on)
 {
 	unsigned int sr = g2_lock();
 	unsigned int mvol = SNDREG32(0x2800);
 	unsigned int in[2];
 	unsigned int i;
 
-	if ((mvol & 0x0fu) == 0u)
+	if (at_key_on && !cd.level_seen && ((mvol & 0x0fu) == 0u))
 	{
 		g2_fifo_wait();
 		SNDREG32(0x2800) = mvol | 0x0fu;
@@ -696,9 +703,18 @@ static void cdda_read_game_level(void)
 	{
 		unsigned int dl = (in[i] >> 8) & 0x0fu;
 
-		if (dl == 0u)
+		if (dl != 0u)
+		{
+			cd.level_seen = 1;
+			cd.zero_run[i] = 0;
+		}
+		else if (!cd.level_seen)
 		{
 			dl = 0x0fu;
+		}
+		else if (++cd.zero_run[i] < 2u)
+		{
+			continue;	/* keep the level until a second zero */
 		}
 		cd.disdl[i] = (dl > (unsigned int)CDDA_DISDL) ? (unsigned int)CDDA_DISDL : dl;
 	}
@@ -749,7 +765,7 @@ static void cdda_channels_start(void)
 {
 	unsigned int sr;
 
-	cdda_read_game_level();
+	cdda_read_game_level(1);
 	cdda_deadline_timer_start();
 	cd.need_restream = 0;
 	cd.ch_bad_run = 0;
@@ -875,6 +891,28 @@ static unsigned int cdda_find_track(unsigned int lba)
 
 /* ------------------------------------------------------------ one sub-fetch */
 
+/* cdda_fetch()'s exchange, run through gd_exchange(): the request is in
+ * pkt_buf and the door is open. */
+static void cdda_exchange(void)
+{
+	build_send_packet(sizeof(command_3int_t));
+	bb->loop(0);
+	/* Shut the door as soon as the wait ends: the extra wait, the drain, the
+	 * listening window and later disc reads then discard stragglers. */
+	g_bin_stage_want = 0;
+	bin_complete_escape(0);
+
+	/* The wait usually ends on the last part (cmd_partbin() sets 0 when the
+	 * window completes) with the ReturnValue processed in the same pass, but
+	 * not always: if the window is complete and the echo is not in yet, wait
+	 * for it under the same deadline. */
+	if ((timeout_loop >= 0) && (syscall_retval == 0u) && bin_window_complete())
+	{
+		syscall_retval = (unsigned int)-1;
+		bb->loop(0);
+	}
+}
+
 /*
  * Fetch `sectors` audio sectors starting at `lba` into the staging buffer.
  * Returns 0 on success, -1 if the answer was late, refused, incomplete or not
@@ -927,23 +965,8 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors)
 	bin_window_close();
 	bin_echo_suppress(1);
 	bin_complete_escape(1);
-	build_send_packet(sizeof(command_3int_t));
-	bb->loop(0);
-	/* Shut the door as soon as the wait ends: the extra wait, the drain, the
-	 * listening window and later disc reads then discard stragglers. */
-	g_bin_stage_want = 0;
-	bin_complete_escape(0);
-
-	/* The wait usually ends on the last part (cmd_partbin() sets 0 when the
-	 * window completes) with the ReturnValue processed in the same pass, but
-	 * not always: if the window is complete and the echo is not in yet, wait
-	 * for it under the same deadline. */
-	if ((timeout_loop >= 0) && (syscall_retval == 0u) && bin_window_complete())
-	{
-		syscall_retval = (unsigned int)-1;
-		bb->loop(0);
-	}
-
+	/* Without a thread switch, off the title's stack (cdfs_syscalls.c). */
+	gd_exchange(cdda_exchange);
 	bin_echo_suppress(0);
 	fine_deadline_ticks = 0;
 	timed_out = (timeout_loop < 0);
@@ -1126,6 +1149,29 @@ static unsigned int cdda_fill(void)
 {
 	unsigned int budget = CDDA_FETCHES_PER_SERVICE;
 	unsigned int did = 0;
+
+	/*
+	 * CATCH UP BY WHAT THE GAP COST, NOT BY A FIXED TWO.
+	 *
+	 * Two sub-fetches a call assumes a call every frame, which a Katana
+	 * title's GetDrvStat gives. Windows CE never calls GetDrvStat: the
+	 * services come from ExecServer, when CE happens to use the drive,
+	 * hundreds of ms apart. Two sub-fetches (107 ms) per call then fell
+	 * behind the AICA, the lead ran out, and the model -- modulo one loop --
+	 * went on reading "full" while the AICA replayed the ring: recorded on
+	 * Sega Rally 2's menu (2026-09-27) as 1.386 s of track 8 repeated with the
+	 * start advancing 0.1135 s each loop (docs/wince-investigation.md 7t).
+	 * Budget the sub-fetches the gap consumed, plus the usual two, up to the
+	 * whole lead. The gap limit (CDDA_GAP_LIMIT_TICKS) still restarts the
+	 * stream if a gap outran the lead itself.
+	 */
+	if (cd.svc_gap > CDDA_FETCH_TMU2)
+	{
+		unsigned int catch_up = cd.svc_gap / CDDA_FETCH_TMU2 + budget;
+
+		budget = (catch_up > (unsigned int)CDDA_LEAD_FETCHES)
+			 ? (unsigned int)CDDA_LEAD_FETCHES : catch_up;
+	}
 
 	while (budget != 0u && cdda_fill_due())
 	{

@@ -273,7 +273,13 @@ def main():
     ap.add_argument("--baseline", type=Path,
                     help="compare against a snapshot instead of the ELF")
     ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--elf", type=Path, default=None,
+                    help="the loader ELF that is actually running; for a "
+                         "host-relocated loader, `dcload-ip-rs relocate "
+                         "loaders/dcload-relocatable.elf <base> -o <file>`")
     args = ap.parse_args()
+    if args.elf:
+        peek.ELF = args.elf
 
     if args.watch <= 0 or args.save_baseline:
         return run(args.host, args.port, args.no_verify,

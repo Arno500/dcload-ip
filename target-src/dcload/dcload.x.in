@@ -209,6 +209,23 @@ SECTIONS
   _end = .;
   PROVIDE (end = .);
 
+  /* THE BIG STAGE: reads into a title's translated addresses (Windows CE),
+   * placed in the loader's own stack region, above _end.
+   *
+   * Only a title running with the MMU on uses it (cdfs_syscalls.c,
+   * gd_stage_big), and by then the loader's main-loop stack -- which lives
+   * here -- is dead: GD syscalls run on the title's stack and the network
+   * exchange on the Maple page (gd_on_loader_stack). A Katana title never
+   * touches it, which matters in the LOW family, where this range is inside
+   * the title's own stack. NOLOAD: not in dcload.bin, not zeroed, and not
+   * counted in _end. The ASSERT below keeps it under _stack. */
+  .gdstage ALIGN(32) (NOLOAD) :
+  {
+    __gdstage_start = .;
+    *(.gdstage)
+    __gdstage_end = .;
+  }
+
   /* Large buffers that must NOT live inside the loader image.
    *
    * Everything above this point sits between 0x8c004000 and _end, and a
@@ -313,6 +330,7 @@ _stack = DCLOAD_STACK;
 ASSERT(( __hiram_end <= DCLOAD_MAPLE ), "Error: .hiram overflows into the Maple DMA buffer: raise the reservation in target-src/dcload/Makefile (and the host's loaders::live_footprint)")
 #endif
 ASSERT(( (_stack - _end) > 800 ), "Error: Not enough stack space: need at least 800 bytes")
+ASSERT(( __gdstage_end <= _stack ), "Error: the big GD stage (.gdstage) does not fit under _stack: lower GD_STAGE_BIG_SECTORS")
 ASSERT(( _end <= (ORIGIN(ram) + LENGTH(ram)) ), "Error: Region 'ram' overflowed: try '-Os' or shrink code size")
 /* For some reason LD's normal overflow checks don't run when sections are
    explicitly aligned, so these asserts are here to make up for it. */
