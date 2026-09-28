@@ -14,6 +14,7 @@
 
 #include "dhcp.h"
 #include "memfuncs.h"
+#include "g2dma.h"
 #include "perfctr.h"
 
 // Here's a datasheet for the FUJITSU MB86967 chip:
@@ -383,6 +384,7 @@ void la_bb_stop(void)
    at a time for transmission, but this is the simple way. */
 int la_bb_tx(unsigned char *pkt, int len)
 {
+	g2dma_quiesce();
 	int i;
 /*	char buffer[16]; */
 
@@ -598,6 +600,7 @@ static char reg_agg_temp[9] = {0};
 /* Loop doing something interesting */
 void la_bb_loop(int is_main_loop)
 {
+	g2dma_quiesce();
 	unsigned int irq_held = bb_irq_hold();
 	int result;
 	int link_change_message = 0;

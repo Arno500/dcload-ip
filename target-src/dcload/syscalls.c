@@ -115,14 +115,7 @@ int write(int fd, const void *buf, size_t count)
 
 	// Version is encoded as (major << 16) | (minor << 8) | patch
 	// Legacy check for version < 2.0.0
-	if(DCTOOL_MAJOR < 2)
-	{ // Legacy version
-		memcpy(command->id, CMD_WRITE_OLD, 4);
-	}
-	else
-	{ // New version
-		memcpy(command->id, CMD_WRITE, 4);
-	}
+	memcpy(command->id, CMD_WRITE, 4);
 
 	command->value0 = htonl(fd);
 	command->value1 = htonl((unsigned int)buf);

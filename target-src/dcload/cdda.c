@@ -63,6 +63,8 @@
 #include "cdfs.h"
 #include "cdda.h"
 #include "hiram.h"
+#include "g2dma.h"
+#include "memfuncs.h"
 
 #if WITH_CDDA
 
@@ -329,7 +331,15 @@ typedef char cdda_assert_lba_fits[
 typedef char cdda_assert_ring_fits[(2u * RING_BYTES < CDDA_RING_TOP) ? 1 : -1];
 
 /* The staging buffer -- one sub-fetch, in .hiram, outside the loader image. */
-HIRAM_BUF static unsigned char cdda_pcm[FETCH_BYTES] __attribute__((aligned(4)));
+#if CDDA_ADPCM
+/* 32-byte aligned, with room for the DMA's alignment shift: the left block is
+ * received at cdda_pcm + a (a < 32, see cdda_push()) and the right one is
+ * moved up to 31 bytes further on. */
+#define STAGE_BYTES        (FETCH_BYTES + 64u)
+#else
+#define STAGE_BYTES        FETCH_BYTES
+#endif
+HIRAM_BUF static unsigned char cdda_pcm[STAGE_BYTES] __attribute__((aligned(32)));
 
 /* The disc's table of contents, cached for the session. */
 static unsigned int cdda_toc[102];
@@ -412,6 +422,7 @@ static unsigned int g2_lock(void)
 	unsigned int sr, tmp;
 	int spin = G2_FIFO_SPIN_LIMIT;
 
+	g2dma_quiesce();		/* no CPU access to G2 over our own DMA */
 	__asm__ __volatile__("stc\tsr,%0\n\t"
 	                     "mov\t%0,%1\n\t"
 	                     "or\t%2,%1\n\t"
@@ -720,6 +731,97 @@ static void cdda_read_game_level(int at_key_on)
 	}
 }
 
+#if CDDA_ADPCM
+/*
+ * G2 DMA WRITES OF THE RING (docs/g2-dma-investigation.md, step 3).
+ *
+ * The bus moves ~7.5 MB/s to the AICA either way (measured on the console: CPU
+ * 336 us, DMA 314 us for 2368 bytes, every channel, no wrong word), so the
+ * gain is not the transfer's length but the CPU: a DMA left running lets the
+ * title execute meanwhile. It needs 32-byte alignment of both ends and a
+ * length in 32s, and a sub-fetch is 1176 bytes at ring offsets that are not:
+ * so the (at most 28-byte) unaligned edges are written by the CPU, before the
+ * DMA starts, and only the aligned body goes by DMA. Nothing outside the
+ * range is touched -- no carried-over bytes, no spill over the ring's end.
+ *
+ * ORDER, because the CPU may not use G2 while one of our DMAs does
+ * (g2dma.h): the edges are written under g2_lock() (which first waits for the
+ * previous DMAs), then both channels start and the caller returns. The next
+ * use of the staging buffer (cdda_fetch), of G2 (g2_lock) or of the adapter
+ * (g2dma_quiesce in the drivers) waits for them first.
+ */
+/* n bytes from `l` and `r` (each already congruent to its destination modulo
+ * 32) to both rings at ring offset `off`; left running. The source lines must
+ * be in RAM. Per ring: the head up to the first 32-byte boundary and the tail
+ * past the last one by the CPU, then the body by DMA. */
+static void cdda_put2(unsigned int off, const unsigned char *l, const unsigned char *r,
+                      unsigned int n)
+{
+	unsigned int d[2], h[2], b[2], k, i, w = 0;
+	const unsigned char *s[2];
+	unsigned int sr;
+
+	/* n is at least two sectors' worth (588 bytes), so a head and a body always
+	 * exist; anything shorter is a bug elsewhere and is not written. */
+	if (n < 64u)
+	{
+		return;
+	}
+	d[0] = AICA_LEFT_BASE + off;
+	d[1] = AICA_RIGHT_BASE + off;
+	s[0] = l;
+	s[1] = r;
+	sr = g2_lock();
+	for (k = 0; k < 2u; k++)
+	{
+		h[k] = (0u - d[k]) & 31u;
+		b[k] = (n - h[k]) & ~31u;
+		for (i = 0; i < n; i += 4u)
+		{
+			if (i == h[k])
+			{
+				i += b[k];
+				if (i >= n)
+				{
+					break;
+				}
+			}
+			if ((w++ & 3u) == 0u)
+			{
+				g2_fifo_wait();
+			}
+			AICA_RAM(d[k] + i) = *(const unsigned int *)(const void *)(s[k] + i);
+		}
+	}
+	g2_unlock(sr);
+	for (k = 0; k < 2u; k++)
+	{
+		g2dma_start(G2DMA_CDDA_L + k, s[k] + h[k], 0x00800000u + d[k] + h[k],
+		            b[k], G2DMA_TO_G2);
+	}
+}
+
+/* Write the quiet floor over `bytes` bytes of both rings from byte `off`, so
+ * audio that has not arrived plays as silence. The staging buffer is the
+ * source, filled with the idle byte; a chunk is at most half a sub-fetch, so
+ * that its shift by the destination's alignment stays inside the buffer. Left
+ * running. */
+static void cdda_floor(unsigned int off, unsigned int bytes)
+{
+	unsigned int *w = (unsigned int *)(void *)cdda_pcm;
+	unsigned int i;
+
+	g2dma_quiesce();
+	for (i = 0; i < STAGE_BYTES / 4u; i++)
+	{
+		w[i] = IDLE_WORD;
+	}
+	CacheBlockWriteBack(cdda_pcm, (STAGE_BYTES + 31u) / 32u);
+	/* At most half a sub-fetch: the drain's cell. */
+	cdda_put2(off, cdda_pcm + ((AICA_LEFT_BASE + off) & 31u),
+	          cdda_pcm + ((AICA_RIGHT_BASE + off) & 31u), bytes);
+}
+#else
 /* Write the quiet floor over `bytes` bytes of both rings from byte `off`, so
  * audio that has not arrived plays as silence. 256 bytes per lock. */
 static void cdda_floor(unsigned int off, unsigned int bytes)
@@ -743,6 +845,7 @@ static void cdda_floor(unsigned int off, unsigned int bytes)
 		g2_unlock(sr);
 	}
 }
+#endif
 
 /* The same, `frames` frames from ring position `pos`, wrapping at the end. */
 static void cdda_floor_frames(unsigned int pos, unsigned int frames)
@@ -935,12 +1038,14 @@ static void cdda_exchange(void)
  *    fetch waits for one (the "door", g_bin_stage_*);
  *  - after a failure, a drain consumes whatever is still on its way.
  */
-static int cdda_fetch(unsigned int lba, unsigned int sectors)
+static int cdda_fetch(unsigned int lba, unsigned int sectors, unsigned int stage_off)
 {
 	command_3int_t *command =
 		(command_3int_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
 	int timed_out;
+	unsigned char *stage = cdda_pcm + stage_off;
 
+	g2dma_quiesce();	/* the last push's DMA reads this buffer */
 #if CDDA_ADPCM
 	/* Bit 31 resets the host's encoder: set on the first fetch after a key-on,
 	 * the only thing that resets the AICA's decoder. */
@@ -952,7 +1057,7 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors)
 	command->value2 = htonl(sectors * RAW_SECTOR_SIZE);
 #endif
 	command->value0 = htonl(lba);
-	command->value1 = htonl((unsigned int)cdda_pcm);
+	command->value1 = htonl((unsigned int)stage);
 
 	syscall_retval = (unsigned int)-1;
 	timeout_loop = CDDA_TIMEOUT_SECONDS;
@@ -960,8 +1065,8 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors)
 	fine_deadline_ticks = CDDA_FETCH_DEADLINE_TICKS;
 	/* Open the door for this answer only. */
 	g_bin_stage_lo = (unsigned int)cdda_pcm;
-	g_bin_stage_hi = (unsigned int)cdda_pcm + FETCH_BYTES;
-	g_bin_stage_want = (unsigned int)cdda_pcm;
+	g_bin_stage_hi = (unsigned int)cdda_pcm + STAGE_BYTES;
+	g_bin_stage_want = (unsigned int)stage;
 	bin_window_close();
 	bin_echo_suppress(1);
 	bin_complete_escape(1);
@@ -1011,16 +1116,49 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors)
 	return 0;
 }
 
+#if CDDA_ADPCM
+#define CDDA_STAGE_OFF(pos) cdda_stage_off(pos)
+/* Where in the staging buffer a sub-fetch written at write head `pos` is
+ * received: congruent to its left destination modulo 32. */
+static unsigned int cdda_stage_off(unsigned int pos)
+{
+	return (AICA_LEFT_BASE + SAMPLE_BYTES(pos)) & 31u;
+}
+
+/*
+ * The host sends the left block at `stage`, then the right one right after it,
+ * at frames / 2 (not the middle of the buffer: a short sub-fetch at the end of
+ * a range would otherwise leave the right ear stale bytes and a
+ * desynchronised decoder at every loop of a repeating track). The right block
+ * is then moved forward, at most 31 bytes, to where it is congruent to the
+ * right ring's destination: a CPU copy in RAM of ~1 KB, and the lines written
+ * back for the DMA.
+ */
+static void cdda_push(unsigned int base_sample, unsigned int frames)
+{
+	unsigned int off = SAMPLE_BYTES(base_sample);
+	unsigned int n = SAMPLE_BYTES(frames);
+	unsigned char *l = cdda_pcm + cdda_stage_off(base_sample);
+	unsigned char *r = l + n;
+	unsigned int shift = ((AICA_RIGHT_BASE + off) - (unsigned int)r) & 31u;
+	unsigned int *d = (unsigned int *)(void *)(r + shift + n);
+	const unsigned int *e = (const unsigned int *)(const void *)(r + n);
+
+	while (e > (const unsigned int *)(const void *)r)
+	{
+		*--d = *--e;
+	}
+	/* Every line of the buffer: the left ones are clean already. */
+	CacheBlockWriteBack(cdda_pcm, (STAGE_BYTES + 31u) / 32u);
+	cdda_put2(off, l, r + shift, n);
+}
+#else
+#define CDDA_STAGE_OFF(pos) 0u
 /*
  * Copy the staging buffer into both rings at sample `base_sample`, one 32-bit
- * store per channel per step: eight samples in ADPCM, two interleaved frames in
- * PCM. A FIFO wait every four steps keeps to the eight-write rule. A sub-fetch
- * is truncated at the end of the ring, so nothing wraps.
- *
- * In ADPCM the host sends the left block, then the right one right after it:
- * at frames / 2, not at the middle of the buffer. They differ for the short
- * sub-fetch at the end of a range, where the right ear used to get stale bytes
- * -- and a desynchronised decoder -- at every loop of a repeating track.
+ * store per channel per step: two interleaved frames in PCM. A FIFO wait every
+ * four steps keeps to the eight-write rule. A sub-fetch is truncated at the
+ * end of the ring, so nothing wraps.
  */
 static void cdda_push(unsigned int base_sample, unsigned int frames)
 {
@@ -1028,21 +1166,6 @@ static void cdda_push(unsigned int base_sample, unsigned int frames)
 	unsigned int off = SAMPLE_BYTES(base_sample);
 	unsigned int end = off + SAMPLE_BYTES(frames);
 	unsigned int k;
-#if CDDA_ADPCM
-	const unsigned int *l = (const unsigned int *)(const void *)cdda_pcm;
-	const unsigned int *r =
-		(const unsigned int *)(const void *)(cdda_pcm + SAMPLE_BYTES(frames));
-
-	for (k = 0; off < end; k++, off += 4u)
-	{
-		if ((k & 3u) == 0u)
-		{
-			g2_fifo_wait();
-		}
-		AICA_RAM(AICA_LEFT_BASE + off) = *l++;
-		AICA_RAM(AICA_RIGHT_BASE + off) = *r++;
-	}
-#else
 	const unsigned int *f = (const unsigned int *)(const void *)cdda_pcm;
 
 	for (k = 0; off < end; k++, off += 4u)
@@ -1057,9 +1180,9 @@ static void cdda_push(unsigned int base_sample, unsigned int frames)
 		AICA_RAM(AICA_LEFT_BASE + off) = (f0 & 0xffffu) | (f1 << 16);
 		AICA_RAM(AICA_RIGHT_BASE + off) = (f0 >> 16) | (f1 & 0xffff0000u);
 	}
-#endif
 	g2_unlock(sr);
 }
+#endif
 
 /* ------------------------------------------------------------ fill the ring */
 
@@ -1198,7 +1321,8 @@ static unsigned int cdda_fill(void)
 		}
 		else
 		{
-			if (cdda_fetch(cd.next_lba, sectors) < 0 || aica_dma_busy())
+			if (cdda_fetch(cd.next_lba, sectors, CDDA_STAGE_OFF(cd.write_pos)) < 0
+			    || aica_dma_busy())
 			{
 				break;
 			}
@@ -1241,7 +1365,13 @@ static void cdda_prime(void)
 	cd.restart = 1;
 	cdda_channels_stop();
 	cdda_deadline_timer_start();
+#if !CDDA_ADPCM
 	cdda_floor(0, RING_BYTES);
+#endif
+	/* ADPCM: no floor over the ring. The lead is laid, with audio or with the
+	 * floor (cdda_fill's drain), before the channels key on, and what follows is
+	 * laid before the AICA gets there -- the mute covers a service that is late.
+	 * It was the whole ring, 61 KB of CPU writes: ~9 ms with the title frozen. */
 	cd.priming = 1;
 }
 

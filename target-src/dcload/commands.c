@@ -23,7 +23,6 @@ unsigned short tool_port = 0;
 unsigned int tool_version = 0;
 
 static unsigned int cached_dest = 0;
-static int payload1024 = 0;
 
 /*
  * Transfer accounting, for the one read Sonic Adventure never completes.
@@ -256,31 +255,17 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	g_last_load_addr = bin_info.load_address;
 	g_last_load_size = bin_info.load_size;
 
-	// Legacy check for versions < 2.0.0
-	if(DCTOOL_MAJOR < 2)
+	// Only dc-tool 2.x and later: 1440-byte payloads (the legacy 1024-byte
+	// mode was removed, AGENTS.md 4.3).
+	// Max size check (16MB, RAM size)
+	if(bin_info.load_size > 16777216)
 	{
-		if(bin_info.load_size > (BIN_INFO_MAP_SIZE*1024))
-		{
-			// Send error, exit, and bail
-			write(1, "ERROR: Size >11656KB (legacy mode)\r\n", 37);
-			dcexit();
-			bb->start(); // dcexit calls RX stop, so need to re-enable that
+		// Send error, exit, and bail
+		write(1, "ERROR: Size >16MB\r\n", 20);
+		dcexit();
+		bb->start(); // dcexit calls RX stop, so need to re-enable that
 
-			return;
-		}
-	}
-	else
-	{
-		// Max size check (16MB, RAM size)
-		if(bin_info.load_size > 16777216)
-		{
-			// Send error, exit, and bail
-			write(1, "ERROR: Size >16MB\r\n", 20);
-			dcexit();
-			bb->start(); // dcexit calls RX stop, so need to re-enable that
-
-			return;
-		}
+		return;
 	}
 
 	// Zero out the received packet map
@@ -302,16 +287,6 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	else
 	{
 		cached_dest = 0;
-	}
-
-	// Set up partbin to have as small a conditional as possible
-	if(DCTOOL_MAJOR < 2)
-	{
-		payload1024 = 1;
-	}
-	else
-	{
-		payload1024 = 0;
 	}
 
 	if (echo_suppressed)
@@ -464,15 +439,7 @@ void cmd_partbin(command_t * command)
 	// Ensure physical memory is actually written to from the cache, since we don't know how it might be used.
 	// Purge instead of writeback to avoid cache conflicts/trashing.
 
-	// Legacy check for versions < 2.0.0
-	if(__builtin_expect(payload1024, 0))
-	{
-		index = (cmd_addr - bin_info.load_address) / 1024; // /1024 = >> 10
-	}
-	else
-	{
-		index = (cmd_addr - bin_info.load_address) / 1440; // /1440 = 64-bit multiplication trick
-	}
+	index = (cmd_addr - bin_info.load_address) / 1440; // /1440 = 64-bit multiplication trick
 	if ((unsigned int)index >= BIN_INFO_MAP_SIZE)
 	{
 		g_pbin_rejected++;
@@ -505,16 +472,8 @@ void cmd_donebin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	// Need to hardcode these divides so that GCC can optimize them out (and
 	// thankfully it is able to do so in these two scenarios, as it can convert
 	// them into 64-bit multiplication)
-	if(DCTOOL_MAJOR < 2)
-	{
-		map_index_verify = (bin_info.load_size + 1023) / 1024;
-		payload_size = 1024;
-	}
-	else
-	{
-		map_index_verify = (bin_info.load_size + 1439) / 1440;
-		payload_size = 1440;
-	}
+	map_index_verify = (bin_info.load_size + 1439) / 1440;
+	payload_size = 1440;
 
 	g_dbin_count++;
 	for(i = 0; i < map_index_verify; i++)
@@ -588,16 +547,8 @@ void cmd_sendbinq(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	// Need to hardcode these divides so that GCC can optimize them out (and
 	// thankfully it is able to do so in these two scenarios, as it can convert
 	// them into 64-bit multiplication)
-	if(DCTOOL_MAJOR < 2)
-	{
-		payload_size = 1024;
-		numpackets = (bytes_left + 1023) / 1024;
-	}
-	else
-	{
-		payload_size = 1440;
-		numpackets = (bytes_left + 1439) / 1440;
-	}
+	payload_size = 1440;
+	numpackets = (bytes_left + 1439) / 1440;
 
 	unsigned int ip_src = ntohl(ip->src);
 	unsigned short udp_src = ntohs(udp->src);
@@ -686,19 +637,7 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	// was added when packet sizes switched to 1440 bytes of payload data)
 	tool_version = ntohl(command->address);	// This global variable is used in the major/minor/patch version macros.
 
-	// Legacy check for >= 2.0.0
-	if(DCTOOL_MAJOR >= 2)
-	{
-		// New versions of the program get the syscall port from dctool instead of hardcoding 31313.
-		// That way if standards ever change, this program won't have to and the dctool server will deal with it.
-		// This global variable is initted to the legacy port by default, so if dctool is old it'll still work, too.
-		dcload_syscall_port = ntohs(udp->dest);
-	}
-	else
-	{
-		// In case dc-tool -l is used after a non-legacy usage
-		dcload_syscall_port = 31313;
-	}
+	dcload_syscall_port = ntohs(udp->dest);
 
 	datalength = strlen("dcload-ip " DCLOAD_VERSION " using "); // no '+1' because adapter name will be appended
 	memcpy(response, command, COMMAND_LEN);

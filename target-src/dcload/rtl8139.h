@@ -122,4 +122,8 @@ void rtl_bb_stop(void);
 int rtl_bb_tx(unsigned char * pkt, int len);
 void rtl_bb_loop(int is_main_loop);
 
+/* irq_tick is running under the interrupt hook: a frame may be DMA'd, nothing waits
+ * (rtl8139.c, docs/g2-dma-investigation.md). */
+extern volatile unsigned int g_rx_dma_tick;
+
 #endif

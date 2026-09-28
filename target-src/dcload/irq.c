@@ -35,6 +35,7 @@
 #include "cdfs.h"
 #include "cdda.h"
 #include "rtl8139.h"
+#include "g2dma.h"
 
 #if WITH_IRQ_HOOK
 
@@ -92,11 +93,20 @@ volatile unsigned int g_irq_iml[9];		/* the title's IML2/4/6 NRM,EXT,ERR at inst
 #define EXT_BBA    8U
 static volatile unsigned int *rx_iml;
 
+/* Holly NRM bit of the end of G2 DMA channel 1, the BBA's: the RX DMA of
+ * rtl8139.c (9s). */
+#define RX_DMA_END (1U << 16)
+
+/* 0 = neither, 1 = the chip's RX interrupt (a chunk is on the wire), 2 = the end
+ * of a frame's DMA instead (the chip's would re-enter at once while the DMA
+ * runs; arming both, with the chip's status acknowledged first, was measured on
+ * the console and was worse: docs/g2-dma-investigation.md). */
 void irq_rx_arm(unsigned int on)
 {
 	if (rx_iml && g_irq_hooked)
 	{
-		rx_iml[1] = (rx_iml[1] & ~EXT_BBA) | (on ? EXT_BBA : 0U);
+		rx_iml[0] = (rx_iml[0] & ~RX_DMA_END) | (on == 2U ? RX_DMA_END : 0U);
+		rx_iml[1] = (rx_iml[1] & ~EXT_BBA) | (on == 1U ? EXT_BBA : 0U);
 	}
 }
 
@@ -220,15 +230,30 @@ void irq_tick(void)
 
 	g_irq_ticks++;
 	g_irq_evt_last = INTEVT;
-	if (g_irq_evt_last == g_irq_rx_evt && (SB_IST(1) & EXT_BBA))
+	g_rx_dma_tick = (rx_iml != 0);	/* rtl8139.c: a frame may be DMA'd, nothing waits */
+	if (rx_iml && (SB_IST(0) & RX_DMA_END))
 	{
-		/* Swallowed only when the chip was pending and nothing of the
-		 * title's is: an entry we did not cause always reaches the title,
-		 * or a source of its own would re-enter here forever (9q). */
-		rtl_irq_ack();
+		/* The end of our DMA usually arrives on the TITLE's level: Katana titles
+		 * arm bits 12..18 of IML4's NRM mask, Ext1's DMA end (16) among them
+		 * (AGENTS.md 4.16). Such an entry must not fall into the "looked a
+		 * moment ago" limit below: a finished DMA is a reason to look now.
+		 * rx_settle() clears the bit when it finishes the frame. */
+		read_mark = t0 + IRQ_READ_PERIOD;
+	}
+	if (g_irq_evt_last == g_irq_rx_evt && ((SB_IST(1) & EXT_BBA) || (SB_IST(0) & RX_DMA_END)))
+	{
+		/* Swallowed only when the chip -- or the DMA -- was pending and
+		 * nothing of the title's is: an entry we did not cause always
+		 * reaches the title, or a source of its own would re-enter here
+		 * forever (9q). */
+		if (SB_IST(1) & EXT_BBA)
+		{
+			rtl_irq_ack();
+		}
+		SB_ISTNRM = RX_DMA_END;		/* w1c: the line falls, whatever else this tick does */
 		g_irq_rx++;
 		read_mark = t0 + IRQ_READ_PERIOD;	/* look at the read now */
-		g_irq_swallow = !((SB_IST(0) & rx_iml[0])
+		g_irq_swallow = !((SB_IST(0) & rx_iml[0] & ~RX_DMA_END)
 				  | (SB_IST(1) & rx_iml[1] & ~EXT_BBA)
 				  | (SB_IST(2) & rx_iml[2]));
 	}
@@ -255,6 +280,7 @@ void irq_tick(void)
 	}
 #endif
 
+	g_rx_dma_tick = 0;
 	dt = t0 - TMU2_COUNT;
 	g_irq_tick_sum += dt;
 	if (dt > g_irq_tick_max)

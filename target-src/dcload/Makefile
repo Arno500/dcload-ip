@@ -54,7 +54,11 @@ INCLUDE	= -I../../target-inc
 #
 #                              base + 0x0000  image (text/rodata/data/bss)
 #                              base + …       stack, descending from _stack
-#                              base + 0xb000  _stack (dcload's own)
+#                              base + 0xbc00  _stack (dcload's own; 0xb000 until 2026-09-28, moved up
+#                                             to make room for the G2 DMA work -- kept
+#                                             1 KB under .hiram so that no symbol value
+#                                             is both, the host's relocator classifies
+#                                             words by value)
 #                              base + 0xc000  .hiram buffers (12 KB)
 #                              base + 0xf000  Maple DMA buffer (2 KB)
 #
@@ -94,7 +98,7 @@ ifeq ($(DCLOAD_IS_LOW),1)
   DCLOAD_HIRAM ?= 0x8cfe9000
   DCLOAD_MAPLE ?= 0x8cfe8000
 else
-  DCLOAD_STACK ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xb000 )))
+  DCLOAD_STACK ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xbc00 )))
   DCLOAD_HIRAM ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xc000 )))
   DCLOAD_MAPLE ?= $(shell printf '0x%08x' $$(( $(DCLOAD_BASE) + 0xf000 )))
 endif
@@ -403,6 +407,18 @@ CFLAGS += -DWITH_IRQ_HOOK=$(WITH_IRQ_HOOK)
 GD_ASYNC_KATANA ?= 1
 CFLAGS += -DGD_ASYNC_KATANA=$(GD_ASYNC_KATANA)
 
+# G2 DMA bench (g2bench.c, docs/g2-dma-investigation.md step 0): at boot,
+# measures which DMA channels reach the BBA's SRAM and the AICA on this
+# console, and runs a torture round (CPU PIO on the AICA while two DMAs are
+# in flight). Results in g_bench[]. Diagnostic: costs bytes, keep it 0 in a
+# build that ships.
+G2DMA_BENCH ?= 0
+CFLAGS += -DG2DMA_BENCH=$(G2DMA_BENCH)
+ifeq ($(G2DMA_BENCH),1)
+# The bench's ~1.2 KB would push .gdstage past _stack: two sectors less of it.
+CFLAGS += -DGD_STAGE_BIG_SECTORS=2
+endif
+
 OBJCOPY	= $(TARGETOBJCOPY)
 READELF	= $(TARGETREADELF)
 
@@ -411,7 +427,11 @@ ifeq ($(WITH_LAN_ADAPTER),1)
   DCLOBJECTS += lan_adapter.o
 endif
 ifeq ($(WITH_CDDA),1)
-  DCLOBJECTS += cdda.o
+  DCLOBJECTS += cdda.o g2dma.o
+endif
+
+ifeq ($(G2DMA_BENCH),1)
+  DCLOBJECTS += g2bench.o
 endif
 
 ifeq ($(WITH_MAPLE),1)

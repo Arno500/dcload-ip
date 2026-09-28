@@ -166,6 +166,8 @@ Compiler flags disable everything that could move code behind your back:
 | `memfuncs.c/.h`, `memcpy.S`, `memcmp.c` | aligned mem* fast paths. |
 | `maple.c/.h` | Maple bus driver; its DMA buffer is outside the image (§4.4). |
 | `cdda.c/.h` | CD-DA playback (§4.13). The header of `cdda.c` is the design description. |
+| `g2dma.c/.h` | the four G2 DMA channels by polling, `g2dma_quiesce()` (§4.16). |
+| `g2bench.c` | `G2DMA_BENCH=1` only: what G2 DMA does on a console, with a torture round (§4.16). |
 | `cdfs.h`, `cdfs_redir.s`, `cdfs_syscalls.c` | GD-ROM emulation (§4.5); also the boot-time drive spin-down (§4.14). Both carry explanatory headers. |
 | `syscalls.c/.h` | host syscalls `DC00`–`DC24` (§8). |
 | `commands.c/.h` | the command dispatcher and the LoadBinary window (`bin_info`). |
@@ -211,6 +213,7 @@ WITH_PMCR_CMD=0` gives `0x8c00b200`; adding `DCLOAD_LTO=1` gives `0x8c00a8c0`.
 | `GUEST_CACHES_ON` | Hand the title CCR `0x0909` instead of `0x0808`. |
 | `GUEST_IRQ_MASKED` | Hand SR with IMASK=15. Diagnostic only (go.S). |
 | `DCLOAD_CLEAR_IPBIN`, `DCLOAD_ZERO_GAME_RAM` | Clear the IP.BIN region / the title's RAM at start-up, as a real boot would. Faithfulness only (`CLEAR_IPBIN` changed nothing on SA2). |
+| `G2DMA_BENCH` | At boot, measure which G2 DMA channels reach the BBA's SRAM and the AICA, and run a torture round (§4.16); results in `g_bench[]` and on screen. Forces `GD_STAGE_BIG_SECTORS=2`. Costs ~1.2 KB: never in a shipped set. |
 | `DCLOAD_EMIT_RELOCS` | `ld -q`: keep relocations (used by `make loaders`). Loaded bytes unchanged. |
 
 In `rtl8139.c`: `RTL_WARM_START` (1) — adopt a BBA a previous dcload brought
@@ -450,10 +453,11 @@ the exchange mask and stack switch, retries, CD-DA level follow and catch-up)
 put the tree at `_end = 0x8c00c434`, and the interrupt hook (§4.15, phase 1)
 at `_end = 0x8c00c7ec`, and the asynchronous reads (phase 3) at **`_end =
 0x8c00ce78`, 3704 B over** (2026-09-28, with `WITH_GD_SPINDOWN=0` and `WITH_PMCR_CMD=0`). The HIGH family has a bound of its own:
-`.gdstage` must end under `_stack` (`base+0xb000`). Phase 3 spent
+`.gdstage` must end under `_stack` (`base+0xbc00` since 2026-09-28; it was
+`+0xb000`, and the 3 KB moved are what paid for §4.16). Phase 3 spent
 `GD_STAGE_BIG_SECTORS` 5 → 4 to fit (the stage is now 8 KB), which leaves
-`_end` up to `base+0x9000` -- **352 B left** (after 9r; 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default). The next lever is
-`WITH_GD_SPINDOWN=0` (160 B). The deployed
+`_end` up to `base+0x9c00` -- **~2 KB left** after the G2 DMA work (`_end` =
+`base+0x9310`, default flags; before it, 352 B). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. The deployed
 `loaders/` is still the `0x8c00c000` build; deploying the current one loses
 the low base to painted titles as described below. The user's decision
 (2026-09-21) is that this is acceptable where it has to happen: the host
@@ -585,8 +589,11 @@ loader there before uploading the title. Things this must not break:
    `0x8c00f400` for every base, as isoldr does. Each loader ELF carries
    `exception.bin` as a `.guestvbr` section at that address.
 3. **Two layout families.** LOW (base < `0x8c010000`): stock layout, only
-   ORIGIN moves. HIGH: relative to the base — stack top `+0xb000`, `.hiram`
-   `+0xc000` (12 KB), Maple DMA `+0xf000`, span `0x10000`.
+   ORIGIN moves. HIGH: relative to the base — stack top `+0xbc00` (`+0xb000`
+   before 2026-09-28; the host's `loaders::layout()` mirrors it, and it stays
+   1 KB under `.hiram` so that no symbol value is both, the relocator
+   classifies words by value), `.hiram` `+0xc000` (12 KB), Maple DMA `+0xf000`,
+   span `0x10000`.
 4. **A low loader's buffers are at `0x8cfe8000`/`0x8cfe9000`**, so chainloading
    directly to a `0x8cfe8000` base writes over the running loader's packet
    buffers: the transfer "succeeds" and the new loader is deaf. The host always
@@ -777,8 +784,17 @@ to 2026-09-05) and `docs/cdda-double-buffer-investigation.md` (this engine,
 5. A fetch is complete only on its own window: close it before the request.
 6. Measure with the true model; trigger with the lagged one. The lead is
    modulo one loop, so anything that could outlast it is judged on TMU2.
-7. All AICA access inside `g2_lock()`, with a FIFO wait at most every eight
-   32-bit stores (bounded at ~2 ms).
+7. All AICA access by the CPU inside `g2_lock()`, with a FIFO wait at most
+   every eight 32-bit stores (bounded at ~2 ms). `g2_lock()` first waits for
+   the ring's own DMA (`g2dma_quiesce()`, §4.16), and the ring is written by
+   DMA in ADPCM: the unaligned edges (at most 28 bytes a side) by the CPU, the
+   32-byte-aligned body on channels 2 (left) and 3 (right), left running when
+   `cdda_push()` returns. The staging buffer is `STAGE_BYTES` (`FETCH_BYTES` +
+   64), 32-aligned, the left block received at `cdda_pcm + a` (`a` = the left
+   destination modulo 32) and the right one moved up to 31 bytes on to be
+   congruent to its own. `cdda_prime()` no longer floors the whole ring (61 KB
+   of CPU writes, ~9 ms of frozen title); the drain floors one cell, by DMA.
+   `CDDA_ADPCM=0` keeps the old CPU writes.
 8. AICA reads from the SH4 sometimes return `0x00000000`: an implausible zero
    is a failed read.
 9. No variable divisors (libgcc's divider costs ~1 KB, §14.15).
@@ -1219,6 +1235,82 @@ gaps; measure first).
 - In a dump, `pc` is SPC, and an exception taken in a delay slot sets SPC to
   the **branch** before it: a `pc` on a `bra` means the fault is at `pc+2`.
 
+### 4.16 G2 DMA: the CPU stays free while the bus moves the bytes
+
+Established 2026-09-28/29 (`docs/g2-dma-investigation.md`). Everything the
+loader used to move over G2 with the CPU -- the BBA's RX ring, read a word at a
+time (~94 us a frame, the CPU waiting on the bus), and the CD-DA rings, written
+the same way -- now goes by DMA where a title is running, so the title executes
+meanwhile. **The bus is the limit, not the CPU**: measured on the console, 1536
+bytes from the BBA take 99 us by CPU and 94 us by DMA; 2368 bytes to the AICA
+336 us and 314 us. What is gained is CPU, not transfer time.
+
+- **Channels.** 0 is the title's sound driver, 1 the BBA's (KOS's choice; the RX
+  DMA), 2 and 3 the CD-DA ring's left and right. All four reach the AICA and the
+  BBA's SRAM with no wrong word, also with the CPU writing the AICA meanwhile
+  (`G2DMA_BENCH=1`, the torture round; positive control included). Registers:
+  `g2dma.h`. `G2APRO` is written on each start; TSEL 4 (CPU trigger, suspend
+  honoured).
+- **Rule: the CPU never uses G2 over the loader's own DMA.** Every entry point
+  that does calls `g2dma_quiesce()` (CD-DA channels) and, in `rtl8139.c`,
+  `rx_settle(1)`, first: `g2_lock()`, `cdda_fetch()`, `rtl_bb_tx/start/stop/
+  irq_ack/loop`, `la_bb_tx/loop`. Bounded (~2 ms), and a channel that will not
+  end is aborted (`g_g2dma_timeouts`, must stay 0).
+- **CD-DA** (§4.13 rule 7): edges by CPU, body by DMA on 2 and 3, left running.
+- **RX under the interrupt hook, Katana titles only** (`rx_iml` set: the BBA's
+  own interrupt level exists): a long frame whose first 64 bytes -- read by the
+  CPU, 4 us -- are a PBIN for us (`rx_is_pbin()`) is copied by DMA into
+  `raw_current_pkt` (`rx_dma_start()`), the ring not advanced, and the tick
+  returns to the title. The frame is processed (`process_pkt`, `rx_advance`)
+  when the DMA is over, by `rx_settle()`. Anything else, and everything outside
+  the tick or under Windows CE (no RX interrupt to wake it), is copied as
+  before. Processing a PBIN never transmits, so it can be finished from any
+  context; `rx_settle(1)` (wait) is in every entry point above, `rx_settle(0)`
+  (leave a running DMA alone) at the top of `rtl_bb_loop()` and `rtl_bb_rx()`.
+- **THE END OF OUR DMA REACHES US ON THE TITLE'S LEVEL.** Katana titles arm
+  bits 12..18 of IML4's NRM mask (Crazy Taxi: `0x7f000`, `g_irq_iml`), Ext1's DMA
+  end (bit 16) among them, so the interrupt is taken as IML4 (evt `0x360`) and
+  never as our IML2 (`0x3a0`). It used to be dropped by the tick's "a read was
+  looked at a moment ago" limit (`IRQ_READ_PERIOD`), the frame waited for the
+  next interrupt of the title's (~1.6 ms, one frame per entry) and a load ran at
+  ~0.7 MiB/s with the tick never finishing a chunk. `irq_tick()` now takes a
+  finished DMA (bit 16 up, at any level) as a reason to look now. Result on
+  Crazy Taxi 2, load to the menu: 71 chunks of 71 finished by the tick, latency
+  DMA to processing ~81 us, tick CPU 0.75 ms a chunk (1.5 before), `g_irq_tick_max`
+  0.3 ms (1.7), ~1.5 MiB/s (0.7 without the fix, ~2 with the CPU copy), no lag.
+- **What did not work**, so nobody repeats it: acknowledging the chip's RX
+  status before the DMA and leaving its interrupt armed (its line rises mid-DMA,
+  the tick waits for the end: 4.7 % of the CPU against 1.1 %, same throughput);
+  a synchronous RX DMA (94 us against 99 us: nothing to gain, only the wait
+  changes hands); reading the whole ring in one DMA (no buffer for it: `.hiram`
+  has ~500 B left).
+- **The Internet checksum is fast** (`packet.c`, `csum_sum16()`): 32-bit reads,
+  the two halves added apart, no carry test per word, one fold at the end --
+  the old loop was ~18 us over a 1440-byte payload. Checked bit for bit against
+  the old loops on the PC (38 426 cases: every length 0..1600, four alignments,
+  all-0 and all-`0xff` included).
+- **What is left** in the tick is `process_pkt`: mostly the RAM-to-RAM copy of
+  `cmd_partbin()` and its purge (est. 13 us a frame of ~50). A zero copy -- DMA
+  of the payload to its destination, the checksum then read from there, so the
+  frame is written before it is verified -- would gain ~10-15 us a frame:
+  ~0.15 ms of a chunk of ~8 ms, invisible in play. Not done; it needs the LOW
+  `.gdstage` assert relaxed (the CD image has 240 B left) and the host's
+  relocation bound with it. The NIC cannot verify the checksum: the RTL8139
+  offload exists only on the C+ (descriptor mode), and it already discards
+  frames with a bad Ethernet CRC (RXCONFIG accepts no errors).
+- **The legacy 1024-byte payload mode (dc-tool < 2.0.0) was removed from the
+  loader** (2026-09-28: `DCTOOL_MAJOR < 2` branches in `commands.c` and
+  `syscalls.c`) for its ~220 bytes. `dc-tool -l` no longer works against this
+  loader; dc-tool 2.x and the Rust host are unaffected.
+- **Counters**: `g_g2dma_timeouts` (must stay 0) and `g_rx_dma_frames`. Read
+  `g_ga_irq_done` against `g_ga_posts`: that is the tick finishing chunks. The
+  investigation's others (latency, causes of each entry, the title's IMASK)
+  were removed once they had answered; the git history has them.
+- **flycast completes a G2 DMA the moment it starts** (`aica_if.cpp` copies
+  everything at once and defers only the end interrupt and the start bit): a
+  missing wait is invisible there, and so is the title's mask carrying our
+  event. The console is the judge.
+
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
 `loader.s` + `disable.s`, linked at `-Ttext=0x8c010000`, `objcopy`'d, then
@@ -1281,7 +1373,7 @@ Options `x:u:d:a:s:t:i:nlqhrgf`, plus `m:c:` outside MinGW.
 | `-i` | isofile | CDFS redirection from this image |
 | `-r` | — | reset the DC (while dcload is in control) |
 | `-g` | — | GDB server on TCP `:2159` |
-| `-l` | — | legacy 1024-byte payload |
+| `-l` | — | legacy 1024-byte payload (refused by the loader since 2026-09-28, §4.16) |
 | `-f` | — | no FIFO delays: faster, more loss |
 | `-h` | — | usage |
 
@@ -1651,6 +1743,11 @@ against a capture on the wire) to tell lost TX from lost RX.
 21. **Reading a hardware field by the name in the comment.** AICA TL is
     attenuation; writing it as a volume silenced CD-DA while every counter was
     healthy. Check fields against a working driver (KOS `arm/aica.c`).
+22. **Assuming an interrupt you armed is the one that fires.** A title's own
+    masks may carry the same event on a higher level: the end of our BBA DMA
+    came as the title's IML4, not our IML2 (§4.16). Read the title's masks
+    (`g_irq_iml`) before choosing where to listen, and count the event at any
+    level before concluding it does not fire.
 
 ## 15. Where to look first
 
@@ -1860,6 +1957,7 @@ Code first. Then:
 | `cdda-crackle-investigation.md` | 2026-08-29→09-05: the first CD-DA engine (integrator). Transport and AICA measurements still hold. |
 | `cdda-double-buffer-investigation.md` | 2026-09-06→09-12: the current engine brought up on hardware, with a table of what was later superseded. |
 | `wince-investigation.md` | 2026-09-20→27: Sega Rally 2 from black screen to playable -- the three GD doors, virtual buffers, streams, CE's RAM, preemption inside a network exchange, CD-DA under CE, and what the interrupt hook must solve next. |
+| `g2-dma-investigation.md` | 2026-09-28/29: G2 DMA for the CD-DA rings and the BBA's RX; the bench, each console measurement and why the RX wake-up failed until the IML4 finding (§4.16). |
 | `flycast-debug-loop.md` | the emulator-as-target workflow. |
 | `read-back-verification.md` | what read-back verification proves and does not. |
 | `dreamshell-presets/` | 6168 archived DreamShell presets. |

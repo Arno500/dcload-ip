@@ -12,6 +12,9 @@
 
 #include "dhcp.h"
 #include "memfuncs.h"
+#include "g2dma.h"
+#include "commands.h"
+#include "irq.h"
 #include "perfctr.h"
 
 // TEMP
@@ -50,6 +53,9 @@ static void rtl_read_mac(void);
 static void rtl_init(void);
 static void pktcpy(unsigned char *dest, unsigned char *src, unsigned int n);
 static int rtl_bb_rx(void);
+#if WITH_IRQ_HOOK
+static int rx_settle(unsigned int wait);
+#endif
 
 /*
  * WARM START: ADOPT AN ADAPTER A PREVIOUS DCLOAD ALREADY BROUGHT UP.
@@ -732,21 +738,28 @@ int rtl_bb_init(void)
  */
 void rtl_irq_ack(void)
 {
+	rx_settle(1);
+	g2dma_quiesce();
 	nic16[RT_INTRSTATUS/2] = RT_INT_RX_ACK;
 }
 
 void rtl_bb_start(void)
 {
+	rx_settle(1);
+	g2dma_quiesce();
 	nic32[RT_RXCONFIG/4] |= 0x0000000a;
 }
 
 void rtl_bb_stop(void)
 {
+	rx_settle(1);
 	nic32[RT_RXCONFIG/4] &= 0xfffffff5;
 }
 
 int rtl_bb_tx(unsigned char * pkt, int len) // pg. 15 in RTL8139C datasheet: http://realtek.info/pdf/rtl8139cp.pdf
 {
+	rx_settle(1);
+	g2dma_quiesce();
 	// According to KOS source we gotta wait for G2 FIFO to be empty by checking
 	// this bit before reading from/writing to G2. So do that here.
 	while((*(volatile unsigned int*)0xa05f688c) & 0x20U);
@@ -919,6 +932,166 @@ static void pktcpy(unsigned char *dest, unsigned char *src, unsigned int n) // d
 	CacheBlockWriteBack(dest, (2 + n + 31)/32);
 }
 
+/* The frame at cur_rx is done with, whatever became of it: move the ring on and
+ * tell the chip (CAPR), and acknowledge the reception. */
+static void rx_advance(unsigned int rx_size)
+{
+	g_rx_frames++;
+
+	// Align next packet to 4-bytes (add 4 to account for transmit status; the 4 extra bytes included in rx_size are the CRC)
+	rtl.cur_rx = (rtl.cur_rx + rx_size + 4 + 3) & ~3;
+
+	/*
+	 * CAPR MUST BE WRITTEN IN RANGE, WRAP OR NO WRAP.
+	 *
+	 * This used to publish 0x7ff0 on the wrap. That value is outside the
+	 * 16 KB ring, and it tells the chip that everything has been drained:
+	 * it moves its own pointer to CBA and discards the queued frames while
+	 * cur_rx stays put. CAPR then sits ahead of CBR and the ring is
+	 * mutually locked -- the chip never reports another frame and the CPU
+	 * never advances. There is no recovery from that state.
+	 *
+	 * Measured symptom, and it is not subtle: Sonic Adventure ran 86 disc
+	 * reads and then received NOTHING more. flycast's bridge reported
+	 * every frame delivered (dropped=0), dcload's LBIN/PBIN/DBIN counters
+	 * were frozen solid, and the read timed out after 20 s. The wrap is
+	 * simply where the ring happened to turn over.
+	 *
+	 * The -16 bias is the RTL8139 convention (it is what distinguishes
+	 * empty from full); masking keeps it inside the ring when cur_rx is
+	 * below 16. Same expression on both paths, deliberately -- the wrap is
+	 * not a special case for this register.
+	 */
+	if(rtl.cur_rx >= RX_BUFFER_LEN)
+	{
+		g_rx_wraps++;
+		// Prevent underflowing the RX buffer
+		rtl.cur_rx %= RX_BUFFER_LEN;
+		g_rx_last_capr = (rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1);
+		g_rx_last_cbr = nic16[RT_RXBUFHEAD/2];
+		nic16[RT_RXBUFTAIL/2] = g_rx_last_capr;
+		// According to the RTL8139C datasheet, 0xfff0 = 65520 is the default value of the register,
+		// and the register cannot be written to before data has been read from the buffer for some
+		// reason. So, presumably, we can just use that value here.
+		//
+		// Although, in the specific case of this system with the GAPS PCI Bridge, we can also just use
+		// 0x7ff0 since that's a well-known memory location (it's the last 16 bytes of the last txdesc.
+		// Because each txdesc is 2048 bytes and no more than 1536 bytes will ever be written there, it
+		// seems like a pretty safe place to put... whatever that apparently 100% necessary offset of
+		// -16 is for).
+	}
+	else
+	{
+		rtl.cur_rx %= RX_BUFFER_LEN;
+		g_rx_last_capr = (rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1);
+		g_rx_last_cbr = nic16[RT_RXBUFHEAD/2];
+		nic16[RT_RXBUFTAIL/2] = g_rx_last_capr;
+		// Why 16? NetBSD and Linux do this, too. Status is 4, CRC appended is 4, what's the other 8?
+		// Things don't work if this isn't 16, anyways (I tried changing it). Maybe this is 16 for DMA reasons?
+		// RealTek does it here: https://www.cs.usfca.edu/~cruse/cs326f04/RTL8139_ProgrammersGuide.pdf
+		// Maybe this is why 16: initial value is 0x0fff0 according to the RTL8139C datasheet:
+		// https://people.freebsd.org/~wpaul/RealTek/spec-8139c(160).pdf
+		// This stays the same regardless of wrap/nowrap, as well.
+		// Wow, even QEMU emulates this "off by 16" thing here: https://github.com/qemu/qemu/blob/master/hw/net/rtl8139.c#L2532
+	}
+
+	// Ack it -- the RECEPTION, not the ring conditions. See RT_INT_RX_FRAME_ACK.
+	unsigned short i = nic16[RT_INTRSTATUS/2];
+	if (i & RT_INT_RX_FRAME_ACK)
+		nic16[RT_INTRSTATUS/2] = RT_INT_RX_FRAME_ACK;
+}
+
+#if WITH_IRQ_HOOK
+/*
+ * RX BY G2 DMA, FROM THE INTERRUPT HOOK (2026-09-28, docs/g2-dma-investigation.md).
+ *
+ * Reading a frame from the BBA's SRAM by the CPU is ~94 us of a CPU that waits
+ * on the bus for every word (measured: 1536 bytes, 99 us by the CPU, 94 us by
+ * DMA); on a Katana title's disc read that was the tick's whole cost, 1.5 ms a
+ * chunk, with SR.BL set. The DMA moves the same bytes with the CPU free. The
+ * tick starts it and returns to the title; the end of the DMA interrupts (the
+ * same level as the chip's own RX interrupt, irq.c), and the frame is then
+ * processed as any other.
+ *
+ * ONLY A PBIN, ONLY UNDER THE TICK. A frame is copied by DMA when it is long
+ * and its first 64 bytes -- read by the CPU, 4 us -- say it is a PartBinary for
+ * us: processing one never transmits, so it can be finished from anywhere. Any
+ * other frame, and every frame outside the tick, is copied as before.
+ *
+ * WHILE THE DMA RUNS the CPU must not touch the BBA (a PIO access to the bridge
+ * under its own DMA), so every entry point that does calls rx_settle() first:
+ * inside the tick that only skips the work (the DMA-end interrupt brings it
+ * back), anywhere else it waits, bounded, then finishes the frame. A frame stays
+ * in the ring, CAPR not moved, until it is processed.
+ */
+#define RX_DMA_MIN 256U
+volatile unsigned int g_rx_dma_tick;	/* irq_tick is running: DMA may start, nothing waits */
+static unsigned int rx_pend_size;	/* rx_size of the frame in flight; 0 = none */
+unsigned int g_rx_dma_frames;		/* frames received by DMA */
+
+/* Is the frame at `pkt` (GAPS window address) a PartBinary addressed to us?
+ * Leaves its first 64 bytes in raw_current_pkt. */
+static int rx_is_pbin(unsigned char *pkt)
+{
+	unsigned char *h = raw_current_pkt + 2;
+
+	pktcpy(raw_current_pkt, pkt, 64);
+	return h[12] == 0x08 && h[13] == 0x00 && h[14] == 0x45 && h[23] == 0x11
+		&& !memcmp_16bit_eq(h, bb->mac, 6 / 2)
+		&& !memcmp_32bit_eq(h + 42, CMD_PARTBIN, 4 / 4);
+}
+
+/* The window's pointer is already at the frame (rx_is_pbin's pktcpy). */
+static void rx_dma_start(unsigned int pkt_size)
+{
+	unsigned int len = (pkt_size + 2U + 31U) & ~31U;	/* <= RAW_RX_PKT_BUF_SIZE */
+
+	while ((*(volatile unsigned int *)0xa05f688cU) & 0x20U);
+	CacheBlockInvalidate(raw_current_pkt, len / 32U);
+	SB_ISTNRM = G2DMA_IST_BIT(1);
+	g2dma_start(1, raw_current_pkt, 0x01848000U, len, G2DMA_TO_RAM);
+	g_rx_dma_frames++;
+}
+
+/* Finish the frame whose DMA was started. In the tick a DMA still running is
+ * left alone (returns 1); elsewhere it is waited for. A DMA that never ends
+ * loses the frame, not the loader: the host retransmits what was not
+ * acknowledged. */
+static int rx_settle(unsigned int wait)
+{
+	unsigned int size = rx_pend_size;
+
+	if (!size)
+	{
+		return 0;
+	}
+	if (!wait && g_rx_dma_tick && g2dma_busy(1))
+	{
+		return 1;
+	}
+	rx_pend_size = 0;
+	if (g2dma_wait(1) < 0)
+	{
+		G2DMA_EN(1) = 0;
+		g_g2dma_timeouts++;
+		g_rx_status_drop++;
+	}
+	else
+	{
+		process_pkt(to_p1(current_pkt));
+	}
+	rx_advance(size);
+	if (!wait)
+	{
+		irq_rx_arm(1);	/* a chunk is still on the wire; the entry points that
+				 * wait are the ones that end it (irq_rx_arm(0) first) */
+	}
+	return 0;
+}
+#else
+#define rx_settle(wait) 0
+#endif
+
 static int rtl_bb_rx()
 {
 	int processed;
@@ -927,6 +1100,10 @@ static int rtl_bb_rx()
 	unsigned char *pkt;
 
 	processed = 0;
+	if (rx_settle(0))
+	{
+		return 0;
+	}
 
 	/* While we have frames left to process... */
 	while (!(nic8[RT_CHIPCMD] & 1))
@@ -1033,6 +1210,19 @@ static int rtl_bb_rx()
 			unsigned long long int first_array = PMCR_RegRead(DCLOAD_PMCR);
 #endif
 
+#if WITH_IRQ_HOOK
+			if (g_rx_dma_tick && pkt_size >= RX_DMA_MIN && rx_is_pbin(pkt))
+			{
+				/* Not consumed: rx_settle() does that when the DMA is over. The
+				 * loop stops here, or its next poll would use the bridge under
+				 * the DMA. */
+				rx_dma_start(pkt_size);
+				rx_pend_size = rx_size;
+				irq_rx_arm(2);
+				escape_loop = 1;
+				break;
+			}
+#endif
 			pktcpy(raw_current_pkt, pkt, pkt_size); // SH4_pkt_to_mem() will shift it by 2 for current_pkt
 
 // Rx time end
@@ -1082,70 +1272,7 @@ static int rtl_bb_rx()
 			g_rx_last_bad_status = rx_status;
 		}
 
-		g_rx_frames++;
-
-		// Align next packet to 4-bytes (add 4 to account for transmit status; the 4 extra bytes included in rx_size are the CRC)
-		rtl.cur_rx = (rtl.cur_rx + rx_size + 4 + 3) & ~3;
-
-		/*
-		 * CAPR MUST BE WRITTEN IN RANGE, WRAP OR NO WRAP.
-		 *
-		 * This used to publish 0x7ff0 on the wrap. That value is outside the
-		 * 16 KB ring, and it tells the chip that everything has been drained:
-		 * it moves its own pointer to CBA and discards the queued frames while
-		 * cur_rx stays put. CAPR then sits ahead of CBR and the ring is
-		 * mutually locked -- the chip never reports another frame and the CPU
-		 * never advances. There is no recovery from that state.
-		 *
-		 * Measured symptom, and it is not subtle: Sonic Adventure ran 86 disc
-		 * reads and then received NOTHING more. flycast's bridge reported
-		 * every frame delivered (dropped=0), dcload's LBIN/PBIN/DBIN counters
-		 * were frozen solid, and the read timed out after 20 s. The wrap is
-		 * simply where the ring happened to turn over.
-		 *
-		 * The -16 bias is the RTL8139 convention (it is what distinguishes
-		 * empty from full); masking keeps it inside the ring when cur_rx is
-		 * below 16. Same expression on both paths, deliberately -- the wrap is
-		 * not a special case for this register.
-		 */
-		if(rtl.cur_rx >= RX_BUFFER_LEN)
-		{
-			g_rx_wraps++;
-			// Prevent underflowing the RX buffer
-			rtl.cur_rx %= RX_BUFFER_LEN;
-			g_rx_last_capr = (rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1);
-			g_rx_last_cbr = nic16[RT_RXBUFHEAD/2];
-			nic16[RT_RXBUFTAIL/2] = g_rx_last_capr;
-			// According to the RTL8139C datasheet, 0xfff0 = 65520 is the default value of the register,
-			// and the register cannot be written to before data has been read from the buffer for some
-			// reason. So, presumably, we can just use that value here.
-			//
-			// Although, in the specific case of this system with the GAPS PCI Bridge, we can also just use
-			// 0x7ff0 since that's a well-known memory location (it's the last 16 bytes of the last txdesc.
-			// Because each txdesc is 2048 bytes and no more than 1536 bytes will ever be written there, it
-			// seems like a pretty safe place to put... whatever that apparently 100% necessary offset of
-			// -16 is for).
-		}
-		else
-		{
-			rtl.cur_rx %= RX_BUFFER_LEN;
-			g_rx_last_capr = (rtl.cur_rx - 16) & (RX_BUFFER_LEN - 1);
-			g_rx_last_cbr = nic16[RT_RXBUFHEAD/2];
-			nic16[RT_RXBUFTAIL/2] = g_rx_last_capr;
-			// Why 16? NetBSD and Linux do this, too. Status is 4, CRC appended is 4, what's the other 8?
-			// Things don't work if this isn't 16, anyways (I tried changing it). Maybe this is 16 for DMA reasons?
-			// RealTek does it here: https://www.cs.usfca.edu/~cruse/cs326f04/RTL8139_ProgrammersGuide.pdf
-			// Maybe this is why 16: initial value is 0x0fff0 according to the RTL8139C datasheet:
-			// https://people.freebsd.org/~wpaul/RealTek/spec-8139c(160).pdf
-			// This stays the same regardless of wrap/nowrap, as well.
-			// Wow, even QEMU emulates this "off by 16" thing here: https://github.com/qemu/qemu/blob/master/hw/net/rtl8139.c#L2532
-		}
-
-		// Ack it -- the RECEPTION, not the ring conditions. See RT_INT_RX_FRAME_ACK.
-		unsigned short i = nic16[RT_INTRSTATUS/2];
-		if (i & RT_INT_RX_FRAME_ACK)
-			nic16[RT_INTRSTATUS/2] = RT_INT_RX_FRAME_ACK;
-
+		rx_advance(rx_size);
 		processed++;
 
 #ifdef FULL_TRIP_TIMING
@@ -1228,6 +1355,11 @@ unsigned int g_rx_missed = 0;
 
 void rtl_bb_loop(int is_main_loop)
 {
+	if (rx_settle(0))
+	{
+		return;
+	}
+	g2dma_quiesce();
 	unsigned int irq_held = bb_irq_hold();
 	unsigned int intr = 0;
 	unsigned int idle_polls = 0;

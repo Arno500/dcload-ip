@@ -37,6 +37,7 @@
 
 #include "dhcp.h"
 #include "perfctr.h"
+#include "g2dma.h"
 
 // This is stock dcload now, no more need to explicitly mention "with DHCP"
 #define NAME "dcload-ip " DCLOAD_VERSION
@@ -1078,6 +1079,10 @@ int main(void)
 	 * coarse PMCR backstop and froze the game for 7 s (AGENTS.md 4.5).
 	 */
 	gd_deadline_timer_start();
+
+#if G2DMA_BENCH
+	g2dma_bench();
+#endif
 
 	while (1) {
 
