@@ -101,6 +101,9 @@ worth its bytes and its change of guarantee for now.
 - Windows CE: no RX interrupt exists there, so RX stays by CPU; the DMA would
   wait for the next interrupt of CE's.
 - The LAN Adapter has no DMA path.
-- `loaders/` (the deployed set) is not updated: the sets under
-  `loaders-g2dma-*` are for testing; deploying `rx6` changes the HIGH layout, so
-  the host and the loader set must go together (AGENTS.md §14.19).
+- Deployed 2026-09-29: `loaders/` of the host is the final set (md5
+  `a5e5f631f338b1da1ad0076eacea9579`, identical to `make loaders` here). It
+  relocates to the HIGH bases and to `0x8c004000`; `0x8c008000` is refused (the
+  image does not fit under that base's stack). The intermediate sets
+  (`loaders-g2dma-rx*`) were deleted. The HIGH layout changed, so the host and
+  the loader set go together (AGENTS.md §14.19).

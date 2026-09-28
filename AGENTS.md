@@ -457,9 +457,10 @@ at `_end = 0x8c00c7ec`, and the asynchronous reads (phase 3) at **`_end =
 `+0xb000`, and the 3 KB moved are what paid for §4.16). Phase 3 spent
 `GD_STAGE_BIG_SECTORS` 5 → 4 to fit (the stage is now 8 KB), which leaves
 `_end` up to `base+0x9c00` -- **~2 KB left** after the G2 DMA work (`_end` =
-`base+0x9310`, default flags; before it, 352 B). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. The deployed
-`loaders/` is still the `0x8c00c000` build; deploying the current one loses
-the low base to painted titles as described below. The user's decision
+`base+0x9310`, default flags; before it, 352 B). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. **The deployed
+`loaders/` is the current build since 2026-09-29** (md5 `a5e5f631…`, it needs
+the host's `layout()` of that date; the older `0x8c00c000` build is gone), which
+loses the low base to painted titles as described below. The user's decision
 (2026-09-21) is that this is acceptable where it has to happen: the host
 already refuses a low base whose image reaches a range the title paints
 (`low_loader_painted_by_title`), so a taller build costs the low family for
