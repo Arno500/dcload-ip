@@ -169,7 +169,8 @@ Compiler flags disable everything that could move code behind your back:
 | `cdfs.h`, `cdfs_redir.s`, `cdfs_syscalls.c` | GD-ROM emulation (§4.5); also the boot-time drive spin-down (§4.14). Both carry explanatory headers. |
 | `syscalls.c/.h` | host syscalls `DC00`–`DC24` (§8). |
 | `commands.c/.h` | the command dispatcher and the LoadBinary window (`bin_info`). |
-| `exception.S` | exception display **and** the VBR table handed to the title; `+0x600` is `nop; rte; nop` (no interrupt is hooked). |
+| `exception.S` | exception display **and** the VBR table handed to the title; `+0x600` is `nop; rte; nop`. |
+| `irq.c/.h`, `irq_hook.S` | the interrupt hook in a Windows CE title's own vector table (§4.15). |
 
 ### 4.3 Build flags
 
@@ -188,9 +189,11 @@ symbol-derived read block of 09-26 (§4.5) bring them to `0x8c00c000`):
 | `PKT_BUFS_IN_HIRAM` | `1` | packet buffers and the CD-DA staging buffer in `.hiram` instead of BSS | 5440 B |
 | `WITH_CDDA` | `1` | CD-DA engine (§4.13) | 5152 B if 0 (2026-09-20) |
 | `WITH_LAN_ADAPTER` | `1` | HIT-0300 driver; 0 = BBA only | 2040 B if 0 |
-| `WITH_PMCR_CMD` | `1` | serve `PMCR` (perfctr.c stays) | 808 B if 0 |
+| `WITH_PMCR_CMD` | `0` | serve `PMCR` (perfctr.c stays); off since 2026-09-28 -- no host sends it | 808 B if 0 |
 | `WITH_MAPLE` | `1` | serve `MAPL` | 656 B if 0 |
-| `WITH_GD_SPINDOWN` | `1` | stop the real drive at boot (§4.14) | 160 B if 0 |
+| `WITH_GD_SPINDOWN` | `0` | stop the real drive at boot (§4.14); off since 2026-09-28 to pay for the Katana hook | 160 B if 0 |
+| `WITH_IRQ_HOOK` | `1` | the interrupt hook (§4.15) | 792 B if 0 (2026-09-27, phase 1) |
+| `GD_ASYNC_KATANA` | `1` | the interrupt hook in Katana titles too, and their disc reads through the asynchronous engine (§4.5); needs `WITH_IRQ_HOOK` | ~150 B |
 | `DCLOAD_GC_SECTIONS` | `1` | `--gc-sections`; also reveals dead code | 328 B |
 | `DCLOAD_LTO` | `0` | `-flto`. **Off on purpose**: it changes the depth of the C frame the GD coroutine parks (§4.5 — check `g_gd_park_longs` on hardware) and suppresses the `*.asm` listings | 2428 B if 1 |
 
@@ -224,7 +227,7 @@ a build variable because it is per-game (§4.11). Defaults (LOW layout):
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` = `0xdeadbeef` magic, `+8` = syscall trampoline pointer (the example-program ABI). |
-| `0x8c00c434` | `_end` with default flags (2026-09-27; over the `0x8c00c000` bound, §4.6). Code and BSS are all below it. |
+| `0x8c00ce78` | `_end` with default flags (2026-09-28, with the interrupt hook and asynchronous reads; over the `0x8c00c000` bound, §4.6). Code and BSS are all below it. |
 | `_end`..`_stack` | the loader's stack; also `.gdstage` (NOLOAD, 10 KB), the big GD stage, used only under a CE title (§4.15). |
 | `0x8c00f400` | `_stack` (LOW layout), **the VBR handed to the title**, the link address of `exception`, and the BIOS VBR. Only `_stack` moves with the base. |
 | `0x8c010000` | the title's load address; `exception.bin` ends just before it. |
@@ -273,6 +276,25 @@ model. The driver a title is written against is a **coroutine**, so:
   wait: nobody reads the echo any more, and sending it would put one of our
   frames on the wire inside the host's burst — the collision already on record
   on the audio path.
+- **Asynchronous reads under Katana titles** (`GD_ASYNC_KATANA`, 2026-09-28,
+  BBA only; `docs/wince-investigation.md` 9l-9n). The interrupt hook goes into
+  Katana titles' vector table too (their entry is six nops, §4.15), and a read
+  of more than one sector goes through the engine written for Windows CE: the
+  read is posted at once, the title runs, and **the hook's tick collects each
+  chunk (4 sectors, ~9 KB of the 16 KB ring) and posts the next as soon as it
+  is back**, between frames. The MMU is off, so the destination is physical
+  and the host writes it directly, 6 sectors a chunk (`GA_PHYS_SECTORS`: what
+  the ring holds undrained). **The BBA's own RX interrupt wakes the tick**
+  (§4.15), so a chunk is collected when it lands rather than at the title's
+  next interrupt. Two versions without the hook failed on the
+  same console (9l, 9m): one chunk per ExecServer (once a frame) loaded menus
+  at ~350 KB/s, and a spin budget for reads of 32+ sectors brought loads to
+  0.5-1 MB/s but stalled play on Crazy Taxi's 73-sector music reads -- no size
+  tells a loading screen from a stream. This **yields between chunks**, which
+  `GD_YIELD_BETWEEN_CHUNKS` measured fatal to Sonic Adventure in 2026-08 --
+  while SA's stack still ran through the loader's image (§4.6), the cause of
+  every other SA death of that week; re-measure SA before trusting either
+  reading. `GD_ASYNC_KATANA=0` leaves Katana titles unhooked and synchronous.
 - `gdGdcGetCmdStat` reports progress (`COMPLETED` consumed once, then `IDLE`;
   `req_count` never 0 or 1). `gdGdcGetDrvStat` reports PLAYING while a read or
   CD-DA is live and calls `cdda_service()` **before** taking the GD lock.
@@ -384,7 +406,7 @@ nesting in invariant 2. `g_gd_lock_owner`/`_stuck_owner` say who held it.
   DMA stream completes only if its first piece is the whole of it. Windows CE
   is steered to PIO by the host (§4.15). No Katana test title has been run
   with this. `GETTOC2` does not model low/high density areas.
-- **Reads into a translated address are staged** (`gd_stage_big`, 10 KB in
+- **Reads into a translated address are staged** (`gd_stage_big`, 8 KB in
   `.gdstage` above `_end` -- the loader's own stack region, dead while a title
   runs, and used only under the MMU because in the LOW family it is a Katana
   title's stack; `gd_stage`, 6 KB in `.hiram`, for the TOC and a stream under
@@ -425,7 +447,13 @@ which is why 593 DreamShell presets can say `0x8c004000`.
 `_end = 0x8c00c000` on 09-26, the image's last byte just under the painted
 range, with no margin left. The Windows CE work (§4.15: staging, streams,
 the exchange mask and stack switch, retries, CD-DA level follow and catch-up)
-puts the tree at **`_end = 0x8c00c434`, 1076 B over**. The deployed
+put the tree at `_end = 0x8c00c434`, and the interrupt hook (§4.15, phase 1)
+at `_end = 0x8c00c7ec`, and the asynchronous reads (phase 3) at **`_end =
+0x8c00ce78`, 3704 B over** (2026-09-28, with `WITH_GD_SPINDOWN=0` and `WITH_PMCR_CMD=0`). The HIGH family has a bound of its own:
+`.gdstage` must end under `_stack` (`base+0xb000`). Phase 3 spent
+`GD_STAGE_BIG_SECTORS` 5 → 4 to fit (the stage is now 8 KB), which leaves
+`_end` up to `base+0x9000` -- **352 B left** (after 9r; 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default). The next lever is
+`WITH_GD_SPINDOWN=0` (160 B). The deployed
 `loaders/` is still the `0x8c00c000` build; deploying the current one loses
 the low base to painted titles as described below. The user's decision
 (2026-09-21) is that this is acceptable where it has to happen: the host
@@ -737,8 +765,9 @@ to 2026-09-05) and `docs/cdda-double-buffer-investigation.md` (this engine,
 
 #### Rules
 
-1. Never service from an interrupt, while `g_gd_in_transfer` is set, or while
-   a title's G2 DMA into sound RAM is in flight.
+1. Never service while `g_gd_in_transfer` is set or a title's G2 DMA into
+   sound RAM is in flight; from an interrupt, only through the hook's tick
+   (`cdda_service_tick()`, §4.15): GD lock free, one sub-fetch, no listening.
 2. Every key-on restarts the ADPCM encoder; any re-key goes through
    `cdda_prime()` (re-keying onto the existing ring decodes it from a reset
    decoder: full-scale noise).
@@ -962,6 +991,9 @@ Three things it depends on:
    measured, so the bound is on iterations and not on time. A drive that will
    not answer is left spinning rather than spun on.
 
+**Off by default since 2026-09-28** (`WITH_GD_SPINDOWN=0`): its 160 bytes
+paid for the Katana interrupt hook under the HIGH bound (§4.6).
+
 `g_gd_spindown` says how it went: the final command status + 2 (**4** =
 COMPLETED, the healthy answer; 1 FAILED, 2 IDLE, 5 STREAMING), plus 7 "the
 driver would not take the command" and 8 "it never finished". 0 means the call
@@ -999,7 +1031,7 @@ title runs and are reused for it:
 
 | Region | Before `EXEC` | Under a CE title |
 | --- | --- | --- |
-| `.gdstage` (above `_end`, under `_stack`) | the loader's own stack | `gd_stage_big`, 5 sectors |
+| `.gdstage` (above `_end`, under `_stack`) | the loader's own stack | `gd_stage_big`, 4 sectors |
 | Maple DMA page (4 KB) | `MAPL` commands | the network exchange's stack |
 | `gd_stage` (`.hiram`, 3 sectors) | -- | the TOC; streams under a Katana title |
 
@@ -1043,13 +1075,13 @@ with reception off (after a deadline it used to stay on, and the LAN filled
 the ring for the next attempt). Katana titles see only that `bb->stop()`,
 which a successful answer's `cmd_retval()` already did.
 
-**Performance: the title waits for the whole read.** Yielding between chunks
-so CE's thread could sleep made reads longer and the menu stop longer. A
-round trip costs ~1.5 ms fixed plus ~0.17 ms a sector, so the number of trips
-is what counts: hence the 5-sector big stage, and the host scaling its
-post-LoadBinary pause to the window (§16). Sega Rally 2 still stops its menu
-~0.1 s each time it reads 604 KB of streamed audio; removing that needs the
-read served asynchronously, i.e. an interrupt (below).
+**Performance.** A real drive takes ~0.4 s over a 604 KB read with the CPU
+free, and CE's menu keeps drawing through it. Served synchronously the read
+was ~0.1 s of CPU the loader kept, and the menu stopped for that. Yielding
+between chunks with nobody working meanwhile made it worse (a 5 ms sleep per
+chunk: 7s). A round trip costs ~1.5 ms fixed plus ~0.17 ms a sector. Hence
+the asynchronous reads of phase 3 (below): the thread sleeps and the hook's
+tick moves the chunk.
 
 **CD-DA: CE never calls `GetDrvStat`.** The music is fed only when CE runs the
 GD server (ExecServer), hundreds of ms apart. `cdda_fill()` therefore budgets
@@ -1057,17 +1089,124 @@ the sub-fetches the gap consumed plus two, up to the whole lead (§4.13).
 Gaps close to the lead (704 ms measured against 893) still cost audible
 glitches; the fix is the same interrupt.
 
-**Next: the interrupt hook** (isoldr's `exception_init` + `wince_entry`: three
-instructions at `VBR+0x600`, a trampoline at `VBR+0x5EC`, a fixed interrupt
-stack, r0/r1/T rebuilt from bank-1 r7 and `*(VBR+0x68c)`; 42 of 98 DreamShell
-CE presets ask for it with `irq=1`). It would let the loader serve reads and
-CD-DA on its own schedule instead of when CE calls. A mistake there shows no
-screen and no exception.
+**The interrupt hook** (2026-09-27, `irq.c`, `irq_hook.S`, `WITH_IRQ_HOOK`).
+`docs/wince-investigation.md` §9. Phase 1 (installed, counted) **measured
+under flycast and on the console** (~600 interrupts a second, a tick ~1 µs).
+Phase 2 (the tick feeds CD-DA) built, **not yet run**.
+
+- **Two entries are recognised** (2026-09-28): Windows CE's (below) and the
+  Katana library's, which copies six nops then `mov.l r0,@-r15 ; mov.l
+  @(disp,pc),r0 ; jmp @r0 ; mov.l r1,@-r15` to `VBR+0x100/+0x400/+0x600`
+  (Crazy Taxi's crt0 sets VBR to our `0x8c00f400` and copies it in, as
+  Sonic Adventure does). Over three nops nothing needs rebuilding: `irq_out`
+  gives back r0, r1 and r15 (the title's r0 parked just under its SP, popped
+  in the delay slot) and resumes at `+0x606` (`g_irq_nop_entry` 1). The words
+  under the vector may be zero or nop padding -- our `exception.bin` pads with
+  nops. From the tick, network code runs on the loader's stack
+  (`gd_in_irq()`: SR.BL), and the tick keeps off the network while CD-DA is
+  (`cdda_busy`: a Katana `GetDrvStat` services it before taking the GD lock).
+  It looks at a read on the wire at most every 0.5 ms, and each look takes what the ring holds and leaves (`GA_POLL_ITERS` 2, 9r): the RX interrupt brings it back for the rest.
+- **The BBA's RX interrupt** (Katana, 2026-09-28, 9o). The title's own
+  interrupts come bunched (~790 a second on Crazy Taxi), and a chunk back
+  after ~2.5 ms waited up to 10 ms more. The chip already raises its line
+  (GAPS `0x1414` = 1, `RT_INTRMASK` = the RX bits); `irq_rx_arm()` routes
+  Holly EXT bit 3 (KOS's `ASIC_EVT_EXP_PCI`) to a level while a chunk is on
+  the wire: the highest of IML6/IML4/IML2 (INTEVT `0x320`/`0x360`/`0x3a0`)
+  whose three masks the title left at zero when the hook went in, else IML6,
+  **shared** -- Crazy Taxi uses IML4, and a first version that took only a
+  free IML4 never armed (9p). The tick acknowledges the chip (`rtl_irq_ack()`:
+  the RX status bits; the loop still finds the frames through its RxBufEmpty
+  net) and looks at the read at once; `irq_entry` then returns with `rte`
+  itself (`g_irq_swallow`) unless something of the title's is pending on that
+  level (IST & its IML masks), in which case the title's handler runs and
+  finds our bit clear. **Only an entry with the chip's bit pending is ever
+  swallowed**: 9p named IML2 and IML6 the wrong way round, took Crazy Taxi's
+  own IML6 interrupts for the chip's, and swallowed them for good -- the
+  title froze (9q). `g_irq_rx` counts them, `g_irq_rx_evt` names the level,
+  `g_irq_iml[9]` keeps the masks the title had (IML2/4/6 NRM, EXT, ERR).
+- Every SH4 interrupt (CE's TMU0 tick, VBlank...) enters at `VBR+0x600`. The
+  loader copies a 30-byte template over the **title's live table** (`stc vbr`)
+  from each GD syscall under the MMU (`irq_hook_check()` in ReqCmd and
+  GetCmdStat): `+0x5e8` trampoline and its two literals (our stack, our
+  entry), `+0x600` `nop; bra; nop`. `irq_entry` saves everything, the FPU
+  included, calls `irq_tick()` on the top of the Maple page, and resumes at
+  `+0x606` with CE's three replaced instructions rebuilt (`r6 = @(40,r7)`,
+  `r0 = *(VBR+0x68c)`, `r1 = r6`) and `r15` back from SGR.
+- **Only Windows CE's exact entry is patched**: `+0x5e8..+0x600` zero and
+  `567a d022 6163` at `+0x600` (Sega Rally 2, VBR `0x8c012110`). Anything
+  else is refused and counted once per VBR (`g_irq_refused`,
+  `g_irq_refused_vbr`); the GD path then works as without the hook. A table
+  that loses the hook gets it back (`g_irq_rehooks`). This is what the first
+  hook (removed 2026-08-07, `docs/loader-comparison.md` 2.3) lacked.
+- Rules the entry keeps, each a reset if broken (SR.BL is 1 throughout):
+  **r15 is replaced before any push** (CE's thread stacks are virtual, and a
+  TLB miss under BL resets); **FD is cleared and FPSCR, FPUL and both FP banks
+  saved** (GCC spills to FP registers, and CE switches the FPU lazily); the
+  pair stores need r15 8-aligned (22 longs pushed before them: keep it even);
+  C reached from `irq_tick()` touches P1/P2 only and never waits.
+- **Two stacks, never one**: the hook's is the Maple page's first KB, the
+  exchange's (`gd_on_loader_stack()`) the page top. Sharing it corrupted an
+  exchange CE had preempted (`docs/wince-investigation.md` 9b).
+- **An exchange must not enter CE's kernel.** CE runs its threads with SR.FD
+  set (lazy FPU); the exchange's first FPU instruction (`fmov.d` in
+  `SH4_aligned_memcpy`, GCC's FP spills) raised an exception CE handled on
+  our stack with IMASK 0, where it could preempt. `gd_on_loader_stack()` now
+  clears FD and saves the FP registers around fn (`fpu_push`/`fpu_pop`,
+  `cdfs_redir.s`), as the hook does.
+- Counters: `g_irq_hooked`, `g_irq_vbr`, `g_irq_entries` (every interrupt),
+  `g_irq_ticks`, `g_irq_tick_max` (TMU2), `g_irq_tick_sum` (all ticks added: the CPU the hook takes; `--diag` shows its growth in ms), `g_irq_evt_last` (INTEVT).
+
+**Phase 2: the tick feeds CD-DA.** At most every 5 ms (TMU2), and only while
+the GD lock is free -- every network use of the GD path (reads, TOC, CD-DA
+from the server) holds it, and no syscall starts while the tick runs, so a
+free lock means nobody is half way through `pkt_buf`, `bin_info` or the ring.
+`cdda_service_tick()`: one sub-fetch per call, no listening window (it would
+run the network path on the hook's 1 KB stack); the exchange itself switches
+to `gd_on_loader_stack()`'s. SR.BL stays set throughout, so the title's
+interrupts wait for a sub-fetch (~3 ms, 20 ms at worst): phase 4 moves that
+wait out of the interrupt.
+
+**Phase 3: asynchronous disc reads** (`data_transfer_async()`,
+`cdfs_syscalls.c`; PIOREAD/DMAREAD of more than one sector, CE with the hook
+in, BBA only). **The tick moves the read, not the thread**: CE's GD thread
+wakes only ~10 times a second while the menu draws, and a first version in
+which the thread copied and posted each chunk managed 72 KB/s (wince 9f). So:
+the thread starts the read and yields (`WAIT_INTERNAL`); the tick (GD lock
+free) drains the ring in passes of `GA_POLL_ITERS` loop turns, gives each
+4-sector chunk its verdict (window whole = done, 250 ms = failed, a
+ReturnValue over a hole = stale), **copies it into the title's buffer and
+posts the next**, at the network's pace. The buffer is virtual and the tick
+cannot take a TLB miss (BL set), so on each wake the thread translates the
+next `GA_XLAT_PAGES` (32) 4 KB pages **by CE's own page tables**
+(`ga_walk()`: TTB, section, MemBlock, entry = PTEL + 1 -- what CE's TLB
+refill reads, and what flycast's `USE_WINCE_HACK` reads), checks each with a
+byte inverted through the virtual address and read back uncached at the
+physical one, and purges the buffer's lines through the virtual address,
+into `ga_xpa[]` (`.hiram`); the tick writes through P1 and writes its lines
+back. A UTLB probe did this until 9j and could not work under flycast
+(below). Between two chunks the tick feeds CD-DA (`cdda_service_tick()`), as
+the synchronous loop does: `irq_tick()` services it only when no read is on
+the wire, and a load is seconds of chunks back to back (9k). A chunk is done with its ReturnValue,
+not merely a whole window (a late one met the next CD-DA fetch as a wrong
+LBA). A chunk beyond the
+translated pages waits for the thread, which copies it the old way. DMAREAD
+(physical) needs no translation. Counters `g_ga_posts`, `g_ga_irq_done`
+(chunks the tick finished, copy included), `g_ga_xlat_miss`, `g_ga_sync`, `g_ga_wakes` (thread resumes with a chunk on the wire)
+(reads finished synchronously: when nothing translates, the read goes back
+to the old loop rather than trickle at the thread's ~20 wakes a second).
+Built, **not yet run**.
 
 Also not done: `CMD_REQ_MODE`/`SET_MODE`/`INIT` answered for real (§4.5 known
 gaps; measure first).
 
 **Debugging CE.**
+
+- **flycast is built with `FAST_MMU`** (`core/build.h`): it serves
+  translations from its own 65536-entry cache, so an access can succeed
+  without the page's entry being in the 64-entry UTLB, and a UTLB probe
+  misses pages a real SH4 would have had to reload. Translate by CE's page
+  tables instead (`ga_walk()`, 9j): flycast resolves CE's misses with the
+  same walk (`USE_WINCE_HACK`, `core/hw/sh4/modules/wince.h`).
 
 - Under flycast, the GDB stub stops the emulation on every MMU exception while
   a client is attached (`debugger::debugTrap`), and every CE API call is one
@@ -1503,12 +1642,12 @@ against a capture on the wire) to tell lost TX from lost RX.
     compares code bytes for this reason. Likewise, compare the md5 of two A/B
     sets before testing: identical md5s have caught a flag that never reached
     the compiler, twice.
-20. **Expecting an interrupt hook to keep the music playing.** A CD-DA fetch
+20. **Servicing from an interrupt without an owner test.** A CD-DA fetch
     transmits, and an interrupt can land while `pkt_buf` or `bin_info` is in
-    use (§4.5), so an IRQ-driven service could only push what is already staged.
-    A real VBR hook would also need re-verifying the title's VBR (isoldr's
-    `exception_vbr_ok()`) and a continuation outside the vector entries
-    (`VBR+0x5f0` is free; Sonic Adventure writes `+0x600`).
+    use (§4.5). The hook's tick (§4.15) services only while the GD lock is
+    free, which every network use of the GD path holds. It also re-verifies
+    the title's VBR on every GD syscall (isoldr's `exception_vbr_ok()`), and
+    patches only Windows CE's entry: Sonic Adventure writes its own `+0x600`.
 21. **Reading a hardware field by the name in the comment.** AICA TL is
     attenuation; writing it as a volume silenced CD-DA while every counter was
     healthy. Check fields against a working driver (KOS `arm/aica.c`).
@@ -1598,7 +1737,10 @@ What it does that concerns the DC side:
 - **Layout**: `loaders::live_footprint()`, `HIRAM_RESERVED` (`0x3000`),
   `LOADER_SPAN` (`0x10000`) mirror the Makefile layout table; the relocator
   assumes only `R_SH_DIR32`, linker-symbol addresses, and `.guestvbr`
-  references only through the jump table (§4.11).
+  references only through the jump table (§4.11). It repeats the link's two
+  stack ASSERTs: every image section (`.gdstage` included) under `_stack`,
+  and 800 B from the **`_end` symbol** -- until 2026-09-27 it measured those
+  800 B from the top of `.gdstage`, and refused a build that linked.
 - **Counter names** are read from the ELF by name (`src/diag.rs`,
   `src/stackwatch.rs`, `scripts/dc-counters.py`); renaming one breaks them.
   So are **`_gd_stage`** and **`_gd_stage_big`** (the ranges a disc read may

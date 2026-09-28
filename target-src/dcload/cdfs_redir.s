@@ -452,38 +452,144 @@ gdGdcUnk4:
 !
 ! void gd_on_loader_stack(void (*fn)(void))
 !
-! Call fn on a stack of the loader's own (the Maple DMA page, P1) and come back
-! to the caller's.
+! Call fn on a stack of the loader's own (the Maple DMA page, P1), with the FPU
+! usable, and come back to the caller's stack.
 ! A Windows CE title calls the GD driver on a thread stack at a VIRTUAL address:
 ! every push there goes through the TLB, and a miss or an uncommitted stack
 ! page enters CE's kernel -- which re-enables interrupts and may switch threads
 ! -- whatever IMASK the loader set. Caught under flycast (2026-09-27): the GD
 ! thread left in the middle of a network exchange with IMASK 15, and the ring
 ! overflowed while it was away (docs/wince-investigation.md 7q). P1 has no TLB.
+!
+! THE FPU IS THE OTHER WAY INTO CE's KERNEL (2026-09-27, 9b). CE switches the
+! FPU lazily: its threads run with SR.FD = 1 until they use it, and the first
+! FPU instruction raises an exception its general handler takes -- on the
+! CURRENT stack, this one, with IMASK lowered to 0. The exchange has FPU
+! instructions (SH4_aligned_memcpy's fmov.d, and GCC spills to FP registers),
+! so every exchange under CE entered the kernel and could be preempted there.
+! Found when the interrupt hook, which used the same stack top, overwrote such
+! a preempted exchange. So fn runs with FD clear and the FP registers -- the
+! hardware state of whichever thread owns them -- saved and put back
+! (fpu_push/fpu_pop below), and nothing in it enters CE.
+!
 ! The CALLER masks interrupts first: this is one stack for every thread, so
 ! nothing may be switched in while it is in use. fn keeps r8-r15 (C ABI).
 !
 ! Why the Maple page and not _stack: the loader's own stack region, above
 ! _end, holds the big GD stage while a CE title runs (dcload.x.in, .gdstage).
 ! The page is 4 KB in both layout families and only a MAPL command uses its
-! first 2 KB -- never while a title runs.
+! first 2 KB -- never while a title runs. The interrupt hook's stack is the
+! page's first KB (irq.c), below this one.
 !
 .globl _gd_on_loader_stack
 .align 2
 _gd_on_loader_stack:
 	mov.l	r14,@-r15
+	mov.l	r8,@-r15
 	sts.l	pr,@-r15
 	mov	r15,r14
+	mov	r4,r8
 	mov.l	ols_stack_k,r15
-	jsr	@r4
+	add	#-4,r15		! fpu_push wants r15 = 4 mod 8
+	mov.l	ols_push_k,r0
+	jsr	@r0
+	nop
+	jsr	@r8
+	nop
+	mov.l	ols_pop_k,r0
+	jsr	@r0
 	nop
 	mov	r14,r15
 	lds.l	@r15+,pr
+	mov.l	@r15+,r8
 	rts
 	mov.l	@r15+,r14
 .align 2
 ols_stack_k:
 	.long	_maple_dma_buffer + 0x1000
+ols_push_k:
+	.long	_fpu_push
+ols_pop_k:
+	.long	_fpu_pop
+
+!
+! fpu_push / fpu_pop -- from assembly only (irq_hook.S, gd_on_loader_stack).
+!
+! fpu_push saves SR, clears SR.FD, then pushes FPUL, FPSCR and both FP banks
+! (0x8c bytes in all) and leaves FPSCR as the loader's C expects it. fpu_pop
+! undoes it, SR last, so FD -- and everything else in SR -- is back as it was.
+! Both clobber r0, r1 and PR. The pair stores need r15 8-aligned after the
+! three longs, i.e. r15 = 4 mod 8 on entry to fpu_push: an address error there
+! runs under whatever the caller masked, and in the interrupt hook that is a
+! reset. The register values saved are not ours: under CE they are the last
+! FPU user's, whoever that is, and they go back untouched.
+!
+.globl _fpu_push
+.globl _fpu_pop
+.align 2
+_fpu_push:
+	stc	sr,r0
+	mov.l	r0,@-r15
+	mov.l	fp_fd_clear_k,r1
+	and	r1,r0
+	ldc	r0,sr
+	sts.l	fpul,@-r15
+	sts.l	fpscr,@-r15
+	mov.l	fp_pair_k,r0
+	lds	r0,fpscr	! SZ = 1: fmov moves register pairs
+	fmov	dr0,@-r15
+	fmov	dr2,@-r15
+	fmov	dr4,@-r15
+	fmov	dr6,@-r15
+	fmov	dr8,@-r15
+	fmov	dr10,@-r15
+	fmov	dr12,@-r15
+	fmov	dr14,@-r15
+	fmov	xd0,@-r15
+	fmov	xd2,@-r15
+	fmov	xd4,@-r15
+	fmov	xd6,@-r15
+	fmov	xd8,@-r15
+	fmov	xd10,@-r15
+	fmov	xd12,@-r15
+	fmov	xd14,@-r15
+	mov.l	fp_c_k,r0
+	lds	r0,fpscr	! what go.S hands a program, and what C here assumes
+	rts
+	nop
+
+_fpu_pop:
+	mov.l	fp_pair_k,r0
+	lds	r0,fpscr
+	fmov	@r15+,xd14
+	fmov	@r15+,xd12
+	fmov	@r15+,xd10
+	fmov	@r15+,xd8
+	fmov	@r15+,xd6
+	fmov	@r15+,xd4
+	fmov	@r15+,xd2
+	fmov	@r15+,xd0
+	fmov	@r15+,dr14
+	fmov	@r15+,dr12
+	fmov	@r15+,dr10
+	fmov	@r15+,dr8
+	fmov	@r15+,dr6
+	fmov	@r15+,dr4
+	fmov	@r15+,dr2
+	fmov	@r15+,dr0
+	lds.l	@r15+,fpscr
+	lds.l	@r15+,fpul
+	mov.l	@r15+,r0
+	ldc	r0,sr
+	rts
+	nop
+.align 2
+fp_fd_clear_k:
+	.long	0xffff7fff
+fp_pair_k:
+	.long	0x00100000
+fp_c_k:
+	.long	0x00040000
 
 !
 ! Coroutine state. Lives in .text (RAM) so the linker initialises it; moving

@@ -375,15 +375,33 @@ endif
 # page does after 180 s of pause (Cdif131e.txt). This makes that immediate and
 # deterministic; a later read spins the drive back up. See gd_spin_down_drive()
 # in cdfs_syscalls.c, and g_gd_spindown for how it went.
-WITH_GD_SPINDOWN ?= 1
+# Off by default since 2026-09-28: its 160 bytes paid for the Katana interrupt
+# hook under the HIGH layout's bound (AGENTS.md 4.6).
+WITH_GD_SPINDOWN ?= 0
 CFLAGS += -DWITH_GD_SPINDOWN=$(WITH_GD_SPINDOWN)
 
 # Serve the PMCR command (host-driven SH4 performance counters). Worth 808
 # bytes. This does NOT remove perfctr.c: dcload uses counter 1 itself for
 # the DHCP lease and for the adapter loops' timeouts. Only the host-facing
-# command goes away.
-WITH_PMCR_CMD ?= 1
+# command goes away. Off by default since 2026-09-28: no host sends it (not
+# dc-tool, not dcload-ip-rs), and its bytes paid for the BBA RX interrupt.
+WITH_PMCR_CMD ?= 0
 CFLAGS += -DWITH_PMCR_CMD=$(WITH_PMCR_CMD)
+
+# The interrupt hook (irq.c, irq_hook.S; AGENTS.md 4.15): installed into a
+# Windows CE title's own vector table from its GD syscalls, so the loader
+# runs on the title's interrupts and not only when the title calls it. Only a
+# table showing CE's exact interrupt entry is patched; anything else is left
+# alone and the GD path works as without it.
+WITH_IRQ_HOOK ?= 1
+CFLAGS += -DWITH_IRQ_HOOK=$(WITH_IRQ_HOOK)
+
+# Katana titles' disc reads served asynchronously too (AGENTS.md 4.5): the
+# interrupt hook goes into their vector table as well (their entry starts with
+# nops, irq.c), and its tick moves the read while the title runs, as under
+# Windows CE. 0 = no hook for them, the synchronous loop.
+GD_ASYNC_KATANA ?= 1
+CFLAGS += -DGD_ASYNC_KATANA=$(GD_ASYNC_KATANA)
 
 OBJCOPY	= $(TARGETOBJCOPY)
 READELF	= $(TARGETREADELF)
@@ -398,6 +416,9 @@ endif
 
 ifeq ($(WITH_MAPLE),1)
   DCLOBJECTS += maple.o
+endif
+ifeq ($(WITH_IRQ_HOOK),1)
+  DCLOBJECTS += irq.o irq_hook.o
 endif
 EXCOBJECTS	= exception.o
 

@@ -745,3 +745,486 @@ the request the way the drive does. Points to settle first:
    interrupt-driven service needs.
 3. Re-verify the VBR before patching it, as isoldr's `exception_vbr_ok()`
    does; a wrong patch shows no screen and no exception.
+
+## 9. The interrupt hook, phase 1: installed and counted (2026-09-27)
+
+Plan, in order, one measurement between each step: (1) the hook alone, its tick
+doing nothing; (2) CD-DA fed from the tick, under a single network owner;
+(3) reads served asynchronously, so CE's GD thread sleeps while the tick fills
+the stage -- CE's wait loop `Sleep(5)`s on PROCESSING with `status[3] == 0`
+(§7e), which is what lets the menu thread run; (4) the CD-DA fetch split the
+same way, out of the interrupt; (5) Katana titles, behind a flag. No IRQ is
+routed to the loader: every interrupt already enters at `VBR+0x600`, so the
+title's own (CE's TMU0 tick) are the heartbeat.
+
+**Phase 0, offline.** `0WINCEOS.BIN` (track 21, LBA 548386, 1257472 bytes),
+loaded at `0x8c010000` after its first sector: the word at `+0x0c` is
+`0x8c0120e0`, `+0x30` = `0x8c012110`, the VBR. At `VBR+0x600`
+(`0x8c012710`): `mov.l @(40,r7),r6 ; mov.l @(0x8c01279c),r0 ; mov r6,r1`
+(`567a d022 6163`) -- the literal is `VBR+0x68c` and holds `0x8c145c04` -- and
+`VBR+0x5dc..+0x600` is zero. So isoldr's `wince_entry` rebuilds exactly what
+it replaces, and the words under the vector are free. (isoldr copies its
+trampoline to `+0x5dc`, not `+0x5ec`; §5 above.)
+
+**Phase 1** (`irq.c`, `irq_hook.S`, AGENTS.md 4.15): the template goes to
+`+0x5e8..+0x606` of the live table, from ReqCmd/GetCmdStat under the MMU, only
+over that exact pattern. The entry switches to the Maple page's top before
+any push, saves r1-r14, mach/macl/pr/gbr, SR, and -- FD cleared -- FPSCR,
+FPUL and both FP banks, calls `irq_tick()`, and resumes at `+0x606` with the
+three instructions rebuilt, touching no other register (isoldr clobbers
+bank-1 r2/r3). `irq_tick()` counts, reads INTEVT and times itself.
+
+`_end` `0x8c00c434` → `0x8c00c74c` (+792 B). The host's `relocate` refused
+the result ("leaves under 800 bytes of stack"): it measured the link's
+`(_stack - _end) > 800` from the top of `.gdstage`, which lives inside the
+stack on purpose. Fixed in dcload-ip-rs `src/loaders.rs` to the link's two
+ASSERTs; relocation checked at `0x8cee0000`, `0x8ce00000`, `0x8c004000`,
+`0x8cfe8000`, 261 host tests pass. **The host must be rebuilt** (it also
+gains an "Interrupt hook" group in `--diag`).
+
+Sets: `loaders-wince-irq/` `50b101a9…` (DHCP, console) and
+`loaders-wince-irq-flycast/` `fadf40a4…` (192.168.1.130, `CDDA_TICKS_X8192`
+580480); A/B against `loaders-wince/` `8d190907…`.
+
+What to read: Sega Rally 2 boots and plays as before; `g_irq_hooked` 1,
+`g_irq_vbr` `0x8c012110`, `g_irq_refused` 0 (or, if 1, `g_irq_refused_vbr` is
+the table seen before CE's), `g_irq_entries` and `g_irq_ticks` climbing at
+roughly CE's tick rate (~1 kHz if TMU0 is 1 ms), `g_irq_tick_max` a few µs.
+Positive control: without the hook `g_irq_entries` stays 0. Not yet run.
+
+## 9b. First flycast run: the hook works, and it found the FPU door (2026-09-27)
+
+`loaders-wince-irq-flycast/` `fadf40a4…`: frozen a few reads after
+"Enabling Full MMU support". One attach: CE in its scheduler's idle loop (PC
+`0x8c0176da`, SR `0x40008000`), **`g_gd_in_transfer` 1**; the hook installed
+and running (`g_irq_hooked` 1, `g_irq_vbr` `0x8c012110`, the patch in place
+with literals `0x8cef0000`/`0x8cee078c`, `g_irq_entries` = `g_irq_ticks` =
+2978, last INTEVT `0x360`). The top of the Maple page held the hook's last
+frame (saved SR `0x70008000`), and below it exchange frames mixed with
+**return addresses into CE's kernel** (`0x8c01151e`, `0x8c02412a`,
+`0x8c024548`): CE's own exception handling had run on the exchange stack.
+
+Mechanism: SR `0x40008000` has FD set -- CE switches the FPU lazily, and its
+threads run with FD = 1 until they use it. The exchange executes FPU
+instructions (`SH4_aligned_memcpy`'s `fmov.d` in `cmd_partbin`, GCC's spills
+to FP registers), so the first one raised an FPU-disabled exception, which
+the general handler (`VBR+0x100`) takes on the current stack -- ours -- after
+setting IMASK 0 (§7q). An interrupt then preempted the GD thread there, and
+the hook, whose stack top was the same address, wrote over the exchange's
+live frames. Before the hook the same window let CE preempt an exchange (the
+preemptions of §7o-7q, which were blamed on the TLB alone) without corrupting
+it.
+
+Changes: `gd_on_loader_stack()` runs the exchange with FD clear and the FP
+registers saved and restored (`fpu_push`/`fpu_pop`, `cdfs_redir.s`, shared
+with the hook), so an exchange no longer enters CE at all; and the hook's
+stack is the Maple page's first KB, apart from the exchange's. `_end`
+`0x8c00c76c`. Sets: `loaders-wince-irq/` `c8106cb6…`,
+`loaders-wince-irq-flycast/` `9e42ce5f…`.
+
+## 9c. Phase 1 measured under flycast (2026-09-27)
+
+`loaders-wince-irq-flycast/` `9e42ce5f…`: Sega Rally 2 runs, no freeze
+("works perfectly"). `--diag`: `g_irq_hooked` 1 at `0x8c012110`, no refusal,
+no re-hook; `g_irq_entries` = `g_irq_ticks` = 31986, **+1783 in 3.43 s, about
+520 interrupts a second** (last INTEVT `0x360`, a Holly level) -- the tick
+phase 2 will run on; `g_irq_tick_max` 0 (under one TMU2 tick). `g_gd_park_longs` 15.
+
+Not the hook's, and still there: `g_cdfs_read_fails` 32 = `_stale` 32 =
+`g_fine_timeouts` 32 = `g_rx_overflow` 32 (`g_rx_missed` 64): 32 chunks whose
+ring overflowed and which were asked again after the 250 ms deadline, about
+8 s of reads spent waiting. CD-DA as before phase 2: `g_cdda_svc_gap_max`
+540 ms, `g_cdda_room_min` 16.4 ms, one mute. Console not yet run.
+
+## 9d. Phase 1 on the console; phase 2 built (2026-09-27)
+
+Console, `loaders-wince-irq/` `c8106cb6…`: hooked at `0x8c012110`, no
+refusal, `g_irq_entries` +2133 in 3.58 s (**~600 a second**), `g_irq_tick_max`
+12 TMU2 ticks (~1 µs); one failed read in the whole session (against 32 under
+flycast), `g_cdda_svc_gap_max` 575 ms, `g_cdda_room_min` 184.6 ms, no mute.
+(`g_gd_spindown` 8: the boot-time drive stop never finished -- unrelated.)
+
+Phase 2: `irq_tick()` calls `cdda_service_tick()` at most every 5 ms while the
+GD lock is free: one sub-fetch per call, no listening window. `_end`
+`0x8c00c7ec`, 20 B under the HIGH bound. Sets `loaders-wince-irq2/`
+`c7674994…`, `loaders-wince-irq2-flycast/` `2dd34013…`; A/B against the
+phase-1 sets. What to read: `g_cdda_svc_gap_max` down from ~550 ms to a few
+ms, `g_cdda_room_min` near the 893 ms lead, `g_cdda_mutes` 0,
+`g_irq_tick_max` ~3 ms (one sub-fetch inside the interrupt), and the menu
+music (track 8) without the glitches of 7u.
+
+## 9e. Phase 2 measured under flycast (2026-09-27)
+
+(A first run was the phase-1 set by mistake: its code in memory matched
+`loaders-wince-irq-flycast` word for word, 7136 of 7168, the phase-2 set 6180
+-- compare the code, not the counters, before reading a run.)
+
+`loaders-wince-irq2-flycast/` `2dd34013…`: **`g_cdda_svc_gap_max` 20.0 ms**
+(550-575 ms in every run before), **`g_cdda_room_min` 893.6 ms** -- the whole
+lead, never dipped into -- `g_cdda_mutes` 0, `g_cdda_fetch_fails` 0; fetches
++62 in 3.32 s = 18.7 a second, the audio's own rate. `g_irq_tick_max` 8.6 ms:
+the longest the title's interrupts waited behind a service in the tick (a
+sub-fetch under flycast, or a prime). Unchanged and not the hook's: the ring
+still overflows under flycast (`g_rx_overflow` 44, `g_cdfs_read_fails` 46).
+
+## 9f. Phase 3: asynchronous reads (2026-09-27)
+
+Phase 2 on the console: music clean, all good. Before phase 3 a doubt was
+raised here and answered by the user's question -- "how does the drive do
+it?". A GD-ROM moves ~1-1.8 MB/s, so the menu's 604 KB take it ~0.4 s, longer
+than we do (~0.14 s), and the menu does not stop: the CPU is free during a
+drive read. So the stop is the loader keeping the CPU (61 masked exchanges in
+one ExecServer), not the read's length, and 7s got worse only because nothing
+moved while CE slept.
+
+`data_transfer_async()` (AGENTS.md 4.15): the thread posts a chunk and sleeps
+(`WAIT_INTERNAL` → `Sleep(5)`), the tick drains the ring and gives the verdict,
+the next ExecServer copies it out and posts the next. `GD_STAGE_BIG_SECTORS`
+5 → 4 to make room (+1 KB of code; `_end` `0x8c00cbe4`, 1052 B under the HIGH
+bound). Sets `loaders-wince-irq3/` `0e8ba96d…`, `loaders-wince-irq3-flycast/`
+`d71eaa74…`.
+
+What to read: the menu no longer stopping while its 604 KB come in; that
+stream's own music not starving (the read is now ~0.4 s, like a drive);
+`g_ga_posts` climbing, `g_ga_irq_done` close to it (the tick, not the thread,
+reaching the verdicts), `g_ga_waits` ~1 per post; `g_cdfs_read_fails` and
+`_holes` unchanged; `g_rx_overflow` not up (the ring now waits for a tick
+between polls). The host needs a rebuild for the three new `--diag` rows.
+
+## 9g. The thread wakes ten times a second: the tick has to move the read (2026-09-27)
+
+First phase-3 run, flycast: the menu froze and its streamed music stopped.
+The engine itself was sound -- `g_ga_irq_done` 603 of 605 posts, one failed
+chunk, and **`g_rx_overflow` 0** (32-46 in every earlier flycast run) -- but
+ExecServer went +51 in 4.92 s: **CE's GD thread woke ~10 times a second**,
+not every 5 ms, and one 8 KB chunk per wake is 72 KB/s; the 604 KB read took
+~8 s. (Likely CE's 100 ms quantum: the menu thread never sleeps, and a real
+drive wakes the GD thread with its interrupt instead.)
+
+So the tick now copies the done chunk into the title's buffer and posts the
+next itself. The obstacle was the buffer's virtual address: a TLB miss with
+SR.BL set resets. The thread translates the next 128 pages on each wake with
+the UTLB probe of 7e/7f (now built with the hook: touched masked, read from
+P2; flycast implements the arrays), purges the buffer's lines through the
+virtual address so no dirty line of CE's is written back over the new data,
+and the tick writes through P1 and writes back. `_end` `0x8c00cf84`, 96 B
+under the HIGH bound; `ga_xpa[]` 512 B in `.hiram`. Sets (replacing 9f's)
+`loaders-wince-irq3/` `0607c2b3…`, `loaders-wince-irq3-flycast/` `71ba734d…`.
+
+What to read: the menu drawing through its reads and its stream not starving;
+`g_ga_irq_done` close to `g_ga_posts` with `g_ga_waits` far below them (a few
+per read, not one per chunk); `g_ga_xlat_miss` 0.
+
+## 9h. No freeze; the menu's stream still stopped: 1 KB pages (2026-09-27)
+
+`loaders-wince-irq3-flycast/` `71ba734d…`: no freeze, but after a while the
+selection menu's streamed music stopped. `g_ga_xlat_miss` 711 (+133 in
+3.58 s) and `g_ga_irq_done` +7 of +73 posts: the probe kept missing, so
+almost every chunk waited for the thread's copy again. The table assumed 4 KB
+pages; CE maps process memory in **1 KB** pages (7f's 4 KB page was a buffer
+the driver had locked for DMA). The probe asked for the 4 KB-aligned address
+while the entry covered only the kilobyte touched -- and a 4 KB run assumed
+contiguous would have been written to the wrong place when it did match. Now
+1 KB granularity, 128 entries = 128 KB ahead per wake (~1.3 MB/s at ten
+wakes a second), and `g_ga_xlat_sz` ORs the sizes met.
+
+Also `g_cdda_wrong_lba` +5 with `g_cdda_fetch_fails` +5: a chunk was
+declared done on its whole window before its ReturnValue came; the
+ReturnValue stayed in the ring and met the next CD-DA fetch. A chunk is now
+done with its ReturnValue (or whole at the deadline).
+
+`_end` `0x8c00cf9c`. Sets `loaders-wince-irq3/` `8b2bed7f…`,
+`loaders-wince-irq3-flycast/` `75d07988…`. What to read: `g_ga_xlat_miss` 0,
+`g_ga_xlat_sz` 0x400 (or with 0x1000), `g_ga_irq_done` close to
+`g_ga_posts`, `g_ga_waits` far below, `g_cdda_wrong_lba` 0, and the menu's
+music running on.
+
+## 9i. The pages were 4 KB; the probe misses because of flycast (2026-09-27)
+
+`loaders-wince-irq3-flycast/` `75d07988…`: better, but selecting a menu entry
+froze 3-4 s and the menu's music stopped for good. `g_ga_xlat_sz` 0x1000:
+**only 4 KB pages** -- 9h's 1 KB hypothesis was wrong (harmless: 1 KB steps
+over 4 KB pages are right, only finer). `g_ga_xlat_miss` still +115, and the
+host log shows the reads at the thread's pace: chunks ~50 ms apart with a
+few 4 ms bursts where a translation held, 602 KB in 2.53 s (238 KB/s) and
+868 KB in 4.87 s (178 KB/s). The game waited on those loads: the freeze.
+
+Why the probe misses a page just touched: flycast is built with `FAST_MMU`
+(`core/build.h`; `hw/sh4/modules/fastmmu.cpp`). It keeps translations in its
+own 65536-entry table, so a load succeeds from that cache after the entry has
+left the 64-entry UTLB -- no exception, CE reloads nothing, the probe finds
+nothing. A real SH4 must have the entry in the UTLB to access the page, so
+the probe should hold on the console.
+
+The weakness it exposed is ours: with nothing translated, the read trickled
+at the thread's wake rate, far worse than before phase 3. Now, when a chunk
+is to be posted and nothing is translated, the read finishes in the old
+synchronous loop (`g_ga_sync`). `g_ga_xlat_sz` and `g_ga_waits` removed for
+room: `_end` `0x8c00cff4`, `.gdstage` ends exactly at `_stack` (12 B left;
+next lever `WITH_GD_SPINDOWN=0`). Sets `loaders-wince-irq3/` `452a90a4…`,
+`loaders-wince-irq3-flycast/` `8c8949be…`.
+
+What to read: under flycast, loads back to their pre-phase-3 speed with
+`g_ga_sync` climbing; on the console, `g_ga_xlat_miss` ~0, `g_ga_sync` 0,
+`g_ga_irq_done` close to `g_ga_posts`, and the menu drawing through its reads.
+
+## 9j. Translating by CE's page tables (2026-09-28)
+
+`loaders-wince-irq3-flycast/` `8c8949be…` under flycast: the menu freeze is
+back, same frequency and length as before phase 3, and the menu's music
+repeats while it lasts (CE's sound thread does not run, its stream buffer
+loops). That is the synchronous fallback of 9i doing what it was built to do.
+
+How flycast translates CE's addresses at all: with `FAST_MMU`, a miss in its
+own table is resolved by `wince_resolve_address()` (`USE_WINCE_HACK`,
+`core/hw/sh4/modules/wince.h`), which walks **CE's page tables** the way
+CE's TLB refill does: `TTB` (0xff000008) → 64 section pointers (va >> 25) →
+512 MemBlock pointers ((va >> 16) & 0x1ff; 0 and 1 are the empty and
+reserved blocks) → at MemBlock + 12, one word per 4 KB page ((va >> 12) &
+0xf), the PTEL plus one, 0 while uncommitted. Those tables are CE's, so they
+are there on the console too.
+
+`ga_translate()` now uses that walk (`ga_walk()`) instead of the UTLB probe:
+touch the page, walk, then **check** -- invert one byte of the buffer through
+the virtual address (the read overwrites it anyway), purge the lines through
+it, and read the byte back through P2 at the physical address found. A walk
+that is wrong on some CE stops the translation, and the read goes the old
+way; it cannot send the tick's copy to the wrong place. The walk also only
+accepts a page in main RAM. Pages are 4 KB (`GA_XPAGE` 0x1000,
+`GA_XLAT_PAGES` 32: still 128 KB ahead). The probe and the masking around it
+are gone from this path (kept for `GD_TRACE_VADDR`): `_end` `0x8c00cf6c`,
+128 B left under the HIGH bound.
+
+Sets `loaders-wince-irq3/` `403c4273…`, `loaders-wince-irq3-flycast/`
+`20c4c2fa…`. What to read, now on both: `g_ga_xlat_miss` ~0, `g_ga_sync` 0,
+`g_ga_irq_done` close to `g_ga_posts`, the menu drawing through its reads and
+its music not stopping.
+
+## 9k. The last track replayed, garbled, through every load (2026-09-28)
+
+With 9j the reads are asynchronous under flycast too, and the menu draws
+through them. But while the menu or a race loads, the last CD-DA track keeps
+playing, corrupted. Cause: `irq_tick()` services CD-DA only when
+`gd_async_tick()` has nothing on the wire, and the tick posts the next chunk
+the moment it commits one -- so across a load of several MB CD-DA was never
+serviced. The ring (1.39 s) went on playing itself, and the overrun mute and
+the gap limit, which live in `cdda_service()`, never ran to stop it. The
+synchronous loop had `cdda_service_between_chunks()`; the tick now calls
+`cdda_service_tick()` between committing a chunk and posting the next (one
+sub-fetch at most, nothing on the wire at that point). `_end` `0x8c00cf7c`.
+Sets `loaders-wince-irq3/` `ee740b07…`, `loaders-wince-irq3-flycast/`
+`c33f4b76…`.
+
+Note: a real GD-ROM cannot play audio and read data at once -- a read stops
+the playback. The loader keeps the music going through reads (it did for
+Katana titles, §4.13); if the title expects silence during a load, that is
+the next difference.
+
+## 9l. The same engine for Katana titles (2026-09-28)
+
+Asked for: the asynchronous reads for every title, so that one streaming
+while it plays (Crazy Taxi: 3-8 sectors every ~60 ms and 73-sector music
+reads, each 16 KB chunk ~5 ms of frozen title, §16 of AGENTS.md) keeps its
+frames.
+
+No interrupt hook for them. A Katana title calls ExecServer every frame, and
+in a loop while it waits on a load (Sonic Adventure: ~43000 ExecServer for
+~120 ReqCmd); that is tick enough, and it spares patching each title's own
+vector table (the plan's phase 5, and the thing the 2026-08 hook failed at).
+With the MMU off the buffer is physical: nothing to translate, the host
+writes the title's buffer directly, as the synchronous path does.
+
+So `gd_async_on()` now also admits a Katana title (`GD_ASYNC_KATANA`, BBA
+only), and `data_transfer_async()` does on each wake what the tick does
+under CE: collect, feed CD-DA (`cdda_service_between_chunks()`, 9k's lesson
+-- a chunk is in flight across frames, so `GetDrvStat`'s service declines
+nearly always during a read), post the next, yield. `g_ga_wakes` counts the
+resumes with a chunk on the wire: read against `g_ga_posts`, it says how
+many ExecServer calls a chunk took.
+
+Risk on record: this yields between chunks, which is what
+`GD_YIELD_BETWEEN_CHUNKS` was measured to kill Sonic Adventure with
+(`sonic-adventure-investigation.md`, "chunk 1"). That measurement dates from
+the week SA's stack ran through the loader's image, which was the cause of
+the other deaths then; the host now places Katana titles high. Unproven
+either way until SA is run.
+
+`_end` `0x8c00cf8c`, 96 B left under the HIGH bound. Sets `loaders-async/`
+`032c0498…` and `loaders-async-flycast/` `6642ea78…` (CE included; the
+`loaders-wince-irq3*` sets stay as the last validated CE build).
+
+What to read: Crazy Taxi's micro-freezes gone (and its music stream fine);
+Sonic Adventure's and Snow Surfers' loads not slower, no death;
+`g_cdfs_read_fails`/`_holes` 0, `g_rx_overflow` not climbing (the ring holds
+a chunk while the title runs), `g_cdda_room_min` healthy during loads.
+
+## 9m. No lag any more, but menu loads at ~350 KB/s (2026-09-28)
+
+`loaders-async*` (9l): the lag while playing is gone, but menu loads run at
+~350 KiB/s. That is one 8 KB chunk per ExecServer at one ExecServer a frame
+(400 KB/s at 50 Hz, less the frames a chunk was not in yet): this title calls
+ExecServer once a frame while it waits, not in a loop as Sonic Adventure's
+call count had suggested.
+
+A read of `GD_ASYNC_BULK` (32) sectors or more is taken for a loading screen
+(isoldr's own heuristic for its bulk reads) and gets a budget: each wake keeps
+collecting and posting for `GD_ASYNC_BULK_TICKS` (6 ms) before yielding --
+~3 chunks a frame, ~1.5 MB/s, with the screen keeping two thirds of each
+frame. Smaller reads stay at one chunk a wake. Not under CE, whose thread must
+sleep while the tick works. `_end` `0x8c00cfcc`: **32 B left** under the HIGH
+bound; the next change spends `WITH_GD_SPINDOWN=0`. Sets `loaders-async/`
+`d14183c3…`, `loaders-async-flycast/` `472354a4…`.
+
+To tune from the host log: the sizes of the `ReadSector` requests during a
+menu load and during play. If a title streams reads of 32 sectors or more
+while playing, the lag comes back on those, and `GD_ASYNC_BULK` goes up.
+
+## 9n. The hook in Katana titles (2026-09-28)
+
+9m on the console, with the host log of a Crazy Taxi session (60 Hz):
+- reads of 32+ sectors moved 3 chunks a frame (the 6 ms budget), but each
+  read then lost 3-4 frames (46-65 ms) before the next one's first chunk;
+  loads ran at 440-910 KiB/s;
+- smaller reads, one chunk a frame (17 ms apart);
+- in play, the 73-sector music reads (`0x82fa8`...) took the budget, and the
+  player felt it.
+
+No size separates a loading screen from a stream, and any throughput above one
+chunk per ExecServer bought with a spin is paid in the title's frame. What CE
+has and Katana lacked is a tick between frames. So the hook goes into Katana
+titles too.
+
+Crazy Taxi's crt0 sets VBR to `0x8c00f400` -- our `exception.bin` -- and
+copies 32 bytes to `+0x100`, `+0x400` and `+0x600` (from `0x8c010d40`):
+six nops, `mov.l r0,@-r15 ; mov.l @(disp,pc),r0 ; jmp @r0 ; mov.l r1,@-r15`,
+the literal patched after the copy; `+0x620` gets another 32 (`0x8c010d20`).
+isoldr's `katana_entry` relies on the same nops (it resumes at `+8`). Over
+three nops nothing needs rebuilding, so `irq_hook_check()` now accepts a
+vector starting with three nops as well as CE's, with zero or nop padding
+under it (`exception.bin` pads with nops), and `irq_out` gives back r0, r1 and
+r15 and resumes at `+0x606`. Only r0 and r1 are free there: the title's r0 is
+parked just under its SP -- where the entry's `mov.l r0,@-r15` puts it again
+-- and popped in the delay slot.
+
+Around it: the tick keeps off the network while `cdda_busy` (a Katana
+`GetDrvStat` services CD-DA before taking the GD lock); network code called
+from the tick runs on the loader's stack (`gd_in_irq()`, SR.BL), the hook's
+own being 1 KB; a read on the wire is looked at every 0.5 ms at most (a Katana
+title may take thousands of interrupts a second); the read's first chunk is
+posted before the server's initial yield (one frame less per read); the spin
+budget of 9m is gone. `gd_async_on()` now requires the hook for Katana too:
+without it, reads stay synchronous. Footprint: `WITH_GD_SPINDOWN=0` by default
+(-160 B), 32 B left under the HIGH bound, `_end` `0x8c00cfc4`.
+
+Sets `loaders-async/` `3b538dde…`, `loaders-async-flycast/` `e4011af6…`.
+
+What to read: `g_irq_hooked` 1 and `g_irq_nop_entry` 1 on a Katana title,
+`g_irq_entries` climbing (how many interrupts it takes a second), `g_ga_irq_done`
+close to `g_ga_posts`; in the host log, the chunks of one read ~2-3 ms apart
+whatever their size, and consecutive reads ~1-2 frames apart; Crazy Taxi
+smooth in play; Sonic Adventure alive.
+
+## 9o. Woken by the BBA itself (2026-09-28)
+
+9n on the console, Crazy Taxi: the hook is in (`g_irq_hooked` 1,
+`g_irq_nop_entry` 1, VBR `0x8c00f400`), `g_ga_irq_done` 4092 of 4095 posts,
+`g_irq_entries` ~790 a second, `g_irq_tick_max` 1.3 ms. But slowdowns remain
+in play, and loads run at 635-670 KiB/s (7.01 MiB in 11.3 s, 5.08 in 7.8).
+In the host log a 73-sector read's chunks come 3 to 13 ms apart, 5.9 ms on
+average (19 chunks in 112 ms), where a round trip is ~2.5 ms: the tick only
+runs on the title's interrupts, which come bunched around the frame (INTEVT
+`0x320`, Holly IML6 -- this read "IML2" until 9q), and a chunk that is back
+waits for the next one.
+
+A drive wakes its system when the data is there. So does the BBA: the chip
+raises its line already (GAPS `0x1414` = 1, `RT_INTRMASK` = the RX bits); only
+Holly's routing is missing. `irq_rx_arm()` sets EXT bit 3 (KOS's
+`ASIC_EVT_EXP_PCI`) in IML4 (IRL 11, INTEVT `0x360`) from the post of a chunk
+to its verdict, and only if the title left IML4's three masks at zero when the
+hook went in. The tick then acknowledges the chip (`rtl_irq_ack()`, the RX
+status bits -- the loop keeps finding frames through its RxBufEmpty net),
+looks at the read without waiting for the 0.5 ms pacing, and, when nothing of
+the title's is on IML4, `irq_entry` returns with `rte` itself: the title's
+handler never sees an interrupt it did not ask for.
+
+Also: chunks into a physical buffer are 6 sectors (`GA_PHYS_SECTORS`, ~13.3
+KB of the 16 KB ring with headers, what it holds even undrained), a third
+fewer round trips. Room: `WITH_PMCR_CMD=0` by default -- no host sends
+`PMCR`, not dc-tool, not dcload-ip-rs, not the scripts -- which leaves 576 B
+under the HIGH bound (`_end` `0x8c00cdb0`).
+
+Sets `loaders-async/` `ac48ed78…`, `loaders-async-flycast/` `ceea13fd…`.
+
+What to read: `g_irq_rx` climbing during reads; in the host log, a read's
+chunks ~2.5-3 ms apart and now 12 KB each; loads well above 670 KiB/s;
+`g_rx_overflow` still 0 (6 sectors must fit the ring). If `g_irq_rx` stays 0
+with reads going on, the title uses IML4 or the level is masked: the tick
+falls back to the title's interrupts, as in 9n.
+
+## 9p. Crazy Taxi uses IML4 (2026-09-28)
+
+9o on the console: `g_irq_rx` 0, `g_irq_evt_last` `0x360`. The level 9o
+wanted was Crazy Taxi's own: its IML4 masks were not zero when the hook went
+in, so `irq_rx_arm()` never armed, and the tick stayed on the title's
+interrupts -- only ~190 a second in that phase (`g_irq_entries` +380 in 2 s),
+141 chunks of 12 KB in 2 s, one every ~14 ms. `g_rx_overflow` 0 with 6-sector
+chunks, and no read failed.
+
+Now the level is the highest of IML6/IML4/IML2 the title leaves empty, else
+IML6, shared: the tick acknowledges the chip, and the interrupt is swallowed
+only when nothing of the title's is pending on that level (IST & its masks);
+otherwise the title's handler runs and finds our bit already clear.
+`g_irq_rx_evt` names the level chosen and `g_irq_iml[9]` keeps the masks the
+title had, so the next reading says what Katana uses where. `_end`
+`0x8c00ce78`, 384 B left. Sets `loaders-async/` `3af660b6…`,
+`loaders-async-flycast/` `52e14a72…`.
+
+## 9q. IML2 and IML6 were swapped: 9p froze the title (2026-09-28)
+
+9p on the console: Crazy Taxi read its TOC and five single sectors, then
+nothing -- no further disc read, and not even `SendBinQ` answered. The code
+named the levels' INTEVTs the wrong way round: IML2 (`0xa05f6910`) is IRL 13,
+INTEVT `0x3a0`, and IML6 (`0xa05f6930`) IRL 9, `0x320` (KOS `asic.c`:
+"691x -> irq 13 ... 693x -> irq 9"); only IML4's `0x360` was right, which is
+why 9o, IML4 only, never showed it. Crazy Taxi takes interrupts on IML6
+(`0x320`, 9n) and IML4 (`0x360`, 9p), so 9p picked the free IML2 and expected
+it as `0x320`: every IML6 interrupt of the title's was taken for ours,
+checked against IML2's empty masks, and swallowed with `rte`. The source was
+never cleared, the interrupt came straight back, and the machine spun there
+for good with the title never running again.
+
+Two changes. The INTEVT is `0x3a0 - 0x10 × (level offset)`. And an interrupt
+is swallowed only when the chip's EXT bit was pending at that entry and
+nothing of the title's is: an entry the loader did not cause always reaches
+the title, so the same kind of mistake can no longer take its interrupts
+away. `_end` unchanged (384 B left). Sets `loaders-async/` `38cc01c8…`,
+`loaders-async-flycast/` `b63f5f1f…`.
+
+## 9r. A look takes what the ring holds and leaves (2026-09-28)
+
+9q on the console: the BBA routed to IML2 (`g_irq_rx_evt` `0x3a0`; Crazy
+Taxi's masks: IML4 NRM `0x7f000`, IML6 NRM `0x2807ec` and ERR `0xe`, IML2
+empty), `g_irq_rx` +198 for 101 chunks, 100 of them finished by the tick.
+Loads were fast; play still stuttered a little. `g_irq_tick_max` was 1.8 ms:
+a look drained the ring for `GA_POLL_ITERS` (64) loop turns, and a turn takes
+every frame already queued, so a look that met a chunk's first frame rode the
+whole burst on the wire (~1.3 ms) with SR.BL set -- the title's vsync and
+render interrupts held off, and the CPU mostly waiting for packets.
+
+`GA_POLL_ITERS` is 2 now: take what is there and leave; the RX interrupt
+brings the tick back for the next frames. `g_irq_tick_sum` adds every tick's
+time up (`--diag` shows its growth in ms), which is the CPU the hook takes.
+`_end` `+0x8e8c`, 352 B left under the HIGH bound. Sets `loaders-async/`
+`a789b599…`, `loaders-async-flycast/` `927fd4f1…`.
+
+Measured on the console (Crazy Taxi, play, 6.2 s): `g_rx_polls` +489 where
+it was +11212 in 11 s -- the waiting is gone -- and `g_irq_tick_sum` +145.6
+ms for 97 chunks: **1.5 ms of CPU a chunk, 2.4 % of the machine**, all of it
+now the copy itself (~10.6 frames a chunk, ~140 µs each: the CPU reads the
+BBA's SRAM over G2 at ~10 MB/s). The user: "a liiiittle bit of stutter ...
+mostly good". What is left is that cost arriving in bursts: a 73-sector music
+read is 13 chunks, ~19 ms of CPU inside ~40 ms. The lever is G2 DMA for the
+copy (the CPU free while the bus moves the frame), not the schedule.
+`g_cdfs_read_fails` 42 = `g_fine_timeouts` 42 over the session, none in the
+sampled interval, `g_cdfs_read_stale` 13: where they fall (load or play) and
+whether `--diag` causes them is not known yet.

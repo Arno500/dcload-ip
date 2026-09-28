@@ -1145,6 +1145,10 @@ static int cdda_fill_due(void)
  * for the same sectors (the host answers a re-ask with the same bytes); so does
  * a title DMA into sound RAM that began while we were on the network.
  */
+/* Set around cdda_service_between_chunks() and cdda_service_tick(): no
+ * listening window; and, from the tick only, one sub-fetch per call. */
+static unsigned int svc_no_listen, svc_one;
+
 static unsigned int cdda_fill(void)
 {
 	unsigned int budget = CDDA_FETCHES_PER_SERVICE;
@@ -1173,6 +1177,10 @@ static unsigned int cdda_fill(void)
 			 ? (unsigned int)CDDA_LEAD_FETCHES : catch_up;
 	}
 
+	if (svc_one)
+	{
+		budget = 1u;	/* from the interrupt hook: called every few ms */
+	}
 	while (budget != 0u && cdda_fill_due())
 	{
 		unsigned int sectors =
@@ -1251,8 +1259,6 @@ static void cdda_prime_step(void)
 
 /* ------------------------------------------------------------ the service */
 
-/* Set only around cdda_service_between_chunks(): no listening window. */
-static unsigned int svc_no_listen;
 
 static void cdda_service_body(void)
 {
@@ -1329,11 +1335,13 @@ static void cdda_service_body(void)
 #endif
 }
 
+/* Not re-entrant: a fetch runs bb->loop(), which can dispatch a title's
+ * GetDrvStat that calls back into here (isoldr's lock_cdda()). Public so the
+ * interrupt hook's tick keeps off the network while it is set (irq.c). */
+volatile unsigned int cdda_busy;
+
 void cdda_service(void)
 {
-	/* Not re-entrant: a fetch runs bb->loop(), which can dispatch a title's
-	 * GetDrvStat that calls back into here (isoldr's lock_cdda()). */
-	static unsigned int busy;
 	unsigned int now;
 
 	/*
@@ -1343,7 +1351,7 @@ void cdda_service(void)
 	 * never finish. The read loop feeds the ring between chunks instead. And
 	 * not while a title DMA writes sound RAM.
 	 */
-	if (g_gd_in_transfer || busy || cd.state != CDDA_STATE_PLAYING
+	if (g_gd_in_transfer || cdda_busy || cd.state != CDDA_STATE_PLAYING
 	    || (!cd.running && !cd.priming) || aica_dma_busy())
 	{
 		return;
@@ -1365,9 +1373,9 @@ void cdda_service(void)
 	cd.svc_mark = now;
 	cd.svc_marked = 1;
 
-	busy = 1;
+	cdda_busy = 1;
 	cdda_service_body();
-	busy = 0;
+	cdda_busy = 0;
 }
 
 /* Feed the ring from inside a long disc read, which does not return to the
@@ -1377,6 +1385,23 @@ void cdda_service_between_chunks(void)
 {
 	svc_no_listen = 1;
 	cdda_service();
+	svc_no_listen = 0;
+}
+
+/*
+ * From the interrupt hook (irq.c), with SR.BL set, on the hook's own stack,
+ * and only while the GD lock is free -- i.e. while nothing of the GD path owns
+ * pkt_buf, bin_info or the ring. So each call stays short: one sub-fetch at
+ * most (~3 ms, the exchange itself on gd_on_loader_stack()'s stack), and no
+ * listening window, which would run the whole network path on the hook's 1 KB.
+ * Called every few ms, it keeps the lead whole without the title's help.
+ */
+void cdda_service_tick(void)
+{
+	svc_no_listen = 1;
+	svc_one = 1;
+	cdda_service();
+	svc_one = 0;
 	svc_no_listen = 0;
 }
 

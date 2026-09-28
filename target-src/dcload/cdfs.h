@@ -46,4 +46,9 @@ void gd_deadline_timer_start(void);
 void gd_spin_down_drive(void);
 extern unsigned int g_gd_spindown;
 
+/* Advance a disc read in flight from the interrupt hook's tick, GD lock free.
+ * Non-zero if one was in flight (cdfs_syscalls.c, data_transfer_async). */
+int gd_async_tick(void);
+int gd_async_busy(void);
+
 #endif

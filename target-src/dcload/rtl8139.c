@@ -724,6 +724,17 @@ int rtl_bb_init(void)
 	return 0;
 }
 
+/*
+ * From the interrupt hook (irq.c), which takes the chip's RX interrupt while a
+ * disc read is on the wire: clear the RX status bits so the line drops. The
+ * frames stay in the ring; rtl_bb_loop() finds them through its RxBufEmpty
+ * safety net even with RxOK gone.
+ */
+void rtl_irq_ack(void)
+{
+	nic16[RT_INTRSTATUS/2] = RT_INT_RX_ACK;
+}
+
 void rtl_bb_start(void)
 {
 	nic32[RT_RXCONFIG/4] |= 0x0000000a;

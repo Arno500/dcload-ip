@@ -113,6 +113,7 @@ typedef struct {
 } rtl_status_t;
 
 int rtl_bb_detect(void);
+void rtl_irq_ack(void);
 int rtl_bb_init(void);
 /* Warm start -- see the long comment at the top of rtl8139.c */
 void rtl_handoff_save(unsigned int ip);

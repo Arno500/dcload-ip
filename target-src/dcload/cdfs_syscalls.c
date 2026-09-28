@@ -74,6 +74,8 @@
 #include "cdfs.h"
 #include "cdda.h"
 #include "hiram.h"
+#include "irq.h"
+#include "memfuncs.h"
 
 /* Command codes, from the BIOS GD driver (same numbering as isoldr). */
 #define CMD_PIOREAD            16
@@ -659,10 +661,14 @@ HIRAM_BUF static unsigned int gd_stage[GD_STAGE_SECTORS * 512]
  * dead while a title runs -- so only a title under the MMU may use it: in the
  * LOW family that range is inside a Katana title's stack. The network exchange
  * no longer runs there either (gd_on_loader_stack uses the Maple page).
- * Five sectors is what fits under _stack in the HIGH family.
+ * Five sectors was what fitted under _stack in the HIGH family; four since the
+ * asynchronous reads (2026-09-27), whose code needed 1 KB of that room. A read
+ * served that way is one chunk per CE poll (5 ms), so four sectors is ~1.6
+ * MB/s -- a real drive's rate -- with the CPU free; the stream path, still
+ * synchronous, pays one round trip more per 20 sectors.
  */
 #ifndef GD_STAGE_BIG_SECTORS
-#define GD_STAGE_BIG_SECTORS 5
+#define GD_STAGE_BIG_SECTORS 4
 #endif
 static unsigned int gd_stage_big[GD_STAGE_BIG_SECTORS * 512]
 	__attribute__((section(".gdstage"), aligned(32)));
@@ -815,11 +821,22 @@ void gd_trace_always(char tag, unsigned int a, unsigned int b, unsigned int c)
  * A Katana title sees only that bb->stop(), which a successful answer's
  * cmd_retval() already did.
  */
+/* From the interrupt hook (SR.BL): its own stack is 1 KB, the loader's the
+ * rest of the Maple page -- free then, since the tick runs only while no GD
+ * syscall owns the network. */
+static int gd_in_irq(void)
+{
+	unsigned int sr;
+
+	__asm__ volatile ("stc sr,%0" : "=r" (sr));
+	return (sr >> 28) & 1U;
+}
+
 void gd_exchange(void (*fn)(void))
 {
 	unsigned int irq = bb_irq_hold();
 
-	if (irq)
+	if (irq || gd_in_irq())
 	{
 		gd_on_loader_stack(fn);
 	}
@@ -1020,6 +1037,501 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 	return CMD_STAT_COMPLETED;
 }
 
+#if GD_TRACE && GD_TRACE_VADDR
+/*
+ * THE UTLB ENTRY MAPPING A VIRTUAL ADDRESS (2026-09-26 for the trace below,
+ * the asynchronous reads used it until 2026-09-28). Measured on Windows CE's buffers:
+ * 4 KB copy-back pages, found where expected (docs/wince-investigation.md 7f).
+ * Call it through its P2 alias -- the TLB arrays are read from uncached code
+ * -- with interrupts masked, right after touching the page so the entry is
+ * there. gd_utlb_d is 0 if no valid entry for the current ASID maps va.
+ */
+static unsigned int gd_utlb_a, gd_utlb_d;
+
+/* log2 of the page size, by the data word's SZ1:SZ0 (1 KB, 4 KB, 64 KB, 1 MB) */
+static const unsigned char gd_page_shift[4] = { 10, 12, 16, 20 };
+
+static inline unsigned int gd_page_size(unsigned int d)
+{
+	return 1U << gd_page_shift[((d >> 6) & 2U) | ((d >> 4) & 1U)];
+}
+
+/* Runs from its P2 alias: the TLB arrays are read from uncached code. */
+static void gd_utlb_probe(unsigned int va)
+{
+	unsigned int asid = *(volatile unsigned int *)0xff000000U & 0xffU;
+	unsigned int i;
+
+	gd_utlb_a = 0;
+	gd_utlb_d = 0;
+	for (i = 0; i < 64; i++)
+	{
+		unsigned int a = *(volatile unsigned int *)(0xf6000000U | (i << 8));
+		unsigned int d = *(volatile unsigned int *)(0xf7000000U | (i << 8));
+		unsigned int mask = ~(gd_page_size(d) - 1U);
+
+		if (!(a & 0x100U) || ((a ^ va) & mask)
+		    || (!(d & 2U) && ((a & 0xffU) != asid)))
+		{
+			continue;
+		}
+		gd_utlb_a = a;
+		gd_utlb_d = d;
+		return;
+	}
+}
+
+#endif
+
+#if WITH_IRQ_HOOK
+/*
+ * ASYNCHRONOUS READS UNDER WINDOWS CE (2026-09-27, docs/wince-investigation.md
+ * 9f-9g).
+ *
+ * WHY. A real drive moves a read with the CPU free -- DMA, or interrupts --
+ * and Windows CE's GD thread sleeps meanwhile, so the menu keeps drawing
+ * through a 604 KB read that takes the drive ~0.4 s. Served synchronously the
+ * same read was 61 masked exchanges inside one ExecServer: the CPU was ours
+ * for ~0.1 s and the menu stopped.
+ *
+ * WHO MOVES IT. The interrupt hook's tick, at the network's pace: it drains
+ * the ring in bounded passes, gives each chunk its verdict (whole window =
+ * done, 250 ms = failed, a ReturnValue over a hole = stale, keep listening),
+ * copies a done chunk into the title's buffer and posts the next. The GD
+ * thread only starts the read and sees it end. It has to be that way round:
+ * CE's GD thread wakes about ten times a second while the menu draws -- a
+ * first version that had the THREAD copy and post each chunk moved 8 KB per
+ * wake, 72 KB/s, and the menu's stream starved (9f).
+ *
+ * THE BUFFER IS VIRTUAL, AND THE TICK CANNOT TAKE A TLB MISS (SR.BL is set:
+ * a miss there resets the CPU). So on each wake the thread translates the
+ * next GA_XLAT_PAGES pages of the buffer into physical ones -- by CE's own
+ * page tables (ga_walk), checked with a byte written through the virtual
+ * address and read back uncached at the physical one -- and purges the
+ * buffer's lines through the virtual address so no dirty line of CE's is
+ * later written back over what the tick put in RAM; the tick writes through
+ * P1 and writes its own lines back. A chunk whose pages are not translated
+ * yet waits for the thread, which copies it the old way. A physical
+ * destination (DMAREAD) needs none of this.
+ *
+ * WHO OWNS WHAT. The thread works with the GD lock held; the tick only while
+ * it is free (irq.c): never both, so _GDS and the table need no other lock.
+ * g_gd_in_transfer is up from a post to its verdict, so CD-DA keeps off the
+ * network and the window; it plays between chunks. BBA only: the LAN
+ * adapter's loop honours neither drain_iters nor the fine deadline.
+ */
+#define GA_IDLE   0U
+#define GA_POSTED 1U
+#define GA_DONE   2U
+#define GA_FAILED 3U
+/*
+ * Loop turns per look: take what the ring holds and leave. A turn drains
+ * every frame already queued; more turns only wait for the wire with SR.BL
+ * set. At 64 a look that met a chunk's first frame rode the whole burst
+ * (~1.3 ms, g_irq_tick_max 1.8 ms), the title's own interrupts held off all
+ * that time; the BBA's RX interrupt (irq.c) brings the tick back for the rest
+ * (9r). The second turn is for a frame whose header was not written yet.
+ */
+#ifndef GA_POLL_ITERS
+#define GA_POLL_ITERS 2
+#endif
+#ifndef GA_XLAT_PAGES
+#define GA_XLAT_PAGES 32		/* 128 KB of buffer ahead */
+#endif
+/*
+ * CE on the SH4 maps its memory in 4 KB pages, 16 to a 64 KB MemBlock
+ * (measured, 9i: the UTLB entries of a menu read were all 4 KB). 128 KB a
+ * wake, ten wakes a second, is ~1.3 MB/s: a real drive's rate.
+ */
+#define GA_XPAGE 0x1000U
+/*
+ * A chunk into a physical buffer (DMAREAD, Katana) is not bounded by the
+ * stage, only by the RX ring, which must be able to hold a whole answer while
+ * nobody drains it: 6 sectors are ~13.3 KB of the 16 KB with the headers
+ * (9 data packets, the LoadBinary, the ReturnValue). A third fewer round
+ * trips than 4 (9o).
+ */
+#ifndef GA_PHYS_SECTORS
+#define GA_PHYS_SECTORS 6
+#endif
+static volatile unsigned int ga_state;
+static unsigned int ga_start;		/* TMU2 at the post */
+static unsigned int ga_sc;		/* sectors in the chunk on the wire */
+static unsigned int ga_virt;		/* the title's buffer is translated */
+static unsigned int ga_req_end;		/* one past the buffer (virtual) */
+static unsigned int ga_xbase;		/* virtual page ga_xpa[0] maps */
+static unsigned int ga_xcount;		/* valid entries */
+HIRAM_BUF static unsigned int ga_xpa[GA_XLAT_PAGES];	/* P1 page addresses */
+volatile unsigned int g_ga_posts;	/* chunks requested this way */
+volatile unsigned int g_ga_irq_done;	/* ... finished by the tick, copy included */
+volatile unsigned int g_ga_xlat_miss;	/* pages the walk could not translate */
+volatile unsigned int g_ga_sync;	/* reads finished synchronously: nothing translated */
+volatile unsigned int g_ga_wakes;	/* the thread resumed with a chunk on the wire */
+
+/*
+ * The hook's tick moves the read: under Windows CE, and under a Katana title
+ * with GD_ASYNC_KATANA (its buffer is physical: nothing to translate).
+ */
+static int gd_async_on(void)
+{
+	return bb == &adapter_bba && g_irq_hooked && (GD_ASYNC_KATANA || gd_mmu_on());
+}
+
+static void ga_send(void)
+{
+	build_send_packet(sizeof(command_3int_t));
+}
+
+static void ga_drain(void)
+{
+	drain_iters = GA_POLL_ITERS;
+	bb->loop(0);
+	drain_iters = 0;
+}
+
+/* Masked and on the loader's stack, FPU usable: gd_exchange() without the
+ * bb->stop() at the end, because the answer is still to come. */
+static void ga_run(void (*fn)(void))
+{
+	unsigned int irq = bb_irq_hold();
+
+	if (irq || gd_in_irq())
+	{
+		gd_on_loader_stack(fn);
+	}
+	else
+	{
+		fn();
+	}
+	bb_irq_restore(irq);
+}
+
+/* Post the next chunk of the read _GDS describes. */
+static void ga_next(void)
+{
+	command_3int_t *command =
+		(command_3int_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
+	unsigned int most = ga_virt ? GD_STAGE_BIG_SECTORS : GA_PHYS_SECTORS;
+
+	ga_sc = (_GDS.param[1] < most) ? _GDS.param[1] : most;
+	memcpy(command->id, CMD_CDFSREAD, 4);
+	command->value0 = htonl(_GDS.param[0]);
+	command->value1 = htonl(ga_virt ? (unsigned int)gd_stage_big : _GDS.param[2]);
+	command->value2 = htonl(ga_sc * _GDS.sec_size);
+	bin_window_close();	/* judged on its own window: see ReadSectors() */
+	bin_echo_suppress(1);
+	syscall_retval = (unsigned int)-1;
+	g_gd_in_transfer++;
+	ga_state = GA_POSTED;
+	ga_start = TMU2_COUNT;
+	g_ga_posts++;
+	irq_rx_arm(1);
+	ga_run(ga_send);
+}
+
+static void ga_end(unsigned int verdict)
+{
+	irq_rx_arm(0);
+	bb->stop();
+	bin_echo_suppress(0);
+	g_gd_in_transfer--;
+	ga_state = verdict;
+	if (verdict == GA_DONE)
+	{
+		g_cdfs_sync_chunks++;
+	}
+	else
+	{
+		g_cdfs_read_fails++;
+	}
+}
+
+static void ga_poll(void)
+{
+	unsigned int late;
+
+	if (ga_state != GA_POSTED)
+	{
+		return;
+	}
+
+	ga_run(ga_drain);
+	late = (unsigned int)(ga_start - TMU2_COUNT) > GD_READ_DEADLINE_TICKS;
+	if (bin_window_complete())
+	{
+		/* Done with its ReturnValue, not before: left in the ring, it met the
+		 * next CD-DA fetch as a wrong LBA (9h). Whole and past the deadline
+		 * without it is done too -- the bytes are all there. */
+		if ((int)syscall_retval >= 0 || late)
+		{
+			ga_end(GA_DONE);
+		}
+	}
+	else if (late)
+	{
+		g_fine_timeouts++;
+		ga_end(GA_FAILED);
+	}
+	else if ((int)syscall_retval >= 0)
+	{
+		/* A ReturnValue over a hole: an earlier attempt's, most likely.
+		 * cmd_retval() stopped reception; keep listening. */
+		g_cdfs_read_stale++;
+		syscall_retval = (unsigned int)-1;
+		bb->start();
+	}
+}
+
+/* The done chunk goes to param[2]: through the translated pages, from any
+ * context. 0 if a page it needs is not translated (yet). */
+static int ga_copy_out(void)
+{
+	unsigned int va = _GDS.param[2];
+	unsigned int n = ga_sc * _GDS.sec_size;
+	unsigned int off = 0;
+
+	if (va < ga_xbase || va + n > ga_xbase + ga_xcount * GA_XPAGE)
+	{
+		return 0;
+	}
+	while (off < n)
+	{
+		unsigned int in = (va + off) & (GA_XPAGE - 1U);
+		unsigned int k = GA_XPAGE - in;
+		unsigned char *p = (unsigned char *)
+			(ga_xpa[(va + off - ga_xbase) / GA_XPAGE] | in);
+
+		if (k > n - off)
+		{
+			k = n - off;
+		}
+		memcpy(p, (unsigned char *)gd_stage_big + off, k);
+		CacheBlockWriteBack((unsigned char *)((unsigned int)p & ~31U),
+				    ((((unsigned int)p & 31U) + k + 31U) >> 5));
+		off += k;
+	}
+	return 1;
+}
+
+/* A done chunk counted in: _GDS moves on, and the read with it. */
+static void ga_commit(void)
+{
+	unsigned int bytes = ga_sc * _GDS.sec_size;
+
+	_GDS.param[1] -= ga_sc;
+	_GDS.param[0] += ga_sc;
+	_GDS.param[2] += bytes;
+	_GDS.transfered += bytes;
+	_GDS.lba = _GDS.param[0];
+	ga_state = GA_IDLE;
+}
+
+/*
+ * A page's P1 address by Windows CE's page tables, walked as its TLB refill
+ * does -- and as flycast's USE_WINCE_HACK does (core/hw/sh4/modules/wince.h),
+ * which is why this works there too: flycast's FAST_MMU serves translations
+ * from a cache of its own, so a UTLB probe misses pages a real SH4 would hold
+ * (9i). TTB holds 64 section pointers (32 MB each), a section 512 MemBlock
+ * pointers (64 KB each; 0 and 1 are the empty and reserved blocks), and a
+ * MemBlock, from +12, one entry per 4 KB page: its PTEL plus one, 0 while
+ * uncommitted. 0 if va has no page in main RAM.
+ */
+#define GA_P1(x) (((x) & 0x1fffffffU) | 0x80000000U)
+static unsigned int ga_walk(unsigned int va)
+{
+	unsigned int p = GA_P1(*(volatile unsigned int *)0xff000008U);
+
+	p = GA_P1(*(unsigned int *)(p + ((va >> 25) << 2)));
+	p = ((unsigned int *)p)[(va >> 16) & 0x1ffU];
+	if (!(p & 0x80000000U))
+	{
+		return 0;
+	}
+	p = ((unsigned int *)GA_P1(p + 12U))[(va >> 12) & 0xfU] - 1U;
+	if ((p & 0x1f000000U) != 0x0c000000U)
+	{
+		return 0;
+	}
+	return GA_P1(p & ~(GA_XPAGE - 1U));
+}
+
+/*
+ * The thread's part: translate the buffer's next pages, from param[2] on.
+ * Each is touched (CE commits it if it has not), walked, and checked: a byte
+ * of the buffer -- which the read overwrites anyway -- is inverted through
+ * the virtual address, the lines purged through it, and the byte read back
+ * uncached at the physical address the walk gave. A walk that is wrong on
+ * some CE stops the translation there, and the read goes the old way.
+ */
+static void ga_translate(void)
+{
+	unsigned int first = _GDS.param[2];
+	unsigned int va, lo, hi, pa, i;
+	unsigned char b;
+
+	ga_xcount = 0;
+	ga_xbase = first & ~(GA_XPAGE - 1U);
+	for (i = 0; i < GA_XLAT_PAGES; i++)
+	{
+		va = ga_xbase + i * GA_XPAGE;
+		if (va >= ga_req_end)
+		{
+			break;
+		}
+		lo = (va < first) ? first : va;
+		hi = (va + GA_XPAGE < ga_req_end) ? va + GA_XPAGE : ga_req_end;
+
+		b = (unsigned char)~*(volatile unsigned char *)lo;
+		*(volatile unsigned char *)lo = b;
+		pa = ga_walk(va);
+		CacheBlockPurge((unsigned char *)(lo & ~31U), (hi - (lo & ~31U) + 31U) >> 5);
+		if (!pa || *(volatile unsigned char *)((pa | 0x20000000U) + (lo & (GA_XPAGE - 1U))) != b)
+		{
+			g_ga_xlat_miss++;
+			break;
+		}
+		ga_xpa[i] = pa;
+		ga_xcount = i + 1;
+	}
+}
+
+/* A chunk is on the wire (irq.c paces its looks at it). */
+int gd_async_busy(void)
+{
+	return ga_state == GA_POSTED;
+}
+
+/* From the tick, GD lock free (irq.c). Non-zero if a chunk was on the wire. */
+int gd_async_tick(void)
+{
+	if (ga_state != GA_POSTED)
+	{
+		return 0;
+	}
+	ga_poll();
+	if (ga_state == GA_DONE && (!ga_virt || ga_copy_out()))
+	{
+		g_ga_irq_done++;
+		ga_commit();
+		/* Nothing on the wire between two chunks: feed CD-DA, as the
+		 * synchronous loop does. A load is seconds of chunks back to
+		 * back, and irq_tick() services CD-DA only when no read is in
+		 * flight -- without this the ring (1.39 s) played itself over
+		 * and over for the whole load, and nothing muted it (9k). */
+		cdda_service_tick();
+		if (_GDS.param[1] && !_GDS.cmd_abort)
+		{
+			ga_next();
+		}
+	}
+	return 1;
+}
+
+/*
+ * The thread's side of a read under CE with the hook in. It sleeps (CE's
+ * Sleep(5) on WAIT_INTERNAL, 7e) while the tick moves the chunks; on each wake
+ * it translates ahead, finishes a chunk the tick could not copy, posts one if
+ * none is on the wire, and retries a failed one. Only values live across the
+ * yields (cdfs_redir.s: the parked frame is relocatable).
+ *
+ * Under a Katana title the same tick runs (irq.c: their entry is three nops),
+ * so a chunk moves between frames as soon as it is back, and a wake -- an
+ * ExecServer, once a frame -- only sees the read end. One chunk per wake,
+ * without it, ran menu loads at ~350 KB/s (9m). g_ga_wakes counts the resumes.
+ */
+static void data_transfer_emu_async(void);
+
+static void data_transfer_async(void)
+{
+	int retries = 0;
+
+	ga_virt = gd_is_virtual(_GDS.param[2]);
+	ga_req_end = _GDS.param[2] + _GDS.param[1] * _GDS.sec_size;
+	ga_xcount = 0;
+	ga_state = GA_IDLE;
+	if (!ga_virt && overlaps_dcload(_GDS.param[2], ga_req_end - _GDS.param[2]))
+	{
+		_GDS.status = CMD_STAT_FAILED;
+	}
+	_GDS.ata_status = CMD_WAIT_INTERNAL;
+
+	while (_GDS.param[1] && !_GDS.cmd_abort && _GDS.status != CMD_STAT_FAILED)
+	{
+		if (ga_virt)
+		{
+			ga_translate();
+		}
+		if (ga_state == GA_IDLE && ga_virt && !ga_xcount)
+		{
+			/*
+			 * NOTHING TRANSLATED: FINISH THE WAY WE USED TO (9i).
+			 *
+			 * Without a page the tick can write, every chunk waits for a
+			 * wake -- 20 a second at best -- which is several times slower
+			 * than the synchronous loop and starved the menu's stream for
+			 * seconds. flycast gets here: built with FAST_MMU, it serves a
+			 * translation from its own cache without reloading the UTLB, so
+			 * the probe finds nothing; a real SH4 must reload it to access
+			 * the page at all.
+			 */
+			g_ga_sync++;
+			data_transfer_emu_async();
+			return;
+		}
+		if (ga_state == GA_IDLE)
+		{
+			ga_next();
+		}
+		ga_poll();
+		if (ga_state == GA_DONE)
+		{
+			if (ga_virt && !ga_copy_out())
+			{
+				memcpy((void *)_GDS.param[2], gd_stage_big,
+				       ga_sc * _GDS.sec_size);
+			}
+			ga_commit();
+			retries = 0;
+#if GD_CDDA_BETWEEN_CHUNKS
+			/* Nothing on the wire: the music's turn, as in the tick. */
+			cdda_service_between_chunks();
+#endif
+			continue;
+		}
+		if (ga_state == GA_FAILED)
+		{
+			ga_state = GA_IDLE;	/* asked again at once: the deadline has passed */
+			g_cdfs_read_retries++;
+			if (!gd_retries_left(++retries))
+			{
+				_GDS.status = CMD_STAT_FAILED;
+			}
+			continue;
+		}
+		gdcExitToGame();
+		g_ga_wakes++;
+	}
+
+	if (ga_state == GA_POSTED)
+	{
+		ga_end(GA_FAILED);	/* aborted in flight */
+	}
+	ga_state = GA_IDLE;
+	ga_xcount = 0;
+	if (_GDS.cmd_abort)
+	{
+		_GDS.transfered = 0;
+		_GDS.status = CMD_STAT_IDLE;
+	}
+	else if (_GDS.status != CMD_STAT_FAILED)
+	{
+		_GDS.status = CMD_STAT_COMPLETED;
+		_GDS.requested -= _GDS.transfered;
+	}
+	_GDS.drv_stat = CD_STATUS_PAUSED;
+}
+#endif
+
 /*
  * Feed the CD-DA ring between the chunks of a disc read. A read of a level file
  * can take seconds, and cdda_service() declines during the read's own waits
@@ -1161,6 +1673,20 @@ static void data_transfer_emu_async(void)
 static void data_transfer(void)
 {
 	_GDS.ata_status = CMD_WAIT_IRQ;
+
+#if WITH_IRQ_HOOK
+	/* Posted at once, not after the yield below: the chunk is on the wire
+	 * while the title runs, and a read costs one frame less. The title still
+	 * sees PROCESSING first -- the answer takes ~2 ms, the loop yields long
+	 * before. */
+	if (_GDS.param[1] && gd_async_on()
+	    && (_GDS.param[1] > 1 || gd_is_virtual(_GDS.param[2])))
+	{
+		data_transfer_async();
+		_GDS.ata_status = CMD_WAIT_INTERNAL;
+		return;
+	}
+#endif
 
 	/*
 	 * isoldr yields once before starting for non-KOS binaries, so the title
@@ -1376,41 +1902,6 @@ static void data_stream(void)
  * afterwards: each trace is a network round trip, long enough for the title's
  * interrupts to replace the entry.
  */
-static unsigned int gd_utlb_a, gd_utlb_d;
-
-/* log2 of the page size, by the data word's SZ1:SZ0 (1 KB, 4 KB, 64 KB, 1 MB) */
-static const unsigned char gd_page_shift[4] = { 10, 12, 16, 20 };
-
-static unsigned int gd_page_size(unsigned int d)
-{
-	return 1U << gd_page_shift[((d >> 6) & 2U) | ((d >> 4) & 1U)];
-}
-
-/* Runs from its P2 alias: the TLB arrays are read from uncached code. */
-static void gd_utlb_probe(unsigned int va)
-{
-	unsigned int asid = *(volatile unsigned int *)0xff000000U & 0xffU;
-	unsigned int i;
-
-	gd_utlb_a = 0;
-	gd_utlb_d = 0;
-	for (i = 0; i < 64; i++)
-	{
-		unsigned int a = *(volatile unsigned int *)(0xf6000000U | (i << 8));
-		unsigned int d = *(volatile unsigned int *)(0xf7000000U | (i << 8));
-		unsigned int mask = ~(gd_page_size(d) - 1U);
-
-		if (!(a & 0x100U) || ((a ^ va) & mask)
-		    || (!(d & 2U) && ((a & 0xffU) != asid)))
-		{
-			continue;
-		}
-		gd_utlb_a = a;
-		gd_utlb_d = d;
-		return;
-	}
-}
-
 static void gd_trace_vaddr(unsigned int va, int with_mmu)
 {
 	void (*probe)(unsigned int) = (void (*)(unsigned int))
@@ -1910,6 +2401,10 @@ int gdGdcReqCmd(int cmd, int *param)
 	g_gd_idx_counts[0]++;
 	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
+	if (GD_ASYNC_KATANA || gd_mmu_on())
+	{
+		irq_hook_check();
+	}
 
 	if ((cmd >= 0) && (cmd <= CMD_MAX))
 	{
@@ -1987,6 +2482,10 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 	g_gd_idx_counts[1]++;
 	gd_service_net();
 	gd_lock_watchdog();
+	if (GD_ASYNC_KATANA || gd_mmu_on())
+	{
+		irq_hook_check();
+	}
 
 	if (gd_take(2))
 	{

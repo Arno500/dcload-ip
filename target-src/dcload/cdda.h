@@ -42,6 +42,9 @@ int cdda_seek(unsigned int lba);
 void cdda_service(void);
 /* The same, without the 1 ms listening window: for the disc read loop. */
 void cdda_service_between_chunks(void);
+/* From the interrupt hook, GD lock free: one sub-fetch at most (cdda.c). */
+void cdda_service_tick(void);
+extern volatile unsigned int cdda_busy;	/* a service is on the network */
 
 int cdda_state(void);
 
@@ -61,6 +64,8 @@ unsigned int cdda_audio_status(void);    /* SCD audio status (0x11 playing ...) 
 #define cdda_seek(a)                (-1)
 #define cdda_service()              do { } while (0)
 #define cdda_service_between_chunks() do { } while (0)
+#define cdda_service_tick()         do { } while (0)
+#define cdda_busy                   0u
 #define cdda_state()                (CDDA_STOPPED)
 #define cdda_current_lba()          (0u)
 #define cdda_track()                (0u)
