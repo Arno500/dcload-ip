@@ -1528,11 +1528,25 @@ void cdda_service_between_chunks(void)
  */
 void cdda_service_tick(void)
 {
+#if WITH_IRQ_HOOK
+	/* A fetch waits for its whole answer inside bb->loop(). With the tick's RX
+	 * DMA armed, the loop stops at the first PartBinary (the frame is left to
+	 * rx_settle()) and the fetch judges a window that is only begun: Aqua GT
+	 * failed 5 fetches in 6, each up to 20 ms with SR.BL set. The fetch takes
+	 * its frames by CPU, as outside the tick (AGENTS.md 4.16). */
+	extern volatile unsigned int g_rx_dma_tick;
+	unsigned int dma = g_rx_dma_tick;
+
+	g_rx_dma_tick = 0;
+#endif
 	svc_no_listen = 1;
 	svc_one = 1;
 	cdda_service();
 	svc_one = 0;
 	svc_no_listen = 0;
+#if WITH_IRQ_HOOK
+	g_rx_dma_tick = dma;
+#endif
 }
 
 /* ------------------------------------------------------------ public API */

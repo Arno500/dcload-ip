@@ -1279,6 +1279,16 @@ bytes from the BBA take 99 us by CPU and 94 us by DMA; 2368 bytes to the AICA
   Crazy Taxi 2, load to the menu: 71 chunks of 71 finished by the tick, latency
   DMA to processing ~81 us, tick CPU 0.75 ms a chunk (1.5 before), `g_irq_tick_max`
   0.3 ms (1.7), ~1.5 MiB/s (0.7 without the fix, ~2 with the CPU copy), no lag.
+- **A fetch inside the tick takes its frames by CPU** (2026-09-29, Aqua GT, the
+  first title to combine CD-DA and the Katana hook). `irq_tick()` sets
+  `g_rx_dma_tick` for its whole length, and `cdda_fetch()` waits inside
+  `bb->loop()`: the loop stopped at the first PBIN (DMA started, `escape_loop`),
+  the fetch judged a window barely begun, and 5 fetches in 6 failed, each up to
+  20 ms with SR.BL set (`g_cdda_fetch_fails` 11387 for 2246 fetches,
+  `g_cdda_retv_nodata` and `g_pbin_rejected` rising together, `g_cdda_room_min`
+  47 ms). `cdda_service_tick()` now clears `g_rx_dma_tick` around the service.
+  `g_ga_irq_done` 0 there is not a fault: Aqua GT polls ExecServer ~2600/s and
+  the thread finishes each chunk first. **Not yet measured on the console.**
 - **What did not work**, so nobody repeats it: acknowledging the chip's RX
   status before the DMA and leaving its interrupt armed (its line rises mid-DMA,
   the tick waits for the end: 4.7 % of the CPU against 1.1 %, same throughput);
