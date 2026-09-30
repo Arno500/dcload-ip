@@ -1157,6 +1157,7 @@ static void gd_utlb_probe(unsigned int va)
 static volatile unsigned int ga_state;
 static unsigned int ga_start;		/* TMU2 at the post */
 static unsigned int ga_sc;		/* sectors in the chunk on the wire */
+static unsigned int ga_fail_run;	/* chunks failed since one last got through */
 static unsigned int ga_virt;		/* the title's buffer is translated */
 static unsigned int ga_req_end;		/* one past the buffer (virtual) */
 static unsigned int ga_xbase;		/* virtual page ga_xpa[0] maps */
@@ -1172,9 +1173,13 @@ volatile unsigned int g_ga_wakes;	/* the thread resumed with a chunk on the wire
  * The hook's tick moves the read: under Windows CE, and under a Katana title
  * with GD_ASYNC_KATANA (its buffer is physical: nothing to translate).
  */
+#ifndef GA_KATANA_READS
+#define GA_KATANA_READS 1	/* 0: the hook in Katana titles, their reads synchronous */
+#endif
 static int gd_async_on(void)
 {
-	return bb == &adapter_bba && g_irq_hooked && (GD_ASYNC_KATANA || gd_mmu_on());
+	return bb == &adapter_bba && g_irq_hooked
+	    && ((GD_ASYNC_KATANA && GA_KATANA_READS) || gd_mmu_on());
 }
 
 static void ga_send(void)
@@ -1323,6 +1328,7 @@ static void ga_commit(void)
 	_GDS.param[2] += bytes;
 	_GDS.transfered += bytes;
 	_GDS.lba = _GDS.param[0];
+	ga_fail_run = 0;	/* the tick commits most chunks: the thread never sees them */
 	ga_state = GA_IDLE;
 }
 
@@ -1395,6 +1401,45 @@ static void ga_translate(void)
 	}
 }
 
+#if IRQ_IDLE_LISTEN
+static void ga_listen(void)
+{
+	extern volatile unsigned int g_rx_dma_tick;
+
+	/* By CPU, as a tick's CD-DA fetch (cdda.c): a late PBIN taken by DMA here
+	 * would be settled with irq_rx_arm(1), the chip's interrupt armed with no
+	 * chunk on the wire. irq_tick() clears it again on the way out. */
+	g_rx_dma_tick = 0;
+	/* Every exchange ends with reception off (cmd_retval, ga_end): without
+	 * this the chip dropped every request and the listen heard nothing. Left
+	 * on, so that a request landing between two listens waits in the ring
+	 * (50 ms) instead of being dropped; the next exchange starts it anyway. */
+	bb->start();
+	drain_iters = 256;
+	fine_deadline_start = TMU2_COUNT;
+	fine_deadline_ticks = 12500U;	/* 1 ms */
+	bb->loop(0);
+	fine_deadline_ticks = 0;
+	drain_iters = 0;
+	timeout_loop = 0;
+}
+
+/* From the tick, GD lock free and no CD-DA fetch: answer whatever the host
+ * asked (--diag, the stack watch, memory marks) even though the title is not
+ * reading its disc -- a GD wait is otherwise the only time the loader looks
+ * at the wire (measured on Shenmue II, 2026-09-30: a cinematic answered
+ * nothing for its whole length). */
+int gd_idle_listen(void)
+{
+	if (ga_state != GA_IDLE || g_gd_in_transfer || bb != &adapter_bba)
+	{
+		return 0;
+	}
+	ga_run(ga_listen);
+	return 1;
+}
+#endif
+
 /* A chunk is on the wire (irq.c paces its looks at it). */
 int gd_async_busy(void)
 {
@@ -1443,8 +1488,7 @@ static void data_transfer_emu_async(void);
 
 static void data_transfer_async(void)
 {
-	int retries = 0;
-
+	ga_fail_run = 0;
 	ga_virt = gd_is_virtual(_GDS.param[2]);
 	ga_req_end = _GDS.param[2] + _GDS.param[1] * _GDS.sec_size;
 	ga_xcount = 0;
@@ -1491,7 +1535,6 @@ static void data_transfer_async(void)
 				       ga_sc * _GDS.sec_size);
 			}
 			ga_commit();
-			retries = 0;
 #if GD_CDDA_BETWEEN_CHUNKS
 			/* Nothing on the wire: the music's turn, as in the tick. */
 			cdda_service_between_chunks();
@@ -1502,7 +1545,7 @@ static void data_transfer_async(void)
 		{
 			ga_state = GA_IDLE;	/* asked again at once: the deadline has passed */
 			g_cdfs_read_retries++;
-			if (!gd_retries_left(++retries))
+			if (!gd_retries_left(++ga_fail_run))
 			{
 				_GDS.status = CMD_STAT_FAILED;
 			}

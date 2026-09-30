@@ -114,6 +114,8 @@ typedef struct {
 
 int rtl_bb_detect(void);
 void rtl_irq_ack(void);
+/* The end bit of the RX DMA in flight, 0 if none (irq.c). */
+unsigned int rtl_rx_dma_bit(void);
 int rtl_bb_init(void);
 /* Warm start -- see the long comment at the top of rtl8139.c */
 void rtl_handoff_save(unsigned int ip);

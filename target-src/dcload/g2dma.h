@@ -78,6 +78,47 @@ static inline int g2dma_busy(unsigned int ch)
 	return (G2DMA_ST(ch) & 1U) != 0U;
 }
 
+/* Channels with a transfer of the loader's started and not yet collected: the
+ * only ones whose end bit the loader may clear, and the ones a hold leaves
+ * running. A title may drive any of the four (g2dma_hold()). */
+extern volatile unsigned int g2dma_mine;
+
+/*
+ * THE TITLE'S G2 DMA IS SUSPENDED WHILE THE LOADER USES THE BUS FROM UNDER IT,
+ * as KOS's g2_lock() does around every G2 access. Measured 2026-09-30 on Sonic
+ * Adventure 2: with the disc reads moved into the interrupt hook, the tick read
+ * the BBA's ring while the title's sound driver was moving its banks to the
+ * AICA, and the title waited forever after loading them -- on the console
+ * only, flycast does not model the bus. Suspending every channel for the tick
+ * fixed it. Nested; channels of the loader's own that are running are left
+ * alone (a wait on them would never end), and g2dma_start() lifts the suspend
+ * of a channel it takes. Bounded like every wait on G2.
+ */
+void g2dma_hold(void);
+void g2dma_release(void);
+
+/*
+ * WHICH CHANNELS THE TITLE USES, so that the loader's own short transfers (the
+ * RX DMA) never share one. Sharing is not safe even when the title's channel
+ * is idle: a Katana title arms the end bits of all four channels on its IML4
+ * (0x7f000), and its handler takes the end of a transfer of ours on a channel
+ * it drives for the end of its own. Crazy Taxi 2 does not use channel 1 and
+ * ignores ours; Sonic Adventure 2 does, and went to a black screen before its
+ * menu for every build that received frames by DMA there (2026-10-01).
+ *
+ * A channel is the title's once seen busy or with its end bit up while
+ * nothing of ours is on it, or with a RAM address (STAR) outside the loader's
+ * .hiram -- the trace a finished transfer of the title's leaves, which the
+ * first two tests miss (its transfers are short, its handler clears the bit
+ * at once). g2dma_forget() clears the traces of an earlier loader at EXEC.
+ * Channel 0 is always the title's (the AICA's). Counter: g_g2dma_foreign.
+ */
+extern volatile unsigned int g_g2dma_foreign;
+void g2dma_forget(void);
+/* A channel for a short transfer of the loader's: 3, then 2, then 1, of those
+ * neither the title's nor busy; -1 if none (then the CPU does it). */
+int g2dma_pick(void);
+
 /* Wait for the channel to finish, at most G2DMA_WAIT_TICKS. 0 when done (its
  * end bit cleared), -1 if it is still running. */
 static inline int g2dma_wait(unsigned int ch)
@@ -92,6 +133,7 @@ static inline int g2dma_wait(unsigned int ch)
 		}
 	}
 	SB_ISTNRM = G2DMA_IST_BIT(ch);
+	g2dma_mine &= ~(1U << ch);
 	return 0;
 }
 

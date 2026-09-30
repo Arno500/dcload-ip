@@ -278,6 +278,19 @@ CFLAGS += -DWITH_LAN_ADAPTER=$(WITH_LAN_ADAPTER)
 WITH_MAPLE ?= 1
 CFLAGS += -DWITH_MAPLE=$(WITH_MAPLE)
 
+# Serve the MARK command: witness words the host has painted in free RAM
+# before EXEC, and which of them the title has changed since (commands.c,
+# cmd_mark). The host learns from it which 64 KB blocks the title writes
+# with the CPU, which its disc reads alone never show (dcload-ip-rs
+# `marks.rs`, game-memory.tsv). With this at 0 MARK is not answered and the
+# host learns from disc reads only.
+#
+# Off in the LOW family, which is the CD's build: it has 136 B left under its
+# .gdstage bound and cmd_mark is 432 B. Nothing is lost, because the host
+# chainloads its own set (`make loaders`, HIGH) before any disc image.
+WITH_MARK_CMD ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+CFLAGS += -DWITH_MARK_CMD=$(WITH_MARK_CMD)
+
 # ---------------------------------------------------------------------------
 # CD-DA (cdda.c). The design is described at the top of cdda.c, the counters
 # and status in AGENTS.md 4.13.
@@ -407,6 +420,29 @@ CFLAGS += -DWITH_IRQ_HOOK=$(WITH_IRQ_HOOK)
 GD_ASYNC_KATANA ?= 1
 CFLAGS += -DGD_ASYNC_KATANA=$(GD_ASYNC_KATANA)
 
+# The interrupt hook's tick listens to the network (at most 1 ms, every 50 ms)
+# when nothing else is on the wire, so the host's --diag panel, its stack watch
+# and its memory marks are answered while a title runs without reading its
+# disc -- a cinematic, a menu, an error screen. Without it the loader looks at
+# the wire only inside GD waits. BBA only; costs up to 2 % of the CPU, with
+# SR.BL set, while the title is not loading. Off in the LOW (CD) build for its
+# bytes: the host chainloads its own set before any disc image.
+IRQ_IDLE_LISTEN ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+CFLAGS += -DIRQ_IDLE_LISTEN=$(IRQ_IDLE_LISTEN)
+
+# The BBA's RX frames by G2 DMA from the hook's tick (AGENTS.md 4.16). 0 takes
+# every frame by CPU, as before 2026-09-28 -- the A/B for a title that the DMA
+# might disturb. Off in the LOW (CD) build, for its bytes: the host chainloads
+# its own set before any disc image.
+RTL_RX_DMA ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+CFLAGS += -DRTL_RX_DMA=$(RTL_RX_DMA)
+
+# With GD_ASYNC_KATANA, 0 keeps the hook in Katana titles (CD-DA from the
+# tick, the idle listen) but serves their disc reads synchronously -- the A/B
+# between the hook and the asynchronous reads.
+GA_KATANA_READS ?= 1
+CFLAGS += -DGA_KATANA_READS=$(GA_KATANA_READS)
+
 # G2 DMA bench (g2bench.c, docs/g2-dma-investigation.md step 0): at boot,
 # measures which DMA channels reach the BBA's SRAM and the AICA on this
 # console, and runs a torture round (CPU PIO on the AICA while two DMAs are
@@ -417,6 +453,12 @@ CFLAGS += -DG2DMA_BENCH=$(G2DMA_BENCH)
 ifeq ($(G2DMA_BENCH),1)
 # The bench's ~1.2 KB would push .gdstage past _stack: two sectors less of it.
 CFLAGS += -DGD_STAGE_BIG_SECTORS=2
+else ifeq ($(DCLOAD_IS_LOW),1)
+# The LOW (CD) build never serves a Windows CE title -- the host places those
+# in the HIGH family, and .gdstage is only used under the MMU -- so its stage is
+# one sector short, which pays for the G2 DMA channel bookkeeping (the image
+# had no room left under _stack, 2026-10-01).
+CFLAGS += -DGD_STAGE_BIG_SECTORS=3
 endif
 
 OBJCOPY	= $(TARGETOBJCOPY)

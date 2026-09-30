@@ -196,6 +196,10 @@ symbol-derived read block of 09-26 (§4.5) bring them to `0x8c00c000`):
 | `WITH_GD_SPINDOWN` | `0` | stop the real drive at boot (§4.14); off since 2026-09-28 to pay for the Katana hook | 160 B if 0 |
 | `WITH_IRQ_HOOK` | `1` | the interrupt hook (§4.15) | 792 B if 0 (2026-09-27, phase 1) |
 | `GD_ASYNC_KATANA` | `1` | the interrupt hook in Katana titles too, and their disc reads through the asynchronous engine (§4.5); needs `WITH_IRQ_HOOK` | ~150 B |
+| `WITH_MARK_CMD` | `1` HIGH, `0` LOW | serve `MARK` (§8): witness words the host uses to learn what a title writes | 432 B |
+| `IRQ_IDLE_LISTEN` | `1` HIGH, `0` LOW | the hook's tick listens to the network (≤ 1 ms every 50 ms) when nothing else owns it, so `--diag`, the stack watch and `MARK` are answered while a title does not read its disc | ~220 B |
+| `RTL_RX_DMA` | `1` HIGH, `0` LOW | the BBA's RX frames by G2 DMA from the tick (§4.16); 0 = every frame by CPU | ~150 B |
+| `GA_KATANA_READS` | `1` | with `GD_ASYNC_KATANA`, a Katana title's disc reads go through the asynchronous engine; 0 keeps the hook (CD-DA from the tick, idle listen) with synchronous reads | -- |
 | `DCLOAD_GC_SECTIONS` | `1` | `--gc-sections`; also reveals dead code | 328 B |
 | `DCLOAD_LTO` | `0` | `-flto`. **Off on purpose**: it changes the depth of the C frame the GD coroutine parks (§4.5 — check `g_gd_park_longs` on hardware) and suppresses the `*.asm` listings | 2428 B if 1 |
 
@@ -457,9 +461,12 @@ at `_end = 0x8c00c7ec`, and the asynchronous reads (phase 3) at **`_end =
 `+0xb000`, and the 3 KB moved are what paid for §4.16). Phase 3 spent
 `GD_STAGE_BIG_SECTORS` 5 → 4 to fit (the stage is now 8 KB), which leaves
 `_end` up to `base+0x9c00` -- **~2 KB left** after the G2 DMA work (`_end` =
-`base+0x9310`, default flags; before it, 352 B). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. **The deployed
-`loaders/` is the current build since 2026-09-29** (md5 `a5e5f631…`, it needs
-the host's `layout()` of that date; the older `0x8c00c000` build is gone), which
+`base+0x9310`, default flags; before it, 352 B; `base+0x9634` since `MARK` and
+the idle listen, 2026-09-30: ~1.4 KB left). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. **The deployed
+`loaders/` is the current build since 2026-10-01** (md5 `b94bc113…`: the
+three Shenmue II fixes, `MARK`, the idle listen, the G2 DMA suspend and the
+per-frame RX channel of §4.16; `_end` = `base+0x990c`, ~700 B left; it needs
+the host's `layout()` of 2026-09-29; the older `0x8c00c000` build is gone), which
 loses the low base to painted titles as described below. The user's decision
 (2026-09-21) is that this is acceptable where it has to happen: the host
 already refuses a low base whose image reaches a range the title paints
@@ -629,7 +636,12 @@ fourteen sets accumulated during the CD-DA investigation were deleted on
   a `-D` folds into a literal pool with no relocation. Only `exception.S` still
   uses `DCLOAD_BASE` as a `-D`.
 - A LOW target's image must fit under `0x8c00f400` minus 800 B, which rules out
-  bases much above `0x8c008000`.
+  bases much above `0x8c008000`. **Since 2026-09-30 the set does not fit even at
+  `0x8c004000`** (image and `.gdstage` 576 B past the VBR, with `MARK` and the
+  idle listen): `LoaderSet::can_provide` relocates for real to answer a low
+  base, and the host leaves the low family when it cannot. Getting it back
+  costs `GD_STAGE_BIG_SECTORS` 3 (Windows CE's staged reads, 4 sectors a chunk
+  today) or one of the two flags.
 
 `DCLOAD_BASE`/`DCLOAD_STACK`/`DCLOAD_HIRAM`/`DCLOAD_MAPLE` reach the linker
 script, the C sources and `exception.S` from the Makefile only; C code uses
@@ -1258,6 +1270,31 @@ bytes from the BBA take 99 us by CPU and 94 us by DMA; 2368 bytes to the AICA
   irq_ack/loop`, `la_bb_tx/loop`. Bounded (~2 ms), and a channel that will not
   end is aborted (`g_g2dma_timeouts`, must stay 0).
 - **CD-DA** (§4.13 rule 7): edges by CPU, body by DMA on 2 and 3, left running.
+- **THE TITLE'S G2 DMA IS SUSPENDED WHILE THE TICK RUNS** (`g2dma_hold()` /
+  `g2dma_release()`, nested; `cdda.c`'s `g2_lock()` uses them too), as KOS's
+  `g2_lock()` does around every G2 access. Measured 2026-09-30/10-01 on Sonic
+  Adventure 2: with the asynchronous Katana reads the tick read the BBA's ring
+  while the title's sound driver moved its banks to the AICA, and the title
+  waited forever right after loading `SDRV`/`SMLT`/`SMPB` -- on the console
+  only. Channels with a transfer of the loader's running are left alone, and
+  `g2dma_start()` lifts the suspend of the channel it takes. The synchronous GD
+  path still does not suspend (a 250 ms read deadline would stall the title's
+  sound): never seen to matter.
+- **A CHANNEL THE TITLE USES IS NEVER THE RX DMA'S.** A Katana title arms the
+  end bits of all four channels on its IML4 (`0x7f000`), and its handler takes
+  the end of a transfer of ours on a channel it drives for the end of its own.
+  Crazy Taxi 2 does not use channel 1 and ignores ours; Sonic Adventure 2 does,
+  and went to a black screen before its menu in every build that received
+  frames by DMA there. `g2dma_pick()` chooses per frame, 3 then 2 then 1, a
+  channel neither busy nor the title's (`g_g2dma_foreign`, bit n = channel n):
+  seen busy or with its end bit up while nothing of ours is on it, or with a
+  RAM address (STAR) outside `.hiram` -- the trace a finished transfer leaves,
+  which the first two tests miss. `g2dma_forget()` clears an earlier loader's
+  traces at EXEC. None free: that frame goes by CPU. **Measured on the console
+  2026-10-01**: Sonic Adventure 2, Crazy Taxi 2 and Shenmue II all run with it
+  (`loaders/` md5 `b94bc113…`); channels 2 and 3 are also CD-DA's, whose own transfers do not yet
+  avoid a title's channel. The loader clears only its own channels' end bits
+  (`g2dma_mine`).
 - **RX under the interrupt hook, Katana titles only** (`rx_iml` set: the BBA's
   own interrupt level exists): a long frame whose first 64 bytes -- read by the
   CPU, 4 us -- are a PBIN for us (`rx_is_pbin()`) is copied by DMA into
@@ -1425,6 +1462,15 @@ opendir, closedir, readdir, cdfsread, gdbpacket, rewinddir, cdfstoc), plus
 
 - **`DC23` `CMD_CDDAREAD`** (DC→host): raw 2352-byte audio sectors. value0 =
   LBA, value1 = destination, value2 = bytes.
+- **`MARK`** (host→DC, 2026-09-30, `cmd_mark`): `address` a 64 KB-aligned
+  start, `size` a multiple of 64 KB (≤ 16 MB), bit 31 clear = **paint** (one
+  word every 256 B, through P2, holding its P1 address `^ 0x5a3cc3a5`), set =
+  **check** (each sampled line purged, then read through P2; a block stops at
+  its first changed word). Reply `MARK` at the same address: `size` 0 after a
+  paint, the bitmap's byte count after a check (bit i = block i changed), or
+  `0xffffffff` if the range touches the loader's image, stack, `.hiram` or
+  Maple page. The host paints before `EXEC` and checks a few blocks a second
+  while the title runs (`marks.rs`, §16).
 - **`DC24` `CMD_CDDAREAD_ADPCM`**: the same audio as 4-bit ADPCM, left block
   then right. value2 = frames (= bytes), **bit 31 = restart the encoder**.
 
@@ -1816,6 +1862,22 @@ What it does that concerns the DC side:
   database does not know is searched from `0x8ce00000`.
   `dcload-ip-rs identify <image>` prints the decision offline, on a `startup`
   line beside the `stack` one.
+- **Learns what a title writes** (`src/marks.rs`, 2026-09-30): before `EXEC`
+  it has the loader paint every 64 KB block above the title's image that is
+  neither known used nor the loader's (`MARK`, §8), then checks them, 16
+  blocks a second; a changed block goes into `game-memory.tsv` like a read.
+  Not for Windows CE titles; `--no-marks` turns it off. The loader's own span
+  is never observed: a write there is learned by the next session, with the
+  loader elsewhere. Found because Shenmue II overwrote a loader at 0x8cfd0000
+  in a block no read had touched.
+- **Two placement rules of 2026-09-30.** A region the title names (a
+  64 KB-aligned word anywhere in its image, `dispatch::region_starts`) that
+  starts inside a high loader's span or less than one block under it rules
+  that base out (`region_reaching_loader`: Shenmue II's 0x8cfc0000 under
+  0x8cfd0000). And a high preset refused by the constant scan is taken as a
+  **window**: the loader goes against the lowest address the title names above
+  the preset (`preset_window_base`) -- 0x8cfe0000 for Shenmue II and Crazy
+  Taxi, under their Maple DMA list at 0x8cff0000.
 - **Relocates and chainloads** `loaders/dcload-relocatable.elf` (§4.11), always
   via `SCRATCH_BASE` `0x8ce00000`, and replaces a running loader when its image
   differs from the file even at the same base.

@@ -24,6 +24,7 @@ typedef struct _command_t command_t;
 
 #define CMD_MAPLE		 "MAPL" /* Maple packet */
 #define CMD_PMCR		 "PMCR" /* Performance counter packet */
+#define CMD_MARK     "MARK" /* paint or check witness words in free RAM */
 
 #define COMMAND_LEN  12
 

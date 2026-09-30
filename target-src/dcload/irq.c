@@ -93,9 +93,9 @@ volatile unsigned int g_irq_iml[9];		/* the title's IML2/4/6 NRM,EXT,ERR at inst
 #define EXT_BBA    8U
 static volatile unsigned int *rx_iml;
 
-/* Holly NRM bit of the end of G2 DMA channel 1, the BBA's: the RX DMA of
- * rtl8139.c (9s). */
-#define RX_DMA_END (1U << 16)
+/* The end bit of the RX DMA armed on our level, among the ones the title's
+ * mask there did not already hold (a shared IML6 is the title's too). */
+static unsigned int rx_armed_dma;
 
 /* 0 = neither, 1 = the chip's RX interrupt (a chunk is on the wire), 2 = the end
  * of a frame's DMA instead (the chip's would re-enter at once while the DMA
@@ -105,12 +105,17 @@ void irq_rx_arm(unsigned int on)
 {
 	if (rx_iml && g_irq_hooked)
 	{
-		rx_iml[0] = (rx_iml[0] & ~RX_DMA_END) | (on == 2U ? RX_DMA_END : 0U);
+		unsigned int dma = (on == 2U) ? rtl_rx_dma_bit() : 0U;
+
+		rx_iml[0] &= ~rx_armed_dma;
+		rx_armed_dma = dma & ~rx_iml[0];
+		rx_iml[0] |= rx_armed_dma;
 		rx_iml[1] = (rx_iml[1] & ~EXT_BBA) | (on == 1U ? EXT_BBA : 0U);
 	}
 }
 
 #define INTEVT (*(volatile unsigned int *)0xff000028U)
+
 
 /*
  * The template's two literals are filled in the loader's own copy (it is
@@ -225,13 +230,22 @@ void irq_hook_check(void)
 void irq_tick(void)
 {
 	static unsigned int cdda_mark, read_mark;
+#if IRQ_IDLE_LISTEN
+	static unsigned int listen_mark;
+#endif
 	unsigned int t0 = TMU2_COUNT;
 	unsigned int dt;
+	/* The end bit of our RX DMA while a frame is on it, else 0: any other G2
+	 * DMA end is the title's, to be neither cleared nor swallowed. */
+	unsigned int ours = rtl_rx_dma_bit();
 
 	g_irq_ticks++;
 	g_irq_evt_last = INTEVT;
+	/* The whole tick: it reads the BBA while the title's own G2 DMA may be
+	 * moving its sound (g2dma_hold(); Sonic Adventure 2, 2026-09-30). */
+	g2dma_hold();
 	g_rx_dma_tick = (rx_iml != 0);	/* rtl8139.c: a frame may be DMA'd, nothing waits */
-	if (rx_iml && (SB_IST(0) & RX_DMA_END))
+	if (rx_iml && (SB_IST(0) & ours))
 	{
 		/* The end of our DMA usually arrives on the TITLE's level: Katana titles
 		 * arm bits 12..18 of IML4's NRM mask, Ext1's DMA end (16) among them
@@ -240,7 +254,7 @@ void irq_tick(void)
 		 * rx_settle() clears the bit when it finishes the frame. */
 		read_mark = t0 + IRQ_READ_PERIOD;
 	}
-	if (g_irq_evt_last == g_irq_rx_evt && ((SB_IST(1) & EXT_BBA) || (SB_IST(0) & RX_DMA_END)))
+	if (g_irq_evt_last == g_irq_rx_evt && ((SB_IST(1) & EXT_BBA) || (SB_IST(0) & ours)))
 	{
 		/* Swallowed only when the chip -- or the DMA -- was pending and
 		 * nothing of the title's is: an entry we did not cause always
@@ -250,10 +264,10 @@ void irq_tick(void)
 		{
 			rtl_irq_ack();
 		}
-		SB_ISTNRM = RX_DMA_END;		/* w1c: the line falls, whatever else this tick does */
+		SB_ISTNRM = ours;		/* w1c: our DMA's line falls, whatever else this tick does */
 		g_irq_rx++;
 		read_mark = t0 + IRQ_READ_PERIOD;	/* look at the read now */
-		g_irq_swallow = !((SB_IST(0) & rx_iml[0] & ~RX_DMA_END)
+		g_irq_swallow = !((SB_IST(0) & rx_iml[0] & ~ours)
 				  | (SB_IST(1) & rx_iml[1] & ~EXT_BBA)
 				  | (SB_IST(2) & rx_iml[2]));
 	}
@@ -272,6 +286,15 @@ void irq_tick(void)
 		/* PHASE 3: a disc read is on the wire; it has the network until
 		 * its verdict, and CD-DA declines meanwhile (g_gd_in_transfer). */
 	}
+#if IRQ_IDLE_LISTEN
+	/* Before CD-DA: when the title's interrupts come more than 5 ms apart
+	 * (VBlank only), every tick finds CD-DA due and a listen placed after it
+	 * never ran. Due once in 50 ms, it leaves CD-DA the other ticks. */
+	else if ((unsigned int)(listen_mark - t0) >= 625000U	/* 50 ms */
+		 && (listen_mark = t0, gd_idle_listen()))
+	{
+	}
+#endif
 #if WITH_CDDA
 	else if ((unsigned int)(cdda_mark - t0) >= IRQ_CDDA_PERIOD)
 	{
@@ -281,6 +304,7 @@ void irq_tick(void)
 #endif
 
 	g_rx_dma_tick = 0;
+	g2dma_release();
 	dt = t0 - TMU2_COUNT;
 	g_irq_tick_sum += dt;
 	if (dt > g_irq_tick_max)

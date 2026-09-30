@@ -21,6 +21,7 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 #define CMD_REBOOT   "RBOT" /* reboot */
 #define CMD_MAPLE    "MAPL" /* Maple packet */
 #define CMD_PMCR 		 "PMCR" /* Performance counter packet */
+#define CMD_MARK     "MARK" /* paint or check witness words in free RAM */
 
 #define COMMAND_LEN  12
 
@@ -34,6 +35,9 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 #endif
 #ifndef WITH_PMCR_CMD
 #define WITH_PMCR_CMD 1
+#endif
+#ifndef WITH_MARK_CMD
+#define WITH_MARK_CMD 1
 #endif
 
 extern unsigned int tool_ip;
@@ -85,6 +89,9 @@ void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #endif
 #if WITH_PMCR_CMD
 void cmd_pmcr(ip_header_t * ip, udp_header_t * udp, command_t * command);
+#endif
+#if WITH_MARK_CMD
+void cmd_mark(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #endif
 
 #endif

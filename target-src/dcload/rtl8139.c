@@ -756,16 +756,38 @@ void rtl_bb_stop(void)
 	nic32[RT_RXCONFIG/4] &= 0xfffffff5;
 }
 
+/* rtl_bb_tx()'s hardware waits: 10 ms of TMU2 (Pck/4). A 1514-byte frame
+ * leaves the FIFO in ~120 us at 100 Mbit. */
+#define RTL_TX_WAIT_TICKS 125000U
+
 int rtl_bb_tx(unsigned char * pkt, int len) // pg. 15 in RTL8139C datasheet: http://realtek.info/pdf/rtl8139cp.pdf
 {
+	unsigned int t0 = TMU2_COUNT;
+
 	rx_settle(1);
 	g2dma_quiesce();
 	// According to KOS source we gotta wait for G2 FIFO to be empty by checking
 	// this bit before reading from/writing to G2. So do that here.
-	while((*(volatile unsigned int*)0xa05f688c) & 0x20U);
+	while((*(volatile unsigned int*)0xa05f688c) & 0x20U)
+	{
+		if ((unsigned int)(t0 - TMU2_COUNT) > RTL_TX_WAIT_TICKS)
+		{
+			break;
+		}
+	}
 
 	while (!(nic32[RT_TXSTATUS0/4 + rtl.cur_tx] & 0x2000U))
 	{ // While tx is not complete (checking OWN)
+		/*
+		 * BOUNDED (AGENTS.md 4.8: every hardware wait is). This runs from the
+		 * interrupt hook's tick with SR.BL set too, where a descriptor the chip
+		 * never gives back would freeze the whole machine. The frame is dropped
+		 * instead; every sender here has a deadline and asks again.
+		 */
+		if ((unsigned int)(t0 - TMU2_COUNT) > RTL_TX_WAIT_TICKS)
+		{
+			return 0;
+		}
 		if (nic32[RT_TXSTATUS0/4 + rtl.cur_tx] & 0x40000000U)
 		{ // Check for abort
 			// Found another bug: (nic32[RT_TXSTATUS0/4 + rtl.cur_tx] |= 1; // <-- If abort, set descriptor size to 1)
@@ -1025,9 +1047,23 @@ static void rx_advance(unsigned int rx_size)
  * in the ring, CAPR not moved, until it is processed.
  */
 #define RX_DMA_MIN 256U
+#ifndef RTL_RX_DMA
+#define RTL_RX_DMA 1	/* 0: every frame by CPU, as before 2026-09-28 (Makefile) */
+#endif
 volatile unsigned int g_rx_dma_tick;	/* irq_tick is running: DMA may start, nothing waits */
 static unsigned int rx_pend_size;	/* rx_size of the frame in flight; 0 = none */
 unsigned int g_rx_dma_frames;		/* frames received by DMA */
+
+/* THE CHANNEL IS CHOSEN PER FRAME (g2dma_pick()): one the title does not
+ * use. It was always 1, KOS's choice for the BBA -- and Sonic Adventure 2's
+ * own channel, whose handler took our ends for its own (g2dma.h). */
+static unsigned int rx_dma_ch;
+
+/* The end bit of the RX DMA in flight, 0 if none (irq.c). */
+unsigned int rtl_rx_dma_bit(void)
+{
+	return rx_pend_size ? G2DMA_IST_BIT(rx_dma_ch) : 0U;
+}
 
 /* Is the frame at `pkt` (GAPS window address) a PartBinary addressed to us?
  * Leaves its first 64 bytes in raw_current_pkt. */
@@ -1045,11 +1081,12 @@ static int rx_is_pbin(unsigned char *pkt)
 static void rx_dma_start(unsigned int pkt_size)
 {
 	unsigned int len = (pkt_size + 2U + 31U) & ~31U;	/* <= RAW_RX_PKT_BUF_SIZE */
+	unsigned int spin = 200000U;
 
-	while ((*(volatile unsigned int *)0xa05f688cU) & 0x20U);
+	while (((*(volatile unsigned int *)0xa05f688cU) & 0x20U) && --spin);
 	CacheBlockInvalidate(raw_current_pkt, len / 32U);
-	SB_ISTNRM = G2DMA_IST_BIT(1);
-	g2dma_start(1, raw_current_pkt, 0x01848000U, len, G2DMA_TO_RAM);
+	SB_ISTNRM = G2DMA_IST_BIT(rx_dma_ch);	/* not the title's: g2dma_pick() */
+	g2dma_start(rx_dma_ch, raw_current_pkt, 0x01848000U, len, G2DMA_TO_RAM);
 	g_rx_dma_frames++;
 }
 
@@ -1065,14 +1102,15 @@ static int rx_settle(unsigned int wait)
 	{
 		return 0;
 	}
-	if (!wait && g_rx_dma_tick && g2dma_busy(1))
+	if (!wait && g_rx_dma_tick && g2dma_busy(rx_dma_ch))
 	{
 		return 1;
 	}
 	rx_pend_size = 0;
-	if (g2dma_wait(1) < 0)
+	if (g2dma_wait(rx_dma_ch) < 0)
 	{
-		G2DMA_EN(1) = 0;
+		G2DMA_EN(rx_dma_ch) = 0;
+		g2dma_mine &= ~(1U << rx_dma_ch);
 		g_g2dma_timeouts++;
 		g_rx_status_drop++;
 	}
@@ -1211,8 +1249,12 @@ static int rtl_bb_rx()
 #endif
 
 #if WITH_IRQ_HOOK
-			if (g_rx_dma_tick && pkt_size >= RX_DMA_MIN && rx_is_pbin(pkt))
+			int ch;
+
+			if (RTL_RX_DMA && g_rx_dma_tick && pkt_size >= RX_DMA_MIN
+			    && (ch = g2dma_pick()) >= 0 && rx_is_pbin(pkt))
 			{
+				rx_dma_ch = (unsigned int)ch;
 				/* Not consumed: rx_settle() does that when the DMA is over. The
 				 * loop stops here, or its next poll would use the bridge under
 				 * the DMA. */

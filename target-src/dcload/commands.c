@@ -15,6 +15,7 @@
 
 #include "perfctr.h"
 #include "memfuncs.h"
+#include "g2dma.h"
 
 __attribute__((aligned(4))) volatile unsigned int our_ip = 0; // To be clear, this needs to be zero for init. Make that explicit here. Also, this value should be kept LE.
 unsigned int tool_ip = 0;
@@ -213,6 +214,12 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 		 * only chance to tell it what address we were answering on -- see the
 		 * warm-start comment in rtl8139.c. A game will simply never look. */
 		adapter_handoff_save(our_ip);
+
+#if WITH_CDDA || WITH_IRQ_HOOK
+		/* What a G2 DMA channel's registers say about who used it last must
+		 * be about this title, not an earlier loader (g2dma.h). */
+		g2dma_forget();
+#endif
 
 		running = 1;
 
@@ -772,6 +779,118 @@ void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN + i);
 }
 #endif /* WITH_MAPLE */
+
+#if WITH_MARK_CMD
+/*
+ * MARK: witness words in RAM, so the host learns what the title WRITES.
+ *
+ * The host's memory map (dcload-ip-rs game-memory.tsv) learned only where
+ * disc reads land. What a title writes with the CPU -- a heap, a
+ * decompressed file, a table -- it never saw, and that is what overwrote the
+ * loader under Shenmue II: ~2 KB at 0x8cfd0000 at the end of a cinematic,
+ * in a block no read had ever touched (2026-09-30).
+ *
+ * So, before EXEC, the host asks for RAM no read has landed in to be painted:
+ * one word every MARK_STRIDE bytes, holding its own P1 address ^ MARK_KEY
+ * (an address-dependent value, so a title copying painted RAM elsewhere is
+ * still caught). While the title runs, it asks which 64 KB blocks still carry
+ * every word, and records the others. Done here rather than from the host
+ * because painting 16 MB over the network is seconds, here milliseconds, and
+ * a check is one datagram each way instead of a SendBinQ per sample.
+ *
+ *   address  start, 64 KB aligned (any segment)
+ *   size     bytes, a multiple of 64 KB, at most 16 MB;
+ *            bit 31 clear = paint, set = check
+ *   reply    MARK, same address. Paint: size 0. Check: size = the bitmap's
+ *            bytes, bit i (LSB first) = block i has a changed word.
+ *            Refused: size 0xffffffff, nothing done.
+ *
+ * Painting goes through P2, so nothing sits dirty in the cache when go.S
+ * turns it off. A check purges each sampled line first (ocbp: a write the
+ * title left in the cache reaches RAM) and then reads through P2 (a line
+ * brought in by an earlier check cannot hide a later DMA or P2 write).
+ *
+ * A check costs one purge and one uncached read per sample, and stops at the
+ * first changed word of a block: ~256 samples per clean 64 KB block. The host
+ * asks about a few blocks at a time, because this runs inside the title's GD
+ * wait or the interrupt tick.
+ *
+ * Refused if the range reaches anything of the loader's own: a painted word in
+ * its image, stack, .hiram or Maple page would be a loader that stops
+ * answering, and only the host's arithmetic stands between the two.
+ */
+#define MARK_KEY    0x5a3cc3a5U
+#define MARK_STRIDE 256U
+
+extern char mark_stack_top[] __asm__("_stack");
+extern char _hiram_start[], _hiram_end[];
+extern char maple_dma_buffer[];
+
+static int mark_overlaps(unsigned int a, unsigned int e, const char *lo, unsigned int hi)
+{
+	return a < hi && e > (unsigned int)lo;
+}
+
+void cmd_mark(ip_header_t * ip, udp_header_t * udp, command_t * command)
+{
+	unsigned char *buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
+	command_t * response = (command_t *)buffer;
+	unsigned int size = ntohl(command->size);
+	unsigned int check = size >> 31;
+	unsigned int blocks = (size & 0x7fffffffU) >> 16;
+	unsigned int a = (ntohl(command->address) & 0x1fff0000U) | 0x80000000U;
+	unsigned int e = a + (blocks << 16);
+	unsigned int i, n = 0;
+
+	memcpy(response, command, COMMAND_LEN);
+
+	if (blocks > 256 || e > 0x8d000000U
+	    || mark_overlaps(a, e, dcload_base, (unsigned int)mark_stack_top)
+	    || mark_overlaps(a, e, _hiram_start, (unsigned int)_hiram_end)
+	    || mark_overlaps(a, e, maple_dma_buffer, (unsigned int)maple_dma_buffer + 0x1000U))
+	{
+		response->size = htonl(0xffffffffU);
+	}
+	else
+	{
+		for (i = 0; i < blocks; i++)
+		{
+			unsigned int p = a + (i << 16);
+			unsigned int top = p + 0x10000U;
+
+			if (!(i & 7))
+			{
+				response->data[i >> 3] = 0;
+			}
+			for (; p < top; p += MARK_STRIDE)
+			{
+				volatile unsigned int *w = (volatile unsigned int *)(p | 0x20000000U);
+
+				if (!check)
+				{
+					*w = p ^ MARK_KEY;
+					continue;
+				}
+				__asm__ volatile ("ocbp @%0" : : "r" (p) : "memory");
+				if (*w != (p ^ MARK_KEY))
+				{
+					response->data[i >> 3] |= 1 << (i & 7);
+					break;
+				}
+			}
+		}
+		if (check)
+		{
+			n = (blocks + 7) >> 3;
+		}
+		response->size = htonl(n);
+	}
+
+	make_ip(ntohl(ip->src), ntohl(ip->dest), UDP_H_LEN + COMMAND_LEN + n, IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
+	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN + n, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
+	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN + n);
+}
+#endif /* WITH_MARK_CMD */
 
 #if WITH_PMCR_CMD
 // The 6 performance counter control functions are:

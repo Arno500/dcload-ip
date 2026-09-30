@@ -282,6 +282,14 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		}
 #endif
 
+#if WITH_MARK_CMD
+		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_MARK, 4/4)))
+		{
+			cmd_mark(ip, udp, command);
+			pkt_match_id = 0;
+		}
+#endif
+
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_DONEBIN, 4/4)))
 		{
 			cmd_donebin(ip, udp, command);

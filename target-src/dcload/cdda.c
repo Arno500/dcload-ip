@@ -82,9 +82,6 @@
 #define G2_FIFO_G2         (1u << 4)
 #define G2_FIFO_SH4        (1u << 5)
 /* Suspend registers of the three G2 DMA channels (SPU, BBA, CH2), KOS g2bus.h. */
-#define G2_DMA_SUSPEND_SPU (*(volatile unsigned int *)0xa05f781c)
-#define G2_DMA_SUSPEND_BBA (*(volatile unsigned int *)0xa05f783c)
-#define G2_DMA_SUSPEND_CH2 (*(volatile unsigned int *)0xa05f785c)
 /* G2 DMA channel 0 (the AICA) is busy: a title is writing sound RAM. The
  * loader keeps off the AICA meanwhile, as isoldr does. */
 #define aica_dma_busy()    (((*(volatile unsigned int *)0xa05f7818) & 1u) != 0u)
@@ -420,7 +417,6 @@ static void g2_fifo_wait(void)
 static unsigned int g2_lock(void)
 {
 	unsigned int sr, tmp;
-	int spin = G2_FIFO_SPIN_LIMIT;
 
 	g2dma_quiesce();		/* no CPU access to G2 over our own DMA */
 	__asm__ __volatile__("stc\tsr,%0\n\t"
@@ -430,22 +426,13 @@ static unsigned int g2_lock(void)
 	                     : "=&r"(sr), "=&r"(tmp)
 	                     : "r"(0xf0u)
 	                     : "memory");
-	G2_DMA_SUSPEND_SPU = 1;
-	G2_DMA_SUSPEND_BBA = 1;
-	G2_DMA_SUSPEND_CH2 = 1;
-	while ((G2_FIFO_STATUS & (G2_FIFO_SH4 | G2_FIFO_G2 | G2_FIFO_AICA))
-	       && spin--)
-	{
-		/* spin */
-	}
+	g2dma_hold();		/* nested: the tick may already hold (g2dma.h) */
 	return sr;
 }
 
 static void g2_unlock(unsigned int sr)
 {
-	G2_DMA_SUSPEND_SPU = 0;
-	G2_DMA_SUSPEND_BBA = 0;
-	G2_DMA_SUSPEND_CH2 = 0;
+	g2dma_release();
 	__asm__ __volatile__("ldc\t%0,sr\n" : : "r"(sr) : "memory");
 }
 
@@ -1492,6 +1479,13 @@ void cdda_service(void)
 	 * the rest of the file uses wraps and the end of a track does not. */
 	now = TMU_TCNT2;
 	cd.svc_gap = cd.svc_marked ? (unsigned int)(cd.svc_mark - now) : 0u;
+	if ((int)cd.svc_gap < 0)
+	{
+		/* The tick's service ran between reading `now` and here and moved
+		 * svc_mark past it: a negative gap, which read as 343597 ms and muted
+		 * the stream twice (Shenmue II, g_cdda_svc_gap_max 0xffffffc8). */
+		cd.svc_gap = 0u;
+	}
 	if (cd.svc_gap > g_cdda_svc_gap_max)
 	{
 		g_cdda_svc_gap_max = cd.svc_gap;
