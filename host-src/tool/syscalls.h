@@ -98,6 +98,11 @@ int dc_gdbpacket(unsigned char * buffer);
  * on bit 31, which the loader sets on the first fetch after a key-on (the only
  * event that resets the AICA's decoder). */
 #define CMD_CDDAREAD_ADPCM "DC24"
+/* Console text from a running title, without an answer: value0 = fd (1 or
+ * 2), then the bytes, as many as the datagram holds. The host prints them and
+ * replies nothing. Sent by dcload only under dcload-ip-rs (g_gd_kos);
+ * dc-tool-ip does not implement it. */
+#define CMD_CONSOLE "DC25"
 
 // Special definition for exception handler data
 #define CMD_EXCEPTION "EXPT"

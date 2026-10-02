@@ -74,6 +74,10 @@ extern unsigned int g_bin_stage_lo;
 extern unsigned int g_bin_stage_hi;
 extern unsigned int g_bin_stage_want;
 extern unsigned int g_cdda_stale_lbin;
+/* The disc read's door: the one destination a waiting read accepts (0 =
+ * none). See g_bin_read_want in commands.c. */
+extern unsigned int g_bin_read_want;
+extern unsigned int g_gd_stale_lbin;
 /* End the wait as soon as the window is complete, instead of on the host's
  * ReturnValue. See the definition. */
 void bin_complete_escape(unsigned int on);

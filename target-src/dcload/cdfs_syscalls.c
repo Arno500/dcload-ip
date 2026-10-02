@@ -76,6 +76,7 @@
 #include "hiram.h"
 #include "irq.h"
 #include "memfuncs.h"
+#include "g2dma.h"
 
 /* Command codes, from the BIOS GD driver (same numbering as isoldr). */
 #define CMD_PIOREAD            16
@@ -195,7 +196,14 @@
  * Idempotent on purpose: restarting it between the chunks of a disc read would
  * break that read's deadline and every mark in flight, so a timer already
  * running as programmed is left alone.
+ *
+ * AND A KOS TITLE'S TIMER IS LEFT ALONE TOO (2026-10-02). KOS runs TMU2 at
+ * Pck/4 with a 1 s reload for its millisecond clock; reprogramming it from
+ * cdda.c would stop KOS's seconds and break its timer_ms_gettime64(). Any
+ * Pck/4 timer whose period outlasts every interval measured here (838 ms,
+ * CDDA_GAP_LIMIT_TICKS) will do: tmu2_since() follows the reload.
  */
+#define TMU2_MIN_PERIOD 12000000u	/* 0.96 s */
 #define TMU_TSTR       (*(volatile unsigned char *)0xffd80004)
 #define TMU_TCOR2      (*(volatile unsigned int *)0xffd80020)
 #define TMU_TCR2       (*(volatile unsigned short *)0xffd80028)
@@ -204,7 +212,7 @@
 
 void gd_deadline_timer_start(void)
 {
-	if ((TMU_TSTR & TMU_START_TMU2) != 0u && TMU_TCOR2 == 0xffffffffu
+	if ((TMU_TSTR & TMU_START_TMU2) != 0u && TMU_TCOR2 >= TMU2_MIN_PERIOD
 	    && (TMU_TCR2 & 0x7u) == TMU_TCR_PCK4)
 	{
 		return;
@@ -486,6 +494,22 @@ unsigned int g_cdfs_read_stale;
 unsigned int g_gd_park_longs;
 
 /*
+ * Non-zero for a KOS binary: written by the host before EXEC, by symbol name
+ * (dcload-ip-rs). A read then starts in the ExecServer that picks it up,
+ * without the first yield -- as isoldr does for BIN_TYPE_KOS (syscalls.c).
+ *
+ * KOS's DMA read (cdrom_read_sectors_dma_irq) polls once; on PROCESSING it
+ * sleeps on a semaphore only the G1 DMA-end interrupt or its vblank handler
+ * signals. Nothing raises the first, so every read ran from the second: the
+ * network exchange inside a vblank interrupt. Measured 2026-10-02 on the GTA
+ * III port: two reads served that way, then the title never asked again.
+ *
+ * It also sends KOS's console writes as DC25 (syscalls.c) and masks the
+ * adapter waits (bb_irq_hold(), adapter.h): the host points KOS's console here.
+ */
+unsigned int g_gd_kos;
+
+/*
  * Non-zero while a disc read (ReadSectors, GetTOC) waits in bb->loop().
  *
  * There is one LoadBinary window (bin_info) and one pkt_buf, so no other
@@ -575,15 +599,15 @@ static void gd_lock_watchdog(void)
 		return;
 	}
 
-	/* TMU2 counts DOWN; the unsigned subtraction is correct across its wrap. */
-	if ((unsigned int)(gd_stuck_since - TMU2_COUNT) < GD_LOCK_STUCK_TICKS)
+	/* TMU2 counts DOWN; tmu2_since() is right across its reload (adapter.h). */
+	if (tmu2_since(gd_stuck_since) < GD_LOCK_STUCK_TICKS)
 	{
 		return;
 	}
 
 	g_gd_lock_stuck++;
 	g_gd_lock_stuck_owner = g_gd_lock_owner;
-	g_gd_lock_stuck_ticks = (unsigned int)(gd_stuck_since - TMU2_COUNT);
+	g_gd_lock_stuck_ticks = tmu2_since(gd_stuck_since);
 	gd_stuck_armed = 0;
 	gd_give();
 }
@@ -834,10 +858,31 @@ static int gd_in_irq(void)
 	return (sr >> 28) & 1U;
 }
 
+/*
+ * A KOS TITLE'S G2 DMA IS SUSPENDED FOR THE EXCHANGE (2026-10-02), as KOS
+ * itself does around every CPU access to G2 (g2_lock()) and as the tick does
+ * for Katana titles (g2dma_hold(), g2dma.h). A KOS title moves its sound to
+ * the AICA by G2 DMA whenever it likes, and here the CPU reads the BBA's ring
+ * through the same bus. Seen on the GTA III port, on the console: a stream
+ * read failed five attempts in a row, 250 ms each, the host answering every
+ * one, and the title asserted on EIO -- the bus collision is the suspect (no
+ * counter could be read: --diag is blind under KOS between reads). The
+ * interrupts are masked for the exchange anyway, so the title's sound waits
+ * for it either way: ~3 ms a read, 250 ms on a failed attempt.
+ */
+#if WITH_CDDA
+#define gd_g2_hold()    do { if (g_gd_kos) g2dma_hold(); } while (0)
+#define gd_g2_release() do { if (g_gd_kos) g2dma_release(); } while (0)
+#else
+#define gd_g2_hold()    do { } while (0)
+#define gd_g2_release() do { } while (0)
+#endif
+
 void gd_exchange(void (*fn)(void))
 {
 	unsigned int irq = bb_irq_hold();
 
+	gd_g2_hold();
 	if (irq || gd_in_irq())
 	{
 		gd_on_loader_stack(fn);
@@ -847,6 +892,7 @@ void gd_exchange(void (*fn)(void))
 		fn();
 	}
 	bb->stop();
+	gd_g2_release();
 	bb_irq_restore(irq);
 }
 
@@ -874,7 +920,7 @@ static void gd_read_exchange(void)
 	 * complete the window when they come. cmd_retval() stopped RX: restart it.
 	 */
 	while (((int)syscall_retval >= 0) && !bin_window_complete()
-	       && ((fine_deadline_start - TMU2_COUNT) <= fine_deadline_ticks))
+	       && (tmu2_since(fine_deadline_start) <= fine_deadline_ticks))
 	{
 		g_cdfs_read_stale++;
 		syscall_retval = (unsigned int)-1;
@@ -975,6 +1021,8 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 	 * one store.
 	 */
 	bin_window_close();
+	/* And no other read's answer may replace it (g_bin_read_want). */
+	g_bin_read_want = dest;
 
 	/*
 	 * AND DO NOT ECHO THE LoadBinary BACK.
@@ -991,6 +1039,7 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 	g_gd_in_transfer++;
 	gd_exchange(gd_read_exchange);
 	g_gd_in_transfer--;
+	g_bin_read_want = 0;
 	bin_echo_suppress(0);
 	fine_deadline_ticks = 0;
 	timeout_loop = 0;
@@ -1223,7 +1272,8 @@ static void ga_next(void)
 	ga_sc = (_GDS.param[1] < most) ? _GDS.param[1] : most;
 	memcpy(command->id, CMD_CDFSREAD, 4);
 	command->value0 = htonl(_GDS.param[0]);
-	command->value1 = htonl(ga_virt ? (unsigned int)gd_stage_big : _GDS.param[2]);
+	g_bin_read_want = ga_virt ? (unsigned int)gd_stage_big : _GDS.param[2];
+	command->value1 = htonl(g_bin_read_want);
 	command->value2 = htonl(ga_sc * _GDS.sec_size);
 	bin_window_close();	/* judged on its own window: see ReadSectors() */
 	bin_echo_suppress(1);
@@ -1240,6 +1290,7 @@ static void ga_end(unsigned int verdict)
 {
 	irq_rx_arm(0);
 	bb->stop();
+	g_bin_read_want = 0;
 	bin_echo_suppress(0);
 	g_gd_in_transfer--;
 	ga_state = verdict;
@@ -1263,7 +1314,7 @@ static void ga_poll(void)
 	}
 
 	ga_run(ga_drain);
-	late = (unsigned int)(ga_start - TMU2_COUNT) > GD_READ_DEADLINE_TICKS;
+	late = tmu2_since(ga_start) > GD_READ_DEADLINE_TICKS;
 	if (bin_window_complete())
 	{
 		/* Done with its ReturnValue, not before: left in the ring, it met the
@@ -1737,9 +1788,10 @@ static void data_transfer(void)
 	 * isoldr yields once before starting for non-KOS binaries, so the title
 	 * observes PROCESSING for at least one poll instead of seeing a request
 	 * satisfied within its own ReqCmd frame. Retail code is written against a
-	 * drive that cannot possibly be that fast.
+	 * drive that cannot possibly be that fast. Not for KOS (g_gd_kos).
 	 */
-	gdcExitToGame();
+	if (!g_gd_kos)
+		gdcExitToGame();
 
 	if (_GDS.param[1] == 0)
 	{
@@ -1766,14 +1818,20 @@ static void data_transfer(void)
 	 *
 	 * Sonic Adventure issues a 105-sector read immediately before the read it
 	 * has always died on, so this is not a hypothetical difference.
+	 *
+	 * NOT FOR KOS (g_gd_kos): this path never retries, and KOS does not
+	 * either -- a FAILED read is EIO, a short fread, and the GTA III port's
+	 * librw asserts and exits (2026-10-02, one lost request under flycast, in
+	 * MISC.TXD). Its one-sector reads take data_transfer_emu_async() and its
+	 * retries; KOS's vblank handler resumes the server after the yield.
 	 */
 #if GD_BULK_SECTORS > 0
 	if (((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1) ||
 	     (_GDS.param[1] >= (unsigned int)GD_BULK_SECTORS))
-	    && !gd_is_virtual(_GDS.param[2]))
+	    && !gd_is_virtual(_GDS.param[2]) && !g_gd_kos)
 #else
 	if (((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1))
-	    && !gd_is_virtual(_GDS.param[2]))
+	    && !gd_is_virtual(_GDS.param[2]) && !g_gd_kos)
 #endif
 	{
 		_GDS.status = ReadSectors(_GDS.param[2], _GDS.param[0], _GDS.param[1]);

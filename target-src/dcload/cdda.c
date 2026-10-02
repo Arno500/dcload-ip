@@ -889,7 +889,7 @@ static void cdda_channels_stop(void)
 	aica_channel_off(CDDA_CH_RIGHT);
 	g2_fifo_wait();
 	t0 = TMU_TCNT2;
-	while ((unsigned int)(t0 - TMU_TCNT2) < KEYOFF_SPIN_TICKS)
+	while (tmu2_since(t0) < KEYOFF_SPIN_TICKS)
 	{
 		/* spin */
 	}
@@ -1437,7 +1437,7 @@ static void cdda_service_body(void)
 	 * network continuously anyway.
 	 */
 	if (filled || svc_no_listen
-	    || (unsigned int)(cd.listen_mark - TMU_TCNT2) < CDDA_LISTEN_PERIOD_TICKS)
+	    || tmu2_since(cd.listen_mark) < CDDA_LISTEN_PERIOD_TICKS)
 	{
 		return;
 	}

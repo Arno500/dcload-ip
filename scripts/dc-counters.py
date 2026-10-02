@@ -84,6 +84,7 @@ GROUPS = [
     ("GD emulation (cdfs_syscalls.c)", [
         "g_gd_park_longs", "g_gd_idx_counts", "g_gd_cmd_counts",
         "g_cdfs_read_retries", "g_cdfs_read_fails", "g_cdfs_read_holes", "g_cdfs_read_stale",
+        "g_gd_stale_lbin",
         "g_cdfs_sync_chunks", "g_cdfs_sync_reentered",
         "g_gd_spindown",
     ]),

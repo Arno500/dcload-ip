@@ -127,7 +127,7 @@ static inline int g2dma_wait(unsigned int ch)
 
 	while (g2dma_busy(ch))
 	{
-		if ((unsigned int)(t0 - TMU2_COUNT) > G2DMA_WAIT_TICKS)
+		if (tmu2_since(t0) > G2DMA_WAIT_TICKS)
 		{
 			return -1;
 		}

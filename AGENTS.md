@@ -279,7 +279,15 @@ model. The driver a title is written against is a **coroutine**, so:
   answer to an earlier attempt, queued in the ring, can end the wait of the
   next one. `ReadSectors` then keeps waiting until its own deadline
   (`g_cdfs_read_stale`) instead of failing in a millisecond; the late answer's
-  parts are the same bytes for the same place, so they count. It also sets `bin_echo_suppress(1)` for the
+  parts are the same bytes for the same place, so they count. **A late answer
+  for another destination is refused at the door** (2026-10-02,
+  `g_bin_read_want`, `g_gd_stale_lbin`): its LoadBinary used to replace the
+  waiting read's window, fill it and pass `bin_window_complete()`, so the read
+  was COMPLETED with nothing delivered -- the GTA III port (KOS) then ran on a
+  cache block holding a sector read 16 reads earlier and asserted in
+  `LoadCollisionModel`. `ReadSectors` and `ga_next` publish their destination
+  for the wait; `cmd_loadbin` refuses any other one without touching the
+  window, as the CD-DA door does. It also sets `bin_echo_suppress(1)` for the
   wait: nobody reads the echo any more, and sending it would put one of our
   frames on the wire inside the host's burst — the collision already on record
   on the audio path.
@@ -357,6 +365,13 @@ never under a title.
    flycast without the local PMCR patch), `RTL_IDLE_POLL_LIMIT` only counts
    polls with no frame, and both are disarmed when `timeout_loop` is cleared
    under a wait. Arm, call, then clear — never clear someone else's.
+   **Measure with `tmu2_since()`** (`adapter.c`), never `start - TMU2_COUNT`:
+   a KOS title owns TMU2 (Pck/4, reloaded every second by `timer_ms_enable()`),
+   and the raw subtraction fired every deadline in progress at each reload
+   (2026-10-02). `gd_deadline_timer_start()` leaves any Pck/4 timer with a
+   period of 0.96 s or more alone, so it no longer reprograms KOS's clock.
+   Intervals measured on TMU2 must stay under that period (838 ms at most
+   today); `cdda.c`'s service gap and the hook's marks still subtract raw.
 
 **Stuck-lock watchdog.** `gd_lock_watchdog()` (from GetDrvStat/GetCmdStat)
 releases the GD lock if it is held while the server is parked and
@@ -463,10 +478,12 @@ at `_end = 0x8c00c7ec`, and the asynchronous reads (phase 3) at **`_end =
 `_end` up to `base+0x9c00` -- **~2 KB left** after the G2 DMA work (`_end` =
 `base+0x9310`, default flags; before it, 352 B; `base+0x9634` since `MARK` and
 the idle listen, 2026-09-30: ~1.4 KB left). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. **The deployed
-`loaders/` is the current build since 2026-10-02** (md5 `a6e6bbe9…`: the
+`loaders/` is the current build since 2026-10-02** (md5 `4ce716ce…`: the
 three Shenmue II fixes, `MARK`, the idle listen, the G2 DMA suspend, the
-per-frame RX channel of §4.16 and the P2 purge of §8; `_end` = `base+0x9914`,
-~750 B left; it needs
+per-frame RX channel of §4.16, the P2 purge of §8, `g_gd_kos` and the
+disc-read door of §4.5, KOS's masked waits and `DC25`, `tmu2_since()` and the
+G2 suspend under KOS (§4.16): `_end` = `base+0x9b20`, `.gdstage` ending 208 B
+under `_stack`; it needs
 the host's `layout()` of 2026-09-29; the older `0x8c00c000` build is gone), which
 loses the low base to painted titles as described below. The user's decision
 (2026-09-21) is that this is acceptable where it has to happen: the host
@@ -1097,7 +1114,8 @@ deadline runs out while the loader is not running at all. Masking interrupts
 is not enough: CE calls the driver on a thread stack at a virtual address, and
 a TLB miss or an uncommitted stack page enters CE's kernel, which sets IMASK 0.
 So every network exchange of the GD path (`ReadSectors`, `GetTOC`,
-`cdda_fetch`) goes through `gd_exchange()`: under the MMU it masks interrupts
+`cdda_fetch`) goes through `gd_exchange()`: under the MMU (and under a KOS
+title, `g_gd_kos`, §16) it masks interrupts
 (`bb_irq_hold()`, `adapter.h`) and then runs on the Maple page
 (`gd_on_loader_stack`, `cdfs_redir.s`) -- in that order, because it is one
 stack for every thread. The adapter loops mask too, and every exchange ends
@@ -1279,8 +1297,13 @@ bytes from the BBA take 99 us by CPU and 94 us by DMA; 2368 bytes to the AICA
   waited forever right after loading `SDRV`/`SMLT`/`SMPB` -- on the console
   only. Channels with a transfer of the loader's running are left alone, and
   `g2dma_start()` lifts the suspend of the channel it takes. The synchronous GD
-  path still does not suspend (a 250 ms read deadline would stall the title's
-  sound): never seen to matter.
+  path suspends **under KOS only** (`gd_exchange()`, `g_gd_kos`, 2026-10-02):
+  the GTA III port failed one stream read five attempts in a row with the host
+  answering each, then asserted on EIO; KOS itself suspends G2 DMA around every
+  CPU access, and its interrupts are masked for the exchange anyway. Suspect,
+  not proven: `--diag` sees nothing under KOS between reads. Katana titles'
+  synchronous path still does not suspend (a 250 ms read deadline would stall
+  their sound): never seen to matter.
 - **A CHANNEL THE TITLE USES IS NEVER THE RX DMA'S.** A Katana title arms the
   end bits of all four channels on its IML4 (`0x7f000`), and its handler takes
   the end of a transfer of ours on a channel it drives for the end of its own.
@@ -1479,6 +1502,10 @@ Both are answered by LoadBinary/PartBinary into value1 and a **ReturnValue
 whose `address` is the LBA served and whose `size` is the clock trim in ppm**
 (§4.13). `cmd_retval()` latches `size` in `syscall_retsize`; every other
 ReturnValue sends 0 there.
+
+`DC25` `CMD_CONSOLE` (DC→host, 2026-10-02) is console text from a running
+KOS title: value0 = fd (1 or 2), then the bytes. **It has no answer**; a lost
+datagram is a lost line. Sent only under dcload-ip-rs (`g_gd_kos`).
 
 `LBIN`/`PBIN`/`DBIN` also carry disc sectors to a running title (§4.5).
 
@@ -1891,6 +1918,25 @@ What it does that concerns the DC side:
 - **Patches titles** before upload: the GAPS guard (§4.12), `--vga` (forces the
   PDTRA cable read; `auto` uses the cable dcload reports), PPF patches
   (`patches/`, checked against the PPF blockcheck).
+- **KOS binaries** (found by KOS's dcload probe words, `is_kos_binary`,
+  2026-10-02): `g_gd_kos` is set under a disc image, and the dcload magic at
+  `0x8c004004` is then pointed at the live loader (its `base+8` syscall
+  pointer), so KOS's console (`dbgio` `fs_dcload`) and `/pc` reach the host --
+  as it is without a disc image. A Katana title, or a KOS one the loader could
+  not be told about, gets the magic cleared. **Safe only because `g_gd_kos`
+  masks interrupts across every adapter wait** (`bb_irq_hold()`, as under the
+  MMU): KOS is preemptive, and a thread's printf entering the write syscall in
+  the middle of another thread's disc read would share `pkt_buf` and take the
+  read's ReturnValue; KOS masks its own dcload syscalls. **Console writes
+  (fd 1 and 2) then go as `DC25`** (`CMD_CONSOLE`, `console_write()` in
+  `syscalls.c`): the text in the datagram, no SendBinQ, no ReturnValue, no
+  wait. The acknowledged `DC02` stopped KOS for good after its first line on
+  the console -- its wait has no deadline, so one lost frame is a hung title.
+  Gated on `g_gd_kos`, which only this host sets: dc-tool-ip does not know
+  `DC25`. And the
+  title's top of RAM is lowered under the loader (`kos_mem_top_patches`:
+  `arch_stack_16m`/`_32m`, which give `_arch_mem_top`; KOS's heap otherwise
+  grows to `0x8cff0000`, through a high loader and a low one's buffers).
 - **`--diag`**: the counter panel (`d` toggles, `w` writes `dcload-diag.txt`;
   the header shows the measured sample interval, not the requested one).
   `stackwatch` reads `g_gd_sp_min` every 10 s in every session.
@@ -1921,8 +1967,14 @@ What it does that concerns the DC side:
 - **Counter names** are read from the ELF by name (`src/diag.rs`,
   `src/stackwatch.rs`, `scripts/dc-counters.py`); renaming one breaks them.
   So are **`_gd_stage`** and **`_gd_stage_big`** (the ranges a disc read may
-  land on inside the loader, `loader_stage` in `main.rs`), and
-  **`_gd_bios_entry`** (`cdfs_redir.s`), the address the host writes
+  land on inside the loader, `loader_stage` in `main.rs`),
+  **`_g_gd_kos`** (`cdfs_syscalls.c`), which the host sets to 1 before `EXEC`
+  for a KOS binary (found by KOS's dcload probe words, `is_kos_binary`): a
+  read then starts without the first yield, as isoldr does for KOS -- KOS
+  sleeps on PROCESSING until the G1 DMA-end interrupt or its vblank handler --
+  and a one-sector read takes the retrying path (KOS never retries: one lost
+  request was EIO and an assertion in the GTA III port);
+  and **`_gd_bios_entry`** (`cdfs_redir.s`), the address the host writes
   over a title's direct calls to the BIOS GD driver (§4.5); a loader without it
   leaves those calls on the real drive, and the host says so.
 - Disc reads are served **one at a time**, to completion, inside the request
@@ -1936,6 +1988,8 @@ What it does that concerns the DC side:
   the title short data in silence. What keeps them in step is that the host
   chainloads its own loader from `loaders/` for every disc image, so that
   directory is redeployed with any change here (§14.19).
+  **Its LoadBinary must name exactly the destination the request gave**: the
+  loader refuses any other one while a read waits (§4.5, the disc-read door).
 - **`send_sectors` pauses once after the LoadBinary, before the first part.**
   `cmd_loadbin` zeroes the part map and purges the cache over the whole
   destination range — 512 cache blocks for a 16 KB chunk — and waiting for the

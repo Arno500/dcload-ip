@@ -99,8 +99,22 @@ extern volatile int drain_iters;
  *
  * Only moves once something has started TMU2: cdda.c does before its first
  * fetch, and setup_machine() does at EXEC when ISOLDR_SETUP_MACHINE=1. In the
- * default build nothing else starts it. */
+ * default build nothing else starts it.
+ *
+ * NOT ALWAYS OURS, AND NOT ALWAYS FROM 0xffffffff (2026-10-02). KOS takes TMU2
+ * for its millisecond clock: Pck/4 too, but reloaded from TCOR2 = 1 s
+ * (timer_ms_enable()). `start - TMU2_COUNT` then goes "negative" at every
+ * reload, and a deadline compared that way fired at once, once a second, in
+ * the middle of whatever wait was running. Measure with tmu2_since(). */
 #define TMU2_COUNT (*(volatile unsigned int *)0xffd80024)
+#define TMU2_TCOR (*(volatile unsigned int *)0xffd80020)
+
+/* Ticks since `start` was read from TMU2_COUNT, across one reload of whatever
+ * period TCOR2 holds; with ours (0xffffffff) the plain unsigned subtraction.
+ * Right for intervals shorter than the period: 1 s under KOS, so anything
+ * measured on TMU2 must be checked at least that often (every deadline here is
+ * 838 ms or less, and is polled). */
+unsigned int tmu2_since(unsigned int start);
 
 /* When non-zero, bb->loop() gives up this many TMU2 ticks after
  * `fine_deadline_start` was latched, exactly as the seconds deadline does:
@@ -121,13 +135,23 @@ extern unsigned int g_fine_timeouts;
  * all (docs/wince-investigation.md 7o). So while the title runs with the MMU
  * on, the adapter loop runs with IMASK 15. Exceptions still reach the title's
  * handlers; nothing here takes one. A wait is ~2 ms, 250 ms at worst.
+ *
+ * KOS IS PREEMPTIVE TOO (g_gd_kos, 2026-10-02). Its timer interrupt can
+ * switch threads in the middle of a disc read's wait, and since the host
+ * points KOS's console at this loader (the dcload magic), the next thread's
+ * printf would enter dcload's write syscall over the same pkt_buf and take
+ * the read's ReturnValue for its own. KOS masks its own dcload syscalls
+ * (fs_dcload.c, plain_dclsc), so masking the GD side closes the pair.
  */
+extern unsigned int g_gd_kos;
+
 static inline unsigned int bb_irq_hold(void)
 {
 	unsigned int sr;
 
 	__asm__ volatile ("stc sr,%0" : "=r" (sr));
-	if ((*(volatile unsigned int *)0xff000010U & 1U) && (~sr & 0xf0U))
+	if (((*(volatile unsigned int *)0xff000010U & 1U) || g_gd_kos)
+	    && (~sr & 0xf0U))
 	{
 		__asm__ volatile ("ldc %0,sr" : : "r" (sr | 0xf0U) : "memory");
 		return sr | 1U << 31;	/* SR bit 31 is reserved: "held" */

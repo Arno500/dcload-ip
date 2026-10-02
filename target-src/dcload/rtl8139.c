@@ -770,7 +770,7 @@ int rtl_bb_tx(unsigned char * pkt, int len) // pg. 15 in RTL8139C datasheet: htt
 	// this bit before reading from/writing to G2. So do that here.
 	while((*(volatile unsigned int*)0xa05f688c) & 0x20U)
 	{
-		if ((unsigned int)(t0 - TMU2_COUNT) > RTL_TX_WAIT_TICKS)
+		if (tmu2_since(t0) > RTL_TX_WAIT_TICKS)
 		{
 			break;
 		}
@@ -784,7 +784,7 @@ int rtl_bb_tx(unsigned char * pkt, int len) // pg. 15 in RTL8139C datasheet: htt
 		 * never gives back would freeze the whole machine. The frame is dropped
 		 * instead; every sender here has a deadline and asks again.
 		 */
-		if ((unsigned int)(t0 - TMU2_COUNT) > RTL_TX_WAIT_TICKS)
+		if (tmu2_since(t0) > RTL_TX_WAIT_TICKS)
 		{
 			return 0;
 		}
@@ -1683,7 +1683,7 @@ void rtl_bb_loop(int is_main_loop)
 		 * both are armed. TMU2 counts DOWN, so elapsed is start minus now, and
 		 * the unsigned subtraction is correct across the counter's wrap. */
 		if (fine_deadline_ticks
-		    && (fine_deadline_start - TMU2_COUNT) > fine_deadline_ticks)
+		    && tmu2_since(fine_deadline_start) > fine_deadline_ticks)
 		{
 			g_fine_timeouts++;
 			timeout_loop = -1;

@@ -305,7 +305,7 @@ void irq_tick(void)
 
 	g_rx_dma_tick = 0;
 	g2dma_release();
-	dt = t0 - TMU2_COUNT;
+	dt = tmu2_since(t0);
 	g_irq_tick_sum += dt;
 	if (dt > g_irq_tick_max)
 	{

@@ -101,6 +101,21 @@ unsigned int g_bin_stage_lo = 0;    /* CD-DA staging buffer, first byte */
 unsigned int g_bin_stage_hi = 0;    /* one past its last byte; 0 = no CD-DA yet */
 unsigned int g_bin_stage_want = 0;  /* destination of the fetch in flight, 0 = none */
 unsigned int g_cdda_stale_lbin = 0; /* abandoned answers refused at the door */
+/*
+ * THE SAME DOOR FOR A DISC READ (2026-10-02). A disc read's answer opens its
+ * own window, and a late answer to an EARLIER read -- another destination --
+ * replaced the window of the read now waiting, filled it, and its ReturnValue
+ * passed bin_window_complete(): COMPLETED with nothing delivered. The GTA III
+ * port (KOS) then ran on a cache block still holding the sector it read 16
+ * reads before, and asserted in LoadCollisionModel. ReadSectors() and the
+ * asynchronous engine publish the destination they wait for; any other
+ * LoadBinary is refused without touching the window. A late answer for the
+ * same destination is a retry's: same bytes, same place, and it counts.
+ */
+/* In BSS on purpose: a title that ends inside a read must not leave the door
+ * shut on the next upload (crt0 zeroes BSS when the loader is re-entered). */
+unsigned int g_bin_read_want;       /* destination of the disc read in flight, 0 = none */
+unsigned int g_gd_stale_lbin = 0;   /* earlier reads' answers refused at the door */
 unsigned int g_dbin_count = 0;
 unsigned int g_dbin_incomplete = 0;
 unsigned int g_last_load_addr = 0;
@@ -253,6 +268,11 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		&& (dest != g_bin_stage_want))
 	{
 		g_cdda_stale_lbin++;
+		return;
+	}
+	if (g_bin_read_want && (dest != g_bin_read_want))
+	{
+		g_gd_stale_lbin++;
 		return;
 	}
 

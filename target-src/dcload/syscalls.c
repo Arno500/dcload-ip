@@ -33,6 +33,8 @@
 #include "commands.h"
 #include "scif.h"
 #include "adapter.h"
+#include "memfuncs.h"
+#include "dcload.h"
 
 unsigned short dcload_syscall_port = 31313; // Legacy mode default port, gets overridn in v2.0.0+ by value from dc-tool
 unsigned int syscall_retval = 0;
@@ -81,6 +83,46 @@ void build_send_packet(int command_len)
 	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + command_len);
 }
 
+/*
+ * A RUNNING KOS TITLE'S CONSOLE IS SENT, NOT ASKED FOR (2026-10-02).
+ *
+ * A write() to the console is three exchanges -- the request, the host
+ * reading the text back with SendBinQ, the ReturnValue -- and its wait has no
+ * deadline: one lost frame and KOS stops for good, inside its dbgio, with the
+ * loader answering everything else. Seen on the console with the GTA III
+ * port, after KOS's first line. Text needs no answer: CMD_CONSOLE carries it,
+ * the host prints it and replies nothing, and a lost frame is a lost line.
+ * Only under the Rust host, which is the one that sets g_gd_kos (dc-tool-ip
+ * does not know CMD_CONSOLE), and with reception left as it was.
+ */
+#define CONSOLE_CHUNK 1024
+
+static int console_write(int fd, const unsigned char *buf, size_t count)
+{
+	command_int_string_t *command =
+		(command_int_string_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
+	ip_header_t *ip = (ip_header_t *)(pkt_buf + ETHER_H_LEN);
+	udp_header_t *udp = (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN);
+	size_t left = count;
+
+	while (left)
+	{
+		unsigned int n = (left < CONSOLE_CHUNK) ? left : CONSOLE_CHUNK;
+		unsigned int len = 8 + n;
+
+		memcpy(command->id, CMD_CONSOLE, 4);
+		command->value0 = htonl(fd);
+		memcpy_8bit(command->string, buf, n);
+		make_ether(tool_mac, bb->mac, (ether_header_t *)pkt_buf);
+		make_ip(tool_ip, our_ip, UDP_H_LEN + len, IP_UDP_PROTOCOL, ip, 0);
+		make_udp(tool_port, dcload_syscall_port, len, ip, udp);
+		bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + len);
+		buf += n;
+		left -= n;
+	}
+	return count;
+}
+
 void dcexit(void)
 {
 	bb->stop(); // Disable packet RX
@@ -112,6 +154,11 @@ int read(int fd, void *buf, size_t count)
 int write(int fd, const void *buf, size_t count)
 {
 	command_3int_t * command = (command_3int_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
+
+	if (g_gd_kos && running && ((fd == 1) || (fd == 2)))
+	{
+		return console_write(fd, buf, count);
+	}
 
 	// Version is encoded as (major << 16) | (minor << 8) | patch
 	// Legacy check for version < 2.0.0
