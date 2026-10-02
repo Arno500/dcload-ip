@@ -78,6 +78,10 @@ extern unsigned int g_cdda_stale_lbin;
  * none). See g_bin_read_want in commands.c. */
 extern unsigned int g_bin_read_want;
 extern unsigned int g_gd_stale_lbin;
+/* The ReturnValue a disc read waits for, GD_READ_TAG | its LBA; 0 = any.
+ * See g_retval_want in commands.c. */
+#define GD_READ_TAG 0x40000000U
+extern unsigned int g_retval_want;
 /* End the wait as soon as the window is complete, instead of on the host's
  * ReturnValue. See the definition. */
 void bin_complete_escape(unsigned int on);

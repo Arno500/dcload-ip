@@ -112,7 +112,11 @@ static int console_write(int fd, const unsigned char *buf, size_t count)
 
 		memcpy(command->id, CMD_CONSOLE, 4);
 		command->value0 = htonl(fd);
-		memcpy_8bit(command->string, buf, n);
+		/* memcpy.S, not memcpy_8bit(): memfuncs.c stores in the source's
+		 * segment (AGENTS.md 8), so a P2 string would land in pkt_buf
+		 * uncached under lines the header just dirtied, and a P0 one with
+		 * the MMU on at a translated address. */
+		memcpy(command->string, buf, n);
 		make_ether(tool_mac, bb->mac, (ether_header_t *)pkt_buf);
 		make_ip(tool_ip, our_ip, UDP_H_LEN + len, IP_UDP_PROTOCOL, ip, 0);
 		make_udp(tool_port, dcload_syscall_port, len, ip, udp);

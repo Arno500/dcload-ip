@@ -918,6 +918,7 @@ static void gd_read_exchange(void)
 	 * from that (docs/wince-investigation.md 7l). A stale answer for the same
 	 * LBA brings the same bytes to the same place, so its parts count; ours
 	 * complete the window when they come. cmd_retval() stopped RX: restart it.
+	 * A ReturnValue naming ANOTHER read never gets here (g_retval_want).
 	 */
 	while (((int)syscall_retval >= 0) && !bin_window_complete()
 	       && (tmu2_since(fine_deadline_start) <= fine_deadline_ticks))
@@ -1023,6 +1024,7 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 	bin_window_close();
 	/* And no other read's answer may replace it (g_bin_read_want). */
 	g_bin_read_want = dest;
+	g_retval_want = GD_READ_TAG | lba;
 
 	/*
 	 * AND DO NOT ECHO THE LoadBinary BACK.
@@ -1040,6 +1042,7 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 	gd_exchange(gd_read_exchange);
 	g_gd_in_transfer--;
 	g_bin_read_want = 0;
+	g_retval_want = 0;
 	bin_echo_suppress(0);
 	fine_deadline_ticks = 0;
 	timeout_loop = 0;
@@ -1274,6 +1277,7 @@ static void ga_next(void)
 	command->value0 = htonl(_GDS.param[0]);
 	g_bin_read_want = ga_virt ? (unsigned int)gd_stage_big : _GDS.param[2];
 	command->value1 = htonl(g_bin_read_want);
+	g_retval_want = GD_READ_TAG | _GDS.param[0];
 	command->value2 = htonl(ga_sc * _GDS.sec_size);
 	bin_window_close();	/* judged on its own window: see ReadSectors() */
 	bin_echo_suppress(1);
@@ -1291,6 +1295,7 @@ static void ga_end(unsigned int verdict)
 	irq_rx_arm(0);
 	bb->stop();
 	g_bin_read_want = 0;
+	g_retval_want = 0;
 	bin_echo_suppress(0);
 	g_gd_in_transfer--;
 	ga_state = verdict;

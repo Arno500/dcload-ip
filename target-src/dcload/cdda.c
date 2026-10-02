@@ -1067,7 +1067,7 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors, unsigned int stage
 	if (!timed_out && (int)syscall_retval >= 0 && syscall_retval != lba)
 	{
 		/* Somebody else's answer: a straggler, or the ReturnValue of a disc
-		 * read or TOC request (address 0). Fail, and drain. */
+		 * read (GD_READ_TAG | its LBA) or TOC request (address 0). Fail, and drain. */
 		g_cdda_wrong_lba++;
 		syscall_retval = (unsigned int)-1;
 		timed_out = 1;

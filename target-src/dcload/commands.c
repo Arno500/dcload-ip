@@ -110,12 +110,28 @@ unsigned int g_cdda_stale_lbin = 0; /* abandoned answers refused at the door */
  * reads before, and asserted in LoadCollisionModel. ReadSectors() and the
  * asynchronous engine publish the destination they wait for; any other
  * LoadBinary is refused without touching the window. A late answer for the
- * same destination is a retry's: same bytes, same place, and it counts.
+ * same destination passes: a retry's brings the same bytes to the same place,
+ * and another read's is caught by its ReturnValue, which names its LBA
+ * (g_retval_want, below). Its parts cannot reach a waiting read's
+ * window here: that window is closed until our own LoadBinary, which the host
+ * sends after every late answer.
  */
 /* In BSS on purpose: a title that ends inside a read must not leave the door
  * shut on the next upload (crt0 zeroes BSS when the loader is re-entered). */
 unsigned int g_bin_read_want;       /* destination of the disc read in flight, 0 = none */
 unsigned int g_gd_stale_lbin = 0;   /* earlier reads' answers refused at the door */
+/*
+ * AND THE SAME DESTINATION (2026-10-02). Every chunk of a translated read
+ * lands in gd_stage_big, and a KOS title reads into the same cache blocks
+ * again and again: a late answer to an earlier read into the same place passes
+ * the door above, fills the window, and its ReturnValue would complete the
+ * read waiting now with the other read's sectors. The host names the read in
+ * the ReturnValue's address, GD_READ_TAG | LBA. cmd_retval() closes the
+ * window such an answer filled and lets the wait go on for ours, which comes
+ * after it (the host serves in order); counted in g_gd_stale_lbin too. 0 from
+ * the host names nothing and is accepted, as before.
+ */
+unsigned int g_retval_want;         /* GD_READ_TAG | LBA of the read in flight, 0 = any */
 unsigned int g_dbin_count = 0;
 unsigned int g_dbin_incomplete = 0;
 unsigned int g_last_load_addr = 0;
@@ -737,6 +753,16 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 {
 	if(running)
 	{
+		unsigned int named = ntohl(command->address);
+
+		/* Another read's answer (g_retval_want): what it filled is not ours.
+		 * > 0: neither a failure nor a host that names nothing. */
+		if (g_retval_want && ((int)named > 0) && (named != g_retval_want))
+		{
+			bin_window_close();
+			g_gd_stale_lbin++;
+			return;
+		}
 		bb->stop(); // Disable packet RX
 
 		unsigned char *buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
@@ -747,7 +773,7 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
 		bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
 
-		syscall_retval = ntohl(command->address);
+		syscall_retval = named;
 		syscall_retsize = ntohl(command->size);
 		syscall_data = command->data;
 		escape_loop = 1;

@@ -291,6 +291,14 @@ model. The driver a title is written against is a **coroutine**, so:
   wait: nobody reads the echo any more, and sending it would put one of our
   frames on the wire inside the host's burst — the collision already on record
   on the audio path.
+  **A late answer for the same destination is named by its ReturnValue**
+  (2026-10-02, `g_retval_want`): every chunk of a translated read lands in
+  `gd_stage_big`, and a KOS title reads into the same cache blocks again, so
+  the door alone let another read's sectors complete the read waiting. The
+  host sends `0x40000000 | LBA` as the ReturnValue's address; `cmd_retval()`
+  takes one naming another LBA for nothing -- it closes the window that answer
+  filled, does not end the wait, and counts in `g_gd_stale_lbin`. 0 (an older
+  host) is accepted as before.
 - **Asynchronous reads under Katana titles** (`GD_ASYNC_KATANA`, 2026-09-28,
   BBA only; `docs/wince-investigation.md` 9l-9n). The interrupt hook goes into
   Katana titles' vector table too (their entry is six nops, §4.15), and a read
@@ -1990,6 +1998,8 @@ What it does that concerns the DC side:
   directory is redeployed with any change here (§14.19).
   **Its LoadBinary must name exactly the destination the request gave**: the
   loader refuses any other one while a read waits (§4.5, the disc-read door).
+  **Its ReturnValue's address is `0x40000000 | LBA`** (`READ_RETVAL_TAG`):
+  the loader refuses one naming another read (§4.5, `g_retval_want`).
 - **`send_sectors` pauses once after the LoadBinary, before the first part.**
   `cmd_loadbin` zeroes the part map and purges the cache over the whole
   destination range — 512 cache blocks for a 16 KB chunk — and waiting for the
