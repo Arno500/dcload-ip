@@ -441,9 +441,9 @@ nesting in invariant 2. `g_gd_lock_owner`/`_stuck_owner` say who held it.
   runs, and used only under the MMU because in the LOW family it is a Katana
   title's stack; `gd_stage`, 6 KB in `.hiram`, for the TOC and a stream under
   a Katana title; and `gd_is_virtual()`: P0 with MMUCR.AT set): received there and
-  copied with `memcpy.S`. The host cannot write such an address: every copy in
-  `memfuncs.c` stores in the source's segment (§8). With the MMU off nothing
-  changes.
+  copied with `memcpy.S`. The host cannot write such an address: the loader
+  may not take a TLB miss (the tick runs with SR.BL set). With the MMU off
+  nothing changes.
 
 ### 4.6 The footprint rule
 
@@ -486,12 +486,14 @@ at `_end = 0x8c00c7ec`, and the asynchronous reads (phase 3) at **`_end =
 `_end` up to `base+0x9c00` -- **~2 KB left** after the G2 DMA work (`_end` =
 `base+0x9310`, default flags; before it, 352 B; `base+0x9634` since `MARK` and
 the idle listen, 2026-09-30: ~1.4 KB left). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. **The deployed
-`loaders/` is the current build since 2026-10-02** (md5 `4ce716ce…`: the
+`loaders/` is the current build since 2026-10-02** (md5 `88c91eb1…`: the
 three Shenmue II fixes, `MARK`, the idle listen, the G2 DMA suspend, the
 per-frame RX channel of §4.16, the P2 purge of §8, `g_gd_kos` and the
 disc-read door of §4.5, KOS's masked waits and `DC25`, `tmu2_since()` and the
-G2 suspend under KOS (§4.16): `_end` = `base+0x9b20`, `.gdstage` ending 208 B
-under `_stack`; it needs
+G2 suspend under KOS (§4.16), the ReturnValue test `g_retval_want` (§4.5,
+§4.13) and `memdiff()` in the destination's segment (§8): `_end` =
+`base+0x9b74`, `.gdstage` ending 128 B under `_stack`; it needs the host's
+ReturnValue naming of 2026-10-02 to refuse a late same-buffer answer, and
 the host's `layout()` of 2026-09-29; the older `0x8c00c000` build is gone), which
 loses the low base to painted titles as described below. The user's decision
 (2026-09-21) is that this is acceptable where it has to happen: the host
@@ -778,9 +780,11 @@ to 2026-09-05) and `docs/cdda-double-buffer-investigation.md` (this engine,
      LoadBinary and parts were lost and only its ReturnValue arrived, the fetch
      passed and pushed the previous sub-fetch again -- the glitch heard for
      weeks with every counter clean (`g_cdda_retv_nodata` now);
-  2. accepts only a ReturnValue whose `address` is the LBA it asked for
-     (`g_cdda_wrong_lba`), waiting a little longer if the window completed
-     before the echo arrived;
+  2. accepts only a ReturnValue whose `address` is the LBA it asked for:
+     `cmd_retval()` takes another one for nothing, closes the window it
+     filled and lets the wait go on (`g_retval_want`, `g_cdda_wrong_lba`;
+     until 2026-10-02 the fetch failed and drained), and the fetch waits a
+     little longer if the window completed before the echo arrived;
   3. keeps the "door" shut: `cmd_loadbin()` refuses any LoadBinary into the
      staging buffer except the one awaited (`g_bin_stage_*`,
      `g_cdda_stale_lbin`);
@@ -1101,9 +1105,8 @@ Katana title's stack.
 - **CE runs with the MMU on.** DMAREAD's destination is a physical page frame
   (`gdGdcReqCmd()` makes it P1). Every other buffer is a **virtual** address
   only the title's translation reaches (`gd_is_virtual()`: P0 with MMUCR.AT):
-  such a read is received into a stage and copied out with `memcpy.S`; never
-  through `memfuncs.c`, whose copies store in the source's segment (§8), and
-  never from the host.
+  such a read is received into a stage and copied out with `memcpy.S`, and
+  never from the host (§8).
 - **Streams** (`PIOREAD_STREAM_EX` 39 and friends) are served by
   `data_stream()`: PIO pieces are chained through the title's callback. DMA
   stream pieces would need the G1 DMA-end interrupt, which nothing raises, so
@@ -1517,8 +1520,8 @@ datagram is a lost line. Sent only under dcload-ip-rs (`g_gd_kos`).
 
 `LBIN`/`PBIN`/`DBIN` also carry disc sectors to a running title (§4.5).
 
-**Known bug, half fixed (measured 2026-08-20 with `dcload-ip-rs
-selftest-readback`):** writing with `PBIN` to a **P2** address (`0xac…`) and
+**Known bug, fixed at its cause 2026-10-02, the `SBIQ` half not yet measured
+(measured 2026-08-20 with `dcload-ip-rs selftest-readback`):** writing with `PBIN` to a **P2** address (`0xac…`) and
 reading it back with `SBIQ` at the same P2 address returns, from byte 8 on, the
 previous transfer's bytes. Either direction alone, and the physical window
 `0x0c…`, are fine (32/32). The suspect is `SH4_aligned_memcpy` in
@@ -1532,10 +1535,18 @@ cached, and `cmd_loadbin` did not purge a P2 destination. **That half is fixed
 into P2 buffers (`0xac37xxxx`), and with its P1 in copy-back it read stale RAM
 and hung on the loading screen right after the `GBST` header, every counter
 clean. `cmd_partbin` now purges every RAM destination through the P1 alias the
-copy stored into. The `SBIQ` half (a P2 source copied into a P1 packet buffer
-through P2) is untouched and the selftest was not re-run. The same rule sends
-a Windows CE virtual address to area 2 (`docs/wince-investigation.md` §7f):
-**no `memfuncs.c` copy may target an address the title's MMU translates.**
+copy stored into. **The cause is fixed the same day**: `memdiff()` no longer
+masks, so every `memfuncs.c` copy stores in the destination's own segment, as
+`memcpy_64bit_32Bytes()` (the bulk of `SH4_aligned_memcpy`) always did -- one
+copy used to write two segments. That also covers the `SBIQ` half (a P2
+source copied into a P1 packet buffer used to store through P2) and the Maple
+payload copy, which `maple.c` meant to be uncached and was not; re-run
+`selftest-readback` to close it. The purge in `cmd_loadbin` stays: it drops
+the title's dirty lines over a P2 range before our uncached stores. The old
+rule sent a Windows CE virtual address to area 2
+(`docs/wince-investigation.md` §7f); the new one sends it through the title's
+translation, which the loader may not take: **no `memfuncs.c` copy may target
+an address the title's MMU translates.**
 
 **A `DBIN` names its range.** `cmd_donebin()` answers with the first missing
 part of the LoadBinary window (or `0, 0` when complete); `cmd_sendbinq()` ends a

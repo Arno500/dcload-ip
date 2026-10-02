@@ -16,6 +16,9 @@
 #include "perfctr.h"
 #include "memfuncs.h"
 #include "g2dma.h"
+#if WITH_CDDA
+#include "cdda.h"
+#endif
 
 __attribute__((aligned(4))) volatile unsigned int our_ip = 0; // To be clear, this needs to be zero for init. Make that explicit here. Also, this value should be kept LE.
 unsigned int tool_ip = 0;
@@ -131,7 +134,9 @@ unsigned int g_gd_stale_lbin = 0;   /* earlier reads' answers refused at the doo
  * after it (the host serves in order); counted in g_gd_stale_lbin too. 0 from
  * the host names nothing and is accepted, as before.
  */
-unsigned int g_retval_want;         /* GD_READ_TAG | LBA of the read in flight, 0 = any */
+/* CD-DA fetches use it too, with their plain LBA: the same late answer, the
+ * same test (cdda_fetch()). */
+unsigned int g_retval_want;         /* GD_READ_TAG | LBA of the read in flight, or a CD-DA LBA; 0 = any */
 unsigned int g_dbin_count = 0;
 unsigned int g_dbin_incomplete = 0;
 unsigned int g_last_load_addr = 0;
@@ -320,12 +325,13 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	command_t * response = (command_t *)buffer;
 	memcpy(response, command, COMMAND_LEN);
 
-	/* Every RAM destination needs the purge, P2 included: cmd_partbin's copy
-	 * stores into the P1 alias of the destination (memdiff(), memfuncs.c), so
-	 * with a title's P1 in copy-back the bytes sit in dirty lines that a
-	 * reader through P2 never sees. GTA2 reads its file headers by PIO into
-	 * 0xac37xxxx buffers and hung on garbage (2026-10-02). Only P4 is left
-	 * alone: it is not RAM, and the store did not go there anyway. */
+	/* Every RAM destination needs the purge, P2 included. GTA2 reads its
+	 * file headers by PIO into 0xac37xxxx buffers and hung on garbage
+	 * (2026-10-02): cmd_partbin's copy then stored part of each packet into
+	 * the P1 alias (memdiff(), memfuncs.c, since fixed). It now stores in the
+	 * destination's own segment, uncached for P2, and the purge still drops
+	 * any dirty line the title holds over the range, whose later write-back
+	 * would land on our bytes. Only P4 is left alone: it is not RAM. */
 	unsigned int cacheable_check = bin_info.load_address >> 29;
 	if(cacheable_check != 0x7)
 	{
@@ -464,7 +470,8 @@ void cmd_partbin(command_t * command)
 	if(cached_dest)
 	{
 		/* Flush exactly the cache lines touched by this packet write, through
-		 * the P1 alias the copy stored into (see cmd_loadbin). */
+		 * the P1 alias, which reaches them from any RAM segment (see
+		 * cmd_loadbin). */
 		unsigned int p1_addr = (unsigned int)to_p1((void *)cmd_addr);
 		unsigned int purge_base = p1_addr & ~31U;
 		unsigned int purge_end = (p1_addr + cmd_size + 31U) & ~31U;
@@ -755,12 +762,24 @@ void cmd_retval(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	{
 		unsigned int named = ntohl(command->address);
 
-		/* Another read's answer (g_retval_want): what it filled is not ours.
-		 * > 0: neither a failure nor a host that names nothing. */
-		if (g_retval_want && ((int)named > 0) && (named != g_retval_want))
+		/* Another request's answer (g_retval_want): what it filled is not
+		 * ours, and the wait goes on. A failure (< 0) is always taken, and 0
+		 * is a disc read's from a host that names nothing -- but never a
+		 * CD-DA answer, which always echoes its LBA. */
+		if (g_retval_want && ((int)named >= 0) && (named != g_retval_want)
+		    && (named || !(g_retval_want & GD_READ_TAG)))
 		{
 			bin_window_close();
-			g_gd_stale_lbin++;
+#if WITH_CDDA
+			if (!(g_retval_want & GD_READ_TAG))
+			{
+				g_cdda_wrong_lba++;
+			}
+			else
+#endif
+			{
+				g_gd_stale_lbin++;
+			}
 			return;
 		}
 		bb->stop(); // Disable packet RX

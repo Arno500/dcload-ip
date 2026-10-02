@@ -22,9 +22,16 @@
 // Len is (# of total bytes/1), so it's "# of 8-bits"
 // Source and destination buffers must both be 1-byte aligned (aka no alignment)
 
+/* The stores land at src + memdiff: in the DESTINATION's own segment. Until
+ * 2026-10-02 both addresses were masked to 29 bits, so a copy stored in the
+ * SOURCE's segment -- a P2 destination fed from a P1 packet buffer was written
+ * cached, and a P1 packet buffer fed from a P2 source uncached under lines its
+ * header had dirtied (AGENTS.md 8) -- while memcpy_64bit_32Bytes(), which does
+ * the bulk of SH4_aligned_memcpy(), always stored at dest: one copy, two
+ * segments. */
 static unsigned int memdiff(const void *dst, const void *src)
 {
-	return ((unsigned int)dst & 0x1fffffff) - ((unsigned int)src & 0x1fffffff);
+	return (unsigned int)dst - (unsigned int)src;
 }
 
 void * memcpy_8bit(void *dest, const void *src, unsigned int len)

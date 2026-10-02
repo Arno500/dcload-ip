@@ -650,14 +650,13 @@ static unsigned int sh4_phys_addr(unsigned int addr)
  * WHERE DISC DATA LANDS WHEN THE TITLE'S BUFFER CANNOT BE HANDED TO THE HOST
  * (2026-09-27).
  *
- * The host writes through cmd_partbin, whose copies (memfuncs.c) store at
- * src + memdiff(dst, src) with both addresses masked to 29 bits: into the
- * SOURCE's segment. With the MMU off that reaches the right RAM -- every
- * address a Katana title hands us is RAM in any segment -- but through P1's
- * cache, which cmd_partbin purges for a P2 buffer too (GTA2, 2026-10-02). With
- * it on (Windows CE), a
- * virtual buffer becomes P1 of a number that is not its physical address:
- * 0x080df2e0 went to area 2, which is empty (docs/wince-investigation.md 7f).
+ * The host writes through cmd_partbin, whose copies (memfuncs.c) store at the
+ * address it names. With the MMU off that is RAM in any segment. With it on
+ * (Windows CE), a virtual buffer is reachable only through the title's
+ * translation, and the loader may not take a TLB miss (the tick runs with
+ * SR.BL set); until 2026-10-02 the copies' tails even went to P1 of the
+ * virtual number: 0x080df2e0 went to area 2, which is empty
+ * (docs/wince-investigation.md 7f).
  * So a read into a translated address is received here and copied to the
  * title with memcpy.S, whose stores go through the title's own translation,
  * as the BIOS's PIO copy does. The TOC comes through here too.

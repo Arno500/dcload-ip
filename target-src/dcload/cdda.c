@@ -995,8 +995,10 @@ static void cdda_exchange(void)
 	/* The wait usually ends on the last part (cmd_partbin() sets 0 when the
 	 * window completes) with the ReturnValue processed in the same pass, but
 	 * not always: if the window is complete and the echo is not in yet, wait
-	 * for it under the same deadline. */
-	if ((timeout_loop >= 0) && (syscall_retval == 0u) && bin_window_complete())
+	 * for it under the same deadline. Again if another request's ReturnValue
+	 * reopened the wait (cmd_retval(), g_retval_want) and ours then completed
+	 * the window first. */
+	while ((timeout_loop >= 0) && (syscall_retval == 0u) && bin_window_complete())
 	{
 		syscall_retval = (unsigned int)-1;
 		bb->loop(0);
@@ -1020,7 +1022,9 @@ static void cdda_exchange(void)
  *    ReturnValue arrived, the fetch used to pass on the old map and push the
  *    previous sub-fetch again, which in ADPCM is heard for seconds (found
  *    2026-09-19 in a recording). g_cdda_retv_nodata counts it now;
- *  - the ReturnValue must echo this LBA (g_cdda_wrong_lba);
+ *  - the ReturnValue must echo this LBA: cmd_retval() takes another one for
+ *    nothing and closes the window it filled (g_retval_want,
+ *    g_cdda_wrong_lba), and the wait goes on for ours;
  *  - cmd_loadbin() refuses any LoadBinary into the staging buffer while no
  *    fetch waits for one (the "door", g_bin_stage_*);
  *  - after a failure, a drain consumes whatever is still on its way.
@@ -1057,21 +1061,14 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors, unsigned int stage
 	bin_window_close();
 	bin_echo_suppress(1);
 	bin_complete_escape(1);
+	g_retval_want = lba;
 	/* Without a thread switch, off the title's stack (cdfs_syscalls.c). */
 	gd_exchange(cdda_exchange);
+	g_retval_want = 0;
 	bin_echo_suppress(0);
 	fine_deadline_ticks = 0;
 	timed_out = (timeout_loop < 0);
 	timeout_loop = 0;
-
-	if (!timed_out && (int)syscall_retval >= 0 && syscall_retval != lba)
-	{
-		/* Somebody else's answer: a straggler, or the ReturnValue of a disc
-		 * read (GD_READ_TAG | its LBA) or TOC request (address 0). Fail, and drain. */
-		g_cdda_wrong_lba++;
-		syscall_retval = (unsigned int)-1;
-		timed_out = 1;
-	}
 
 	if ((int)syscall_retval < 0)
 	{

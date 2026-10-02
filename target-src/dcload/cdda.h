@@ -44,6 +44,7 @@ void cdda_service(void);
 void cdda_service_between_chunks(void);
 /* From the interrupt hook, GD lock free: one sub-fetch at most (cdda.c). */
 void cdda_service_tick(void);
+extern unsigned int g_cdda_wrong_lba;	/* answers to another request, refused (cmd_retval) */
 extern volatile unsigned int cdda_busy;	/* a service is on the network */
 
 int cdda_state(void);
