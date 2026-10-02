@@ -628,8 +628,10 @@ static unsigned int sh4_phys_addr(unsigned int addr)
  *
  * The host writes through cmd_partbin, whose copies (memfuncs.c) store at
  * src + memdiff(dst, src) with both addresses masked to 29 bits: into the
- * SOURCE's segment. With the MMU off that is harmless -- every address a
- * Katana title hands us is RAM in any segment. With it on (Windows CE), a
+ * SOURCE's segment. With the MMU off that reaches the right RAM -- every
+ * address a Katana title hands us is RAM in any segment -- but through P1's
+ * cache, which cmd_partbin purges for a P2 buffer too (GTA2, 2026-10-02). With
+ * it on (Windows CE), a
  * virtual buffer becomes P1 of a number that is not its physical address:
  * 0x080df2e0 went to area 2, which is empty (docs/wince-investigation.md 7f).
  * So a read into a translated address is received here and copied to the

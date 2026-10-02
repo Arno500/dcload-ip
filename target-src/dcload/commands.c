@@ -284,10 +284,14 @@ void cmd_loadbin(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	command_t * response = (command_t *)buffer;
 	memcpy(response, command, COMMAND_LEN);
 
-	// Check for P0, P1, or P3, all of which could be cacheable and would need OCBP or OCBWB
-	// Faster to check for neither P2 nor P4
+	/* Every RAM destination needs the purge, P2 included: cmd_partbin's copy
+	 * stores into the P1 alias of the destination (memdiff(), memfuncs.c), so
+	 * with a title's P1 in copy-back the bytes sit in dirty lines that a
+	 * reader through P2 never sees. GTA2 reads its file headers by PIO into
+	 * 0xac37xxxx buffers and hung on garbage (2026-10-02). Only P4 is left
+	 * alone: it is not RAM, and the store did not go there anyway. */
 	unsigned int cacheable_check = bin_info.load_address >> 29;
-	if((cacheable_check != 0x5) && (cacheable_check != 0x7))
+	if(cacheable_check != 0x7)
 	{
 		cached_dest = 1;
 	}
@@ -423,18 +427,18 @@ void cmd_partbin(command_t * command)
 	SH4_aligned_memcpy((void*)cmd_addr, to_p1(command->data), cmd_size);
 	if(cached_dest)
 	{
-		/* Flush exactly the cache lines touched by this packet write. */
-		unsigned int purge_base = cmd_addr & ~31U;
-		unsigned int purge_end = (cmd_addr + cmd_size + 31U) & ~31U;
+		/* Flush exactly the cache lines touched by this packet write, through
+		 * the P1 alias the copy stored into (see cmd_loadbin). */
+		unsigned int p1_addr = (unsigned int)to_p1((void *)cmd_addr);
+		unsigned int purge_base = p1_addr & ~31U;
+		unsigned int purge_end = (p1_addr + cmd_size + 31U) & ~31U;
 
-		/* Clamp to the end of the 16MB RAM aperture for any SH4 segment alias. */
-		if ((cmd_addr & 0x1f000000U) == 0x0c000000U)
+		/* Clamp to the end of the 16MB RAM aperture. */
+		if ((p1_addr & 0x1f000000U) == 0x0c000000U)
 		{
-			unsigned int seg_base = cmd_addr & 0xe0000000U;
-			unsigned int ram_end = seg_base | 0x0d000000U;
-			if (purge_end > ram_end)
+			if (purge_end > 0x8d000000U)
 			{
-				purge_end = ram_end;
+				purge_end = 0x8d000000U;
 			}
 		}
 

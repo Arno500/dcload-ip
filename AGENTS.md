@@ -463,9 +463,10 @@ at `_end = 0x8c00c7ec`, and the asynchronous reads (phase 3) at **`_end =
 `_end` up to `base+0x9c00` -- **~2 KB left** after the G2 DMA work (`_end` =
 `base+0x9310`, default flags; before it, 352 B; `base+0x9634` since `MARK` and
 the idle listen, 2026-09-30: ~1.4 KB left). 9n spent `WITH_GD_SPINDOWN` on the Katana hook and 9o `WITH_PMCR_CMD` on the BBA RX interrupt, both now 0 by default. **The deployed
-`loaders/` is the current build since 2026-10-01** (md5 `b94bc113…`: the
-three Shenmue II fixes, `MARK`, the idle listen, the G2 DMA suspend and the
-per-frame RX channel of §4.16; `_end` = `base+0x990c`, ~700 B left; it needs
+`loaders/` is the current build since 2026-10-02** (md5 `a6e6bbe9…`: the
+three Shenmue II fixes, `MARK`, the idle listen, the G2 DMA suspend, the
+per-frame RX channel of §4.16 and the P2 purge of §8; `_end` = `base+0x9914`,
+~750 B left; it needs
 the host's `layout()` of 2026-09-29; the older `0x8c00c000` build is gone), which
 loses the low base to painted titles as described below. The user's decision
 (2026-09-21) is that this is acceptable where it has to happen: the host
@@ -1481,7 +1482,7 @@ ReturnValue sends 0 there.
 
 `LBIN`/`PBIN`/`DBIN` also carry disc sectors to a running title (§4.5).
 
-**Known bug, unfixed (measured 2026-08-20 with `dcload-ip-rs
+**Known bug, half fixed (measured 2026-08-20 with `dcload-ip-rs
 selftest-readback`):** writing with `PBIN` to a **P2** address (`0xac…`) and
 reading it back with `SBIQ` at the same P2 address returns, from byte 8 on, the
 previous transfer's bytes. Either direction alone, and the physical window
@@ -1491,7 +1492,13 @@ previous transfer's bytes. Either direction alone, and the physical window
 stores at `src + memdiff(dst, src)`, and `memdiff()` masks both addresses to
 29 bits — so the stores go to the destination's physical address **in the
 source's segment**. A P2 destination fed from a P1 packet buffer is written
-cached, and `cmd_loadbin` does not purge a P2 destination. The same rule sends
+cached, and `cmd_loadbin` did not purge a P2 destination. **That half is fixed
+(2026-10-02, measured on the console):** GTA II reads its file headers by PIO
+into P2 buffers (`0xac37xxxx`), and with its P1 in copy-back it read stale RAM
+and hung on the loading screen right after the `GBST` header, every counter
+clean. `cmd_partbin` now purges every RAM destination through the P1 alias the
+copy stored into. The `SBIQ` half (a P2 source copied into a P1 packet buffer
+through P2) is untouched and the selftest was not re-run. The same rule sends
 a Windows CE virtual address to area 2 (`docs/wince-investigation.md` §7f):
 **no `memfuncs.c` copy may target an address the title's MMU translates.**
 
