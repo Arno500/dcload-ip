@@ -1,5 +1,5 @@
 
-# dcload-ip 2.0.2
+# dcload-ip 2.0.4
 
 A Dreamcast ethernet loader originally by [Andrew Kieschnick](http://napalm-x.thegypsy.com/andrewk/dc/). This program is part of [KallistiOS](http://gamedev.allusion.net/softprj/kos/).
 
@@ -16,6 +16,8 @@ This **special version** has been updated/overhauled by **Moopthehedgehog** and 
 * DHCP support (use an IP address of 0.0.0.0 in `Makefile.cfg` to enable it)
 * NTSC 480i, PAL 576i, and VGA display output modes supported
 * Dumping exceptions over the network if the dcload console is enabled
+* GD-ROM drive emulation (data and CD-DA audio) for retail titles, served from a
+  disc image on the PC by the companion Rust host, `dcload-ip-rs`
 
 ## Building
 
@@ -43,7 +45,7 @@ Edit `Makefile.cfg` for your system and network and then run `make`.
 * The correct display is something like:
 
 ```
-  dcload-ip 2.0.2  <- name/version
+  dcload-ip 2.0.4  <- name/version
   Broadband Adapter (HIT-0400)  <- adapter driver in use  
   00:d0:de:ad:be:ef  <- dc hardware address  
   192.168.1.92  <- dc ip address  
@@ -101,17 +103,24 @@ typedef struct __attribute__ ((packed)) {
 
 Maple command data format:
 
+- Maple Port # (1 byte, 0-3)  
+- Maple Unit # (1 byte, 0 = the controller, 1-5 = its sub-units)  
 - Maple Command (1 byte)  
-- Maple Port # (1 byte)  
-- Maple Slot # (1 byte)  
-- Maple data in 4-byte increments (1 byte)  
+- Length of the data below, in 4-byte words (1 byte)  
 - Any data to be sent with the command (multiple of 4 bytes)  
 
-You will get a similarly formatted response in return.
+You will get a `MAPL` packet in return whose `size` is the number of bytes
+copied out of the Maple receive buffer and whose data is the raw response frame
+(response code, destination, source, length in 4-byte words, then the data).
+The response code is signed: -1 means nothing answered at that address.
 
 ## Performance Counter Control
 
-Newly added is the ability to control Dreamcast/SH7091 performance counters over
+**The `PMCR` command is not served by default**: build dcload with
+`WITH_PMCR_CMD=1` (in `target-src/dcload/Makefile`) to enable it. The counters
+themselves are always used by dcload.
+
+dcload-ip can control to control Dreamcast/SH7091 performance counters over
 the network. These were a previously hidden aspect of the Dreamcast's CPU, and
 this program uses one of them to keep track of DHCP lease time across loaded
 programs. There are two of them, and they are both 48-bit. See perfctr.h/.c for

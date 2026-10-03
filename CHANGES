@@ -1,3 +1,41 @@
+WHAT'S NEW IN 2.0.4
+
+* GD-ROM drive emulation for retail titles: dcload answers a launched title's
+  BIOS GD-ROM syscalls itself and fetches the sectors over the network from a
+  disc image on the PC. This is served by the companion Rust host,
+  dcload-ip-rs; dc-tool-ip does not serve it.
+* CD-DA playback: the disc's audio tracks are streamed from the host (4-bit
+  ADPCM by default) and played on two AICA channels.
+* Windows CE titles (e.g. Sega Rally 2) and KallistiOS titles can be run from a
+  disc image. An interrupt hook installed in the title's own vector table
+  moves disc reads and feeds CD-DA while the title runs.
+* The BBA's RX frames and the CD-DA rings are moved by G2 DMA while a title
+  runs, leaving the CPU to the title.
+* dcload can be relocated: the host builds on a single relocatable image
+  (`make loaders`) and chainloads it to the base each title needs, away from
+  the RAM the title uses.
+* Warm start: a dcload chainloaded from another dcload adopts the BBA as it is,
+  without resetting the chip or renegotiating the link, and keeps its IP.
+* RX ring fixes in the BBA driver (interrupt mask, CAPR on wrap, header
+  plausibility, overflow handled as back-pressure, bounded hardware waits).
+* DHCP replies are checked against our port, xid and MAC address.
+* MAPL: the payload length (in 4-byte words) is honoured, responses are read
+  uncached, and a Maple cycle is never re-triggered while one is running.
+* Copies to an uncached (P2) destination are written uncached.
+* The legacy 1024-byte payload mode (dc-tool-ip -l, dcload < 2.0.0) is no longer
+  served, and the PMCR command is off by default (WITH_PMCR_CMD=1 to enable).
+
+WHAT'S NEW IN 2.0.3
+
+* dc-tool-ip -f ("fast mode") disables all artificial RX FIFO delays and
+  sleeps, for substantially faster transfers at the cost of a higher risk of
+  packet loss on a loaded network. [Moopthehedgehog]
+
+WHAT'S NEW IN 2.0.2
+
+* dc-tool-ip -m <path> maps /pc/ to a directory on the PC. Not available under
+  MinGW yet.
+
 WHAT'S NEW IN 2.0.1
 
 * dcload-ip now retries DHCP handshake if it doesn't get any response. This fixes
