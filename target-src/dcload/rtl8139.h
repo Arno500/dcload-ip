@@ -114,6 +114,18 @@ typedef struct {
 
 int rtl_bb_detect(void);
 void rtl_irq_ack(void);
+#if GA_FAIL_PROBE
+/* RXCONFIG's low byte, plus 0x100 when the ring is empty (CHIPCMD.BUFE). */
+unsigned int rtl_rx_probe(void);
+/* The RX registers, four words: RXCONFIG; CHIPCMD | INTRSTATUS << 16;
+ * CBR | CAPR << 16; RXMISSED | cur_rx << 24 (cur_rx >> 2: 14 bits fit). */
+void rtl_rx_snap(unsigned int *out);
+/* The address filter and the link, four words: IDR0-3; IDR4-5 | BMCR << 16;
+ * BMSR | MEDIASTATUS << 16; frames transmitted so far (g_gaf_tx). Returns
+ * non-zero when IDR no longer holds the MAC we read at init. */
+int rtl_link_snap(unsigned int *out);
+extern unsigned int g_gaf_tx;
+#endif
 /* The end bit of the RX DMA in flight, 0 if none (irq.c). */
 unsigned int rtl_rx_dma_bit(void);
 int rtl_bb_init(void);

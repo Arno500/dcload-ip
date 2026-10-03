@@ -736,6 +736,41 @@ int rtl_bb_init(void)
  * frames stay in the ring; rtl_bb_loop() finds them through its RxBufEmpty
  * safety net even with RxOK gone.
  */
+#if GA_FAIL_PROBE
+unsigned int rtl_rx_probe(void)
+{
+	return (nic32[RT_RXCONFIG/4] & 0xffU) | ((nic8[RT_CHIPCMD] & 1U) << 8);
+}
+
+unsigned int g_gaf_tx;	/* frames handed to the chip to send */
+
+int rtl_link_snap(unsigned int *out)
+{
+	unsigned int i;
+	int bad = 0;
+
+	for (i = 0; i < 6; i++)
+	{
+		bad |= (nic8[RT_IDR0 + i] != rtl.mac[i]);
+	}
+	out[0] = nic8[RT_IDR0] | (nic8[RT_IDR0 + 1] << 8) | (nic8[RT_IDR0 + 2] << 16)
+		 | ((unsigned int)nic8[RT_IDR0 + 3] << 24);
+	out[1] = nic8[RT_IDR0 + 4] | (nic8[RT_IDR0 + 5] << 8)
+		 | ((unsigned int)nic16[RT_MII_BMCR/2] << 16);
+	out[2] = nic16[RT_MII_BMSR/2] | ((unsigned int)nic8[RT_MEDIASTATUS] << 16);
+	out[3] = g_gaf_tx;
+	return bad;
+}
+
+void rtl_rx_snap(unsigned int *out)
+{
+	out[0] = nic32[RT_RXCONFIG/4];
+	out[1] = nic8[RT_CHIPCMD] | ((unsigned int)nic16[RT_INTRSTATUS/2] << 16);
+	out[2] = nic16[RT_RXBUFHEAD/2] | ((unsigned int)nic16[RT_RXBUFTAIL/2] << 16);
+	out[3] = (nic32[RT_RXMISSED/4] & 0x00ffffffU) | ((unsigned int)(rtl.cur_rx >> 2) << 24);
+}
+#endif
+
 void rtl_irq_ack(void)
 {
 	rx_settle(1);
@@ -756,13 +791,16 @@ void rtl_bb_stop(void)
 	nic32[RT_RXCONFIG/4] &= 0xfffffff5;
 }
 
-/* rtl_bb_tx()'s hardware waits: 10 ms of TMU2 (Pck/4). A 1514-byte frame
+/* rtl_bb_tx()'s hardware waits: 10 ms (Pck/4 ticks, clk_since()). A 1514-byte frame
  * leaves the FIFO in ~120 us at 100 Mbit. */
 #define RTL_TX_WAIT_TICKS 125000U
 
 int rtl_bb_tx(unsigned char * pkt, int len) // pg. 15 in RTL8139C datasheet: http://realtek.info/pdf/rtl8139cp.pdf
 {
-	unsigned int t0 = TMU2_COUNT;
+#if GA_FAIL_PROBE
+	g_gaf_tx++;
+#endif
+	unsigned int t0 = clk_now();
 
 	rx_settle(1);
 	g2dma_quiesce();
@@ -770,7 +808,7 @@ int rtl_bb_tx(unsigned char * pkt, int len) // pg. 15 in RTL8139C datasheet: htt
 	// this bit before reading from/writing to G2. So do that here.
 	while((*(volatile unsigned int*)0xa05f688c) & 0x20U)
 	{
-		if (tmu2_since(t0) > RTL_TX_WAIT_TICKS)
+		if (clk_since(t0) > RTL_TX_WAIT_TICKS)
 		{
 			break;
 		}
@@ -784,7 +822,7 @@ int rtl_bb_tx(unsigned char * pkt, int len) // pg. 15 in RTL8139C datasheet: htt
 		 * never gives back would freeze the whole machine. The frame is dropped
 		 * instead; every sender here has a deadline and asks again.
 		 */
-		if (tmu2_since(t0) > RTL_TX_WAIT_TICKS)
+		if (clk_since(t0) > RTL_TX_WAIT_TICKS)
 		{
 			return 0;
 		}
@@ -1680,10 +1718,9 @@ void rtl_bb_loop(int is_main_loop)
 		}
 
 		/* The fine deadline, checked before the seconds one so it wins when
-		 * both are armed. TMU2 counts DOWN, so elapsed is start minus now, and
-		 * the unsigned subtraction is correct across the counter's wrap. */
+		 * both are armed. On the loader's clock (adapter.h). */
 		if (fine_deadline_ticks
-		    && tmu2_since(fine_deadline_start) > fine_deadline_ticks)
+		    && clk_since(fine_deadline_start) > fine_deadline_ticks)
 		{
 			g_fine_timeouts++;
 			timeout_loop = -1;

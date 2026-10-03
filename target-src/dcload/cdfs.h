@@ -34,11 +34,6 @@ void gd_on_loader_stack(void (*fn)(void));
  * virtual stack (cdfs_syscalls.c). */
 void gd_exchange(void (*fn)(void));
 
-/* Start TMU2, the free-running deadline clock the disc-read deadline and the
- * GD lock watchdog both measure on. Idempotent; called from main() so it runs
- * whether or not a title ever plays CD-DA (cdfs_syscalls.c). */
-void gd_deadline_timer_start(void);
-
 /* Put the real GD-ROM drive in <STANDBY> through the BIOS driver, once, at
  * boot. Only valid after cdfs_redir_save()/cdfs_redir_disable() have pointed
  * the syscall vector back at the BIOS. Built only when WITH_GD_SPINDOWN=1;

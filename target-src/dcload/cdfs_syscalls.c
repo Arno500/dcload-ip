@@ -131,8 +131,8 @@
 #define GDC_PARAMS_COUNT        4
 
 /*
- * Deadline for one disc-read wait (ReadSectors, GetTOC): 1.2 s in TMU2 ticks
- * (Pck/4, 12500 per millisecond).
+ * Deadline for one disc-read wait (ReadSectors, GetTOC): in Pck/4 ticks
+ * (clk_since(), 12500 per millisecond).
  *
  * The adapter loop's other bounds are poor for this. The seconds timeout counts
  * whole seconds on the performance counter (6 s fires at 7 s, and never under
@@ -158,11 +158,13 @@
  * the game stop dead. Lower it with the same acceptance test as the host's
  * pacing (g_cdfs_read_fails, _holes, _retries, g_rx_overflow, g_rx_missed).
  *
- * THIS DEADLINE ONLY WORKS IF TMU2 RUNS. Until 2026-09-20 nothing started it
- * unless a title played CD-DA (cdda.c) or ISOLDR_SETUP_MACHINE was set, so for
- * a title that streams its music as data -- Crazy Taxi -- neither this nor the
- * lock watchdog could ever expire, and every lost chunk cost the full 7 s.
- * gd_deadline_timer_start() is called from main() now.
+ * THIS DEADLINE ONLY WORKS IF ITS CLOCK RUNS, AND IS OURS. Until 2026-09-20 it
+ * was TMU2 and nothing started it unless a title played CD-DA, so for a title
+ * that streams its music as data -- Crazy Taxi -- neither this nor the lock
+ * watchdog could ever expire, and every lost chunk cost the full 7 s. Then,
+ * under Sonic Adventure 2, it expired one frame after every asynchronous
+ * request: the title disturbs TMU2 (2026-10-03). It is clk_since() now,
+ * the performance counter main() starts (adapter.h).
  */
 #ifndef GD_READ_DEADLINE_TICKS
 #define GD_READ_DEADLINE_TICKS 3125000u
@@ -184,45 +186,6 @@
  */
 #define GD_READ_RETRIES_MMU 20
 
-/*
- * TMU2, the free-running deadline clock: Pck/4 = 12.5 MHz counting down from
- * 0xffffffff, so `start - TCNT2` is elapsed ticks (adapter.h).
- *
- * It lives here rather than in cdda.c because the read deadline and the lock
- * watchdog depend on it and both are always compiled, while CD-DA is optional
- * -- which is exactly how a title that plays no music came to have no working
- * deadline at all. cdda.c calls this instead of keeping its own copy.
- *
- * Idempotent on purpose: restarting it between the chunks of a disc read would
- * break that read's deadline and every mark in flight, so a timer already
- * running as programmed is left alone.
- *
- * AND A KOS TITLE'S TIMER IS LEFT ALONE TOO (2026-10-02). KOS runs TMU2 at
- * Pck/4 with a 1 s reload for its millisecond clock; reprogramming it from
- * cdda.c would stop KOS's seconds and break its timer_ms_gettime64(). Any
- * Pck/4 timer whose period outlasts every interval measured here (838 ms,
- * CDDA_GAP_LIMIT_TICKS) will do: tmu2_since() follows the reload.
- */
-#define TMU2_MIN_PERIOD 12000000u	/* 0.96 s */
-#define TMU_TSTR       (*(volatile unsigned char *)0xffd80004)
-#define TMU_TCOR2      (*(volatile unsigned int *)0xffd80020)
-#define TMU_TCR2       (*(volatile unsigned short *)0xffd80028)
-#define TMU_START_TMU2 0x04
-#define TMU_TCR_PCK4   0
-
-void gd_deadline_timer_start(void)
-{
-	if ((TMU_TSTR & TMU_START_TMU2) != 0u && TMU_TCOR2 >= TMU2_MIN_PERIOD
-	    && (TMU_TCR2 & 0x7u) == TMU_TCR_PCK4)
-	{
-		return;
-	}
-	TMU_TSTR = (unsigned char)(TMU_TSTR & ~TMU_START_TMU2);
-	TMU_TCR2 = TMU_TCR_PCK4;
-	TMU_TCOR2 = 0xffffffffu;
-	TMU2_COUNT = 0xffffffffu;
-	TMU_TSTR = (unsigned char)(TMU_TSTR | TMU_START_TMU2);
-}
 
 /*
  * STOP THE REAL DRIVE ONCE, AT BOOT (WITH_GD_SPINDOWN).
@@ -263,7 +226,7 @@ void gd_deadline_timer_start(void)
  *
  * BOUNDED, like every other hardware wait (AGENTS.md 4.8) -- on a spin count,
  * in the style of RTL_LINK_SPIN_LIMIT and MAPLE_DMA_SPIN_LIMIT, rather than on
- * TMU2, which is not running this early and whose deadline would cost more of
+ * the loader's clock, whose deadline would cost more of
  * the footprint (4.6) than this whole function is worth. What one ExecServer
  * costs here has not been measured: the bound is on iterations, not on time.
  * A drive that will not answer is left spinning rather than spun on -- three
@@ -537,10 +500,23 @@ unsigned int g_gd_in_transfer;
  * then is safe: the server is parked, so resuming it is what ExecServer was
  * trying to do anyway.
  *
- * It has not fired in any recorded session (g_gd_lock_stuck 0). The freezes
- * behind it are attributed to the CD-DA nesting described at g_gd_in_transfer,
- * and none has been recorded since that fix; the watchdog stays as a backstop.
- * Like the read deadline, it needs TMU2 running.
+ * ONLY WHEN NO C CALLER IS INSIDE (g_gd_lock_owner 0). Under Shenmue II a
+ * GetDrvStat held it 266 ms with the generation still while the driver kept
+ * being called and answered BUSY (2026-10-03): a handler of the title had
+ * landed between gd_take() and gd_give() and polled the driver until it
+ * stopped answering BUSY -- on a holder that could not resume. Releasing it let
+ * that handler in, and the interrupted call released the lock a second time:
+ * frozen. Leaving it (g_gd_lock_held_long) froze the title and silenced the
+ * loader, whose tick needs the lock free. On TMU2, which Shenmue II stops for
+ * its RTC calibration, the watchdog seldom reached 250 ms: the same freeze,
+ * intermittent and deaf (2026-10-02). The cure is gd_take(): a C section runs
+ * masked, so a handler can no longer find one holding the lock.
+ * g_gd_lock_held_long must stay 0.
+ *
+ * g_gd_lock_stuck counts the locks actually released: one recorded, the
+ * Shenmue II hold above, before the owner test. The freezes behind the watchdog are attributed to the CD-DA nesting
+ * described at g_gd_in_transfer, and none has been recorded since that fix; it
+ * stays as a backstop.
  */
 unsigned int g_gd_lock_gen;         /* ++ on every C acquire and release */
 unsigned int g_gd_lock_owner;       /* 1 ReqCmd 2 GetCmdStat 3 GetDrvStat
@@ -549,7 +525,8 @@ unsigned int g_gd_lock_owner;       /* 1 ReqCmd 2 GetCmdStat 3 GetDrvStat
                                      * es_enter and writes no owner */
 unsigned int g_gd_lock_stuck;       /* deadlocks observed and broken */
 unsigned int g_gd_lock_stuck_owner; /* the owner latched at the break */
-unsigned int g_gd_lock_stuck_ticks; /* how long it had been held, TMU2 ticks */
+unsigned int g_gd_lock_stuck_ticks; /* how long it had been held, Pck/4 ticks */
+unsigned int g_gd_lock_held_long;   /* a C caller held it 250 ms (interrupted): left alone */
 
 #ifndef GD_LOCK_STUCK_TICKS
 #define GD_LOCK_STUCK_TICKS 3125000u   /* 250 ms at Pck/4 */
@@ -559,23 +536,82 @@ static unsigned int gd_stuck_since;
 static unsigned int gd_stuck_gen;
 static unsigned int gd_stuck_armed;
 
-/* Take the GD path, recording who has it. Returns 0 on success like gd_lock(). */
-static int gd_take(unsigned int who)
+#if GA_FAIL_PROBE
+unsigned int g_gd_busy_c;    /* BUSY because a C section held it: 0 with the mask */
+unsigned int g_gd_busy_srv;  /* BUSY because the server held it */
+unsigned int g_gd_busy_pr;   /* the last caller told BUSY (its PR) */
+unsigned int g_gd_busy_sr;   /* ... and its SR: IMASK > 0 = from an interrupt */
+#define GD_TAKE(who) gd_take((who), (unsigned int)__builtin_return_address(0))
+#else
+#define GD_TAKE(who) gd_take((who), 0)
+#endif
+
+/* The caller's IMASK, kept while a C section holds the lock (masked: no other
+ * C section can take it meanwhile, so one word is enough). */
+static unsigned int gd_take_imask;
+
+static void gd_release(void)
 {
+	g_gd_lock_owner = 0;
+	g_gd_lock_gen++;
+	gd_unlock();
+}
+
+/* IMASK back to `imask` (0x00..0xf0), every other SR bit -- T included --
+ * left as it is: one asm statement, so the compiler cannot slip in between. */
+static void gd_imask_set(unsigned int imask)
+{
+	unsigned int t;
+
+	__asm__ volatile ("stc sr,%0\n\tand %1,%0\n\tor %2,%0\n\tldc %0,sr"
+			  : "=&r" (t) : "r" (~0xf0U), "r" (imask) : "memory");
+}
+
+/*
+ * Take the GD path, recording who has it. Returns 0 on success like gd_lock().
+ * A C section of the lock runs with interrupts masked, from here to gd_give():
+ * a few instructions, no network, nothing waited for. Otherwise a title's
+ * handler that lands inside one and polls the driver until it stops answering
+ * BUSY waits on a holder that cannot resume: Shenmue II froze there before
+ * its menu (2026-10-03; see gd_lock_watchdog()). The server's own hold (es_enter)
+ * stays interruptible: it waits on the network, and BUSY is then the BIOS's
+ * answer too.
+ */
+static int gd_take(unsigned int who, unsigned int pr)
+{
+	unsigned int sr, t;
+
+	(void)pr;
+	__asm__ volatile ("stc sr,%0\n\tmov %0,%1\n\tor %2,%1\n\tldc %1,sr"
+			  : "=&r" (sr), "=&r" (t) : "r" (0xf0U) : "memory");
 	if (gd_lock())
 	{
+#if GA_FAIL_PROBE
+		if (g_gd_lock_owner)
+		{
+			g_gd_busy_c++;
+		}
+		else
+		{
+			g_gd_busy_srv++;
+		}
+		g_gd_busy_pr = pr;
+		g_gd_busy_sr = sr;
+#endif
+		gd_imask_set(sr & 0xf0U);
 		return 1;
 	}
+	gd_take_imask = sr & 0xf0U;
 	g_gd_lock_owner = who;
 	g_gd_lock_gen++;
 	return 0;
 }
 
+/* The end of a C section: release, then the caller's IMASK back. */
 static void gd_give(void)
 {
-	g_gd_lock_owner = 0;
-	g_gd_lock_gen++;
-	gd_unlock();
+	gd_release();
+	gd_imask_set(gd_take_imask);
 }
 
 /*
@@ -595,21 +631,26 @@ static void gd_lock_watchdog(void)
 	{
 		gd_stuck_armed = 1;
 		gd_stuck_gen = g_gd_lock_gen;
-		gd_stuck_since = TMU2_COUNT;
+		gd_stuck_since = clk_now();
 		return;
 	}
 
-	/* TMU2 counts DOWN; tmu2_since() is right across its reload (adapter.h). */
-	if (tmu2_since(gd_stuck_since) < GD_LOCK_STUCK_TICKS)
+	if (clk_since(gd_stuck_since) < GD_LOCK_STUCK_TICKS)
 	{
 		return;
 	}
 
-	g_gd_lock_stuck++;
 	g_gd_lock_stuck_owner = g_gd_lock_owner;
-	g_gd_lock_stuck_ticks = tmu2_since(gd_stuck_since);
+	g_gd_lock_stuck_ticks = clk_since(gd_stuck_since);
 	gd_stuck_armed = 0;
-	gd_give();
+	if (g_gd_lock_owner)
+	{
+		/* A C section interrupted despite the mask: never release it. */
+		g_gd_lock_held_long++;
+		return;
+	}
+	g_gd_lock_stuck++;
+	gd_release();
 }
 
 /*
@@ -900,7 +941,7 @@ static void gd_read_exchange(void)
 {
 	syscall_retval = (unsigned int)-1;
 	timeout_loop = GD_SYSCALL_TIMEOUT_SECONDS;
-	fine_deadline_start = TMU2_COUNT;
+	fine_deadline_start = clk_now();
 	fine_deadline_ticks = GD_READ_DEADLINE_TICKS;
 	build_send_packet(sizeof(command_3int_t));
 	bb->loop(0);
@@ -920,7 +961,7 @@ static void gd_read_exchange(void)
 	 * A ReturnValue naming ANOTHER read never gets here (g_retval_want).
 	 */
 	while (((int)syscall_retval >= 0) && !bin_window_complete()
-	       && (tmu2_since(fine_deadline_start) <= fine_deadline_ticks))
+	       && (clk_since(fine_deadline_start) <= fine_deadline_ticks))
 	{
 		g_cdfs_read_stale++;
 		syscall_retval = (unsigned int)-1;
@@ -1208,7 +1249,7 @@ static void gd_utlb_probe(unsigned int va)
 #define GA_PHYS_SECTORS 6
 #endif
 static volatile unsigned int ga_state;
-static unsigned int ga_start;		/* TMU2 at the post */
+static unsigned int ga_start;		/* clk_now() at the post */
 static unsigned int ga_sc;		/* sectors in the chunk on the wire */
 static unsigned int ga_fail_run;	/* chunks failed since one last got through */
 static unsigned int ga_virt;		/* the title's buffer is translated */
@@ -1234,6 +1275,56 @@ static int gd_async_on(void)
 	return bb == &adapter_bba && g_irq_hooked
 	    && ((GD_ASYNC_KATANA && GA_KATANA_READS) || gd_mmu_on());
 }
+
+#if GA_FAIL_PROBE
+/*
+ * WHAT A CHUNK THAT MISSED ITS DEADLINE HAD RECEIVED (2026-10-03). Sonic
+ * Adventure 2's asynchronous reads failed one in two at 250 ms, the host
+ * answering each, with nothing lost in the ring (g_rx_missed, _overflow 0)
+ * and no part refused; the synchronous engine served the same title without a
+ * failure. Counted at each failed verdict:
+ */
+extern unsigned int g_lbin_count, g_pbin_ok;
+unsigned int rtl_rx_probe(void);	/* rtl8139.c */
+unsigned int g_gaf_nolbin;	/* no LoadBinary accepted since the request */
+unsigned int g_gaf_parts;	/* PartBinary accepted for failed chunks, summed */
+unsigned int g_gaf_rxoff;	/* reception off (RXCONFIG AB|APM clear) */
+unsigned int g_gaf_ringfull;	/* frames still in the ring */
+unsigned int g_gaf_tick;	/* verdict reached in the tick, not the thread */
+/* The RX registers (rtl_rx_snap()) when the last failed chunk was posted, then
+ * when it failed; and its frames counted by rx_advance() in between. */
+unsigned int g_gaf_at_post[4];
+unsigned int g_gaf_at_fail[4];
+unsigned int g_gaf_frames;	/* g_rx_frames delta of the last failed chunk */
+/* Holly's IML2/4/6 NRM, EXT, ERR as they are at the last failure -- g_irq_iml
+ * is only what the title had set when the hook went in. */
+unsigned int g_gaf_iml[9];
+/* The address filter and the link at the last failure (rtl_link_snap()), its
+ * last word made the frames this console SENT while that chunk waited; and how
+ * many failures found IDR changed. */
+unsigned int g_gaf_link[4];
+unsigned int g_gaf_macbad;
+int rtl_link_snap(unsigned int *out);	/* rtl8139.c */
+extern unsigned int g_gaf_tx;
+static unsigned int ga_tx0;
+/*
+ * THE CLOCK THE DEADLINE USED TO READ (2026-10-03). Counted at each look at a
+ * chunk: TMU2, measured as the loader did until today, says the chunk is late
+ * while the loader's own clock does not -- the asynchronous reads of Sonic
+ * Adventure 2 were failed one frame after their request. The first time, the
+ * title's TMU state: TSTR, TCR2, TCOR2.
+ */
+unsigned int g_gaf_tmu2_late;
+unsigned int g_gaf_tmu2[3];
+unsigned int g_gaf_listens;	/* gd_idle_listen() windows opened */
+static unsigned int ga_start_tmu2;
+#define GAF_TCNT2 (*(volatile unsigned int *)0xffd80024)
+#define GAF_TCOR2 (*(volatile unsigned int *)0xffd80020)
+void rtl_rx_snap(unsigned int *out);	/* rtl8139.c */
+extern unsigned int g_rx_frames;
+static unsigned int ga_lbin0, ga_pbin0, ga_frames0;
+static unsigned int ga_snap_post[4];
+#endif
 
 static void ga_send(void)
 {
@@ -1283,8 +1374,16 @@ static void ga_next(void)
 	syscall_retval = (unsigned int)-1;
 	g_gd_in_transfer++;
 	ga_state = GA_POSTED;
-	ga_start = TMU2_COUNT;
+	ga_start = clk_now();
 	g_ga_posts++;
+#if GA_FAIL_PROBE
+	ga_lbin0 = g_lbin_count;
+	ga_pbin0 = g_pbin_ok;
+	ga_frames0 = g_rx_frames;
+	rtl_rx_snap(ga_snap_post);
+	ga_tx0 = g_gaf_tx;
+	ga_start_tmu2 = GAF_TCNT2;
+#endif
 	irq_rx_arm(1);
 	ga_run(ga_send);
 }
@@ -1318,7 +1417,24 @@ static void ga_poll(void)
 	}
 
 	ga_run(ga_drain);
-	late = tmu2_since(ga_start) > GD_READ_DEADLINE_TICKS;
+	late = clk_since(ga_start) > GD_READ_DEADLINE_TICKS;
+#if GA_FAIL_PROBE
+	{
+		unsigned int now = GAF_TCNT2;
+		unsigned int t2 = (now <= ga_start_tmu2) ? ga_start_tmu2 - now
+			: ga_start_tmu2 - now + GAF_TCOR2 + 1U;
+
+		if (!late && t2 > GD_READ_DEADLINE_TICKS)
+		{
+			if (!g_gaf_tmu2_late++)
+			{
+				g_gaf_tmu2[0] = *(volatile unsigned char *)0xffd80004;
+				g_gaf_tmu2[1] = *(volatile unsigned short *)0xffd80028;
+				g_gaf_tmu2[2] = GAF_TCOR2;
+			}
+		}
+	}
+#endif
 	if (bin_window_complete())
 	{
 		/* Done with its ReturnValue, not before: left in the ring, it met the
@@ -1332,6 +1448,30 @@ static void ga_poll(void)
 	else if (late)
 	{
 		g_fine_timeouts++;
+#if GA_FAIL_PROBE
+		{
+			unsigned int rx = rtl_rx_probe();
+
+			g_gaf_nolbin += (g_lbin_count == ga_lbin0);
+			g_gaf_parts += g_pbin_ok - ga_pbin0;
+			g_gaf_rxoff += !(rx & 0x0aU);
+			g_gaf_ringfull += !(rx & 0x100U);
+			g_gaf_tick += gd_in_irq();
+			g_gaf_frames = g_rx_frames - ga_frames0;
+			memcpy(g_gaf_at_post, ga_snap_post, sizeof(g_gaf_at_post));
+			rtl_rx_snap(g_gaf_at_fail);
+			g_gaf_macbad += rtl_link_snap(g_gaf_link);
+			g_gaf_link[3] -= ga_tx0;
+			{
+				unsigned int i;
+
+				for (i = 0; i < 9; i++)
+				{
+					g_gaf_iml[i] = ((volatile unsigned int *)0xa05f6910U)[i + i / 3];
+				}
+			}
+		}
+#endif
 		ga_end(GA_FAILED);
 	}
 	else if ((int)syscall_retval >= 0)
@@ -1473,7 +1613,7 @@ static void ga_listen(void)
 	 * (50 ms) instead of being dropped; the next exchange starts it anyway. */
 	bb->start();
 	drain_iters = 256;
-	fine_deadline_start = TMU2_COUNT;
+	fine_deadline_start = clk_now();
 	fine_deadline_ticks = 12500U;	/* 1 ms */
 	bb->loop(0);
 	fine_deadline_ticks = 0;
@@ -1492,6 +1632,9 @@ int gd_idle_listen(void)
 	{
 		return 0;
 	}
+#if GA_FAIL_PROBE
+	g_gaf_listens++;
+#endif
 	ga_run(ga_listen);
 	return 1;
 }
@@ -2518,7 +2661,7 @@ int gdGdcReqCmd(int cmd, int *param)
 		g_gd_cmd_counts[cmd]++;
 	}
 
-	if ((cmd < 0) || (cmd > CMD_MAX) || gd_take(1))
+	if ((cmd < 0) || (cmd > CMD_MAX) || GD_TAKE(1))
 	{
 		return gd_chn;
 	}
@@ -2594,7 +2737,7 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 		irq_hook_check();
 	}
 
-	if (gd_take(2))
+	if (GD_TAKE(2))
 	{
 		return CMD_STAT_BUSY;
 	}
@@ -2673,7 +2816,7 @@ int gdGdcGetDrvStat(int *status)
 	 * command state and the audio stream is not part of it. */
 	cdda_service();
 
-	if (gd_take(3))
+	if (GD_TAKE(3))
 	{
 		return CMD_STAT_BUSY;
 	}
@@ -2699,7 +2842,7 @@ int gdGdcChangeDataType(int *param)
 	{
 		return -1;
 	}
-	if (gd_take(4))
+	if (GD_TAKE(4))
 	{
 		return CMD_STAT_BUSY;
 	}
@@ -2726,7 +2869,7 @@ int gdGdcReset(void)
 	g_gd_idx_counts[9]++;
 	reset_GDS();
 	g_gd_lock_owner = 5;
-	gd_give();
+	gd_release();	/* taken by nobody here: no IMASK to give back */
 	return 0;
 }
 

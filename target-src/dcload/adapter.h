@@ -89,34 +89,46 @@ extern int timeout_loop;
  * in cdfs_syscalls.c for why an un-drained ring is not a harmless condition. */
 extern volatile int drain_iters;
 
-/* SH4 TMU channel 2's down-counter, at Pck/4 = 12.5 ticks per microsecond,
- * free running from 0xffffffff. The loader's millisecond deadline clock: the
- * CD-DA fetches, the GD read wait and the GD lock watchdog all measure on it.
+/*
+ * THE LOADER'S CLOCK: PERFORMANCE COUNTER 1, NOT A TIMER UNIT (2026-10-03).
  *
- * `timeout_loop` counts whole seconds on the performance counter, which is too
- * coarse (a 2 s timeout fires at 3 s, measured on hardware) and reads 0 under
- * an emulator without PMCR support.
+ * Every interval the loader measures -- the GD read deadline, the GD lock
+ * watchdog, the CD-DA fetch and service-gap limits, the hook's periods, the
+ * TX waits -- is read here. main() starts the counter in elapsed-time mode
+ * counting CPU cycles (PMCR_Init(DCLOAD_PMCR, ...)) and nothing restarts it.
+ * 200 MHz is exactly sixteen times Pck/4, so clk_since() returns Pck/4 ticks
+ * (12500 a millisecond): every *_TICKS constant, and every counter the host
+ * prints as milliseconds, keeps the unit it had on TMU2. The low 32 bits wrap
+ * every 21.4 s, far above the longest interval measured (838 ms).
  *
- * Only moves once something has started TMU2: cdda.c does before its first
- * fetch, and setup_machine() does at EXEC when ISOLDR_SETUP_MACHINE=1. In the
- * default build nothing else starts it.
+ * It used to be TMU2, which a TITLE CAN TAKE. KOS reloads it every second
+ * (2026-10-02). Under Sonic Adventure 2 an asynchronous disc read, whose wait
+ * spans the title's frame, was judged 250 ms late one frame after it was
+ * posted -- re-asked every 16.7 ms, the same LBA, for seconds, and the ADX
+ * music starved -- while a synchronous read, inside one syscall, never was
+ * (2026-10-03). The loader no longer programs or reads TMU2 at all.
  *
- * NOT ALWAYS OURS, AND NOT ALWAYS FROM 0xffffffff (2026-10-02). KOS takes TMU2
- * for its millisecond clock: Pck/4 too, but reloaded from TCOR2 = 1 s
- * (timer_ms_enable()). `start - TMU2_COUNT` then goes "negative" at every
- * reload, and a deadline compared that way fired at once, once a second, in
- * the middle of whatever wait was running. Measure with tmu2_since(). */
-#define TMU2_COUNT (*(volatile unsigned int *)0xffd80024)
-#define TMU2_TCOR (*(volatile unsigned int *)0xffd80020)
+ * KOS clears this counter once, in its init (perf_cntr_timer_enable()), before
+ * a title can read its disc; g_pmcr_backwards counts any later restart.
+ */
+#ifdef BUS_RATIO_COUNTER
+#error "clk_since() assumes the performance counter counts CPU cycles (200 MHz)"
+#endif
+#define CLK_COUNT (*(volatile unsigned int *)0xff100008)	/* PMCTR1L */
 
-/* Ticks since `start` was read from TMU2_COUNT, across one reload of whatever
- * period TCOR2 holds; with ours (0xffffffff) the plain unsigned subtraction.
- * Right for intervals shorter than the period: 1 s under KOS, so anything
- * measured on TMU2 must be checked at least that often (every deadline here is
- * 838 ms or less, and is polled). */
-unsigned int tmu2_since(unsigned int start);
+/* A start mark for clk_since(). */
+static inline unsigned int clk_now(void)
+{
+	return CLK_COUNT;
+}
 
-/* When non-zero, bb->loop() gives up this many TMU2 ticks after
+/* Pck/4 ticks since `start` (from clk_now()). */
+static inline unsigned int clk_since(unsigned int start)
+{
+	return (CLK_COUNT - start) >> 4;
+}
+
+/* When non-zero, bb->loop() gives up this many ticks (clk_since()) after
  * `fine_deadline_start` was latched, exactly as the seconds deadline does:
  * timeout_loop = -1, escape_loop = 1. Set both, call, then clear. */
 extern volatile unsigned int fine_deadline_ticks;

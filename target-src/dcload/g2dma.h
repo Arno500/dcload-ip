@@ -26,7 +26,7 @@
 #ifndef __G2DMA_H__
 #define __G2DMA_H__
 
-#include "adapter.h"	/* TMU2_COUNT */
+#include "adapter.h"	/* clk_now() */
 
 #ifndef WITH_CDDA
 #define WITH_CDDA 1
@@ -60,7 +60,7 @@
 #define G2DMA_TO_G2        0U
 #define G2DMA_TO_RAM       1U
 
-/* The longest any wait here spins: 2 ms of TMU2 (Pck/4). 16 KB at the
+/* The longest any wait here spins: 2 ms (Pck/4 ticks, clk_since()). 16 KB at the
  * slowest G2 rate measured (6.9 MB/s) is 2.4 ms, and nothing here moves more
  * than a frame or a sub-fetch at a time. */
 #define G2DMA_WAIT_TICKS   25000U
@@ -123,11 +123,11 @@ int g2dma_pick(void);
  * end bit cleared), -1 if it is still running. */
 static inline int g2dma_wait(unsigned int ch)
 {
-	unsigned int t0 = TMU2_COUNT;
+	unsigned int t0 = clk_now();
 
 	while (g2dma_busy(ch))
 	{
-		if (tmu2_since(t0) > G2DMA_WAIT_TICKS)
+		if (clk_since(t0) > G2DMA_WAIT_TICKS)
 		{
 			return -1;
 		}

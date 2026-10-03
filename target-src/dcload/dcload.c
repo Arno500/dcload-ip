@@ -858,11 +858,9 @@ void setup_machine(void)
 
 	tmu8[4] |= 1;			/* TSTR: start TMU0, as the bootstrap would */
 
-	/* TMU2 is the loader's free-running deadline clock (adapter.h), needed by
-	 * the GD read deadline even when no audio plays. TCR2 and TCNT2 are set
-	 * above; UNIE stays clear, so nothing is delivered on underflow. NOTE: this
-	 * function only runs with ISOLDR_SETUP_MACHINE=1, so in the default build
-	 * TMU2 is still started only by CD-DA. */
+	/* TMU2 as isoldr leaves it: TCR2 and TCNT2 are set above; UNIE stays
+	 * clear, so nothing is delivered on underflow. The loader itself no longer
+	 * measures on it (clk_since(), adapter.h). Only with ISOLDR_SETUP_MACHINE=1. */
 	tmu8[4] |= 4;			/* TSTR: start TMU2, Pck/4, free-running */
 
 	asic[4] = 0;			/* SB_IML2NRM */
@@ -1069,16 +1067,8 @@ int main(void)
 	PMCR_Init(DCLOAD_PMCR, PMCR_ELAPSED_TIME_MODE, PMCR_COUNT_RATIO_CYCLES);
 #endif
 
-	/*
-	 * START THE DEADLINE CLOCK BEFORE ANY TITLE CAN RUN.
-	 *
-	 * TMU2 is what the disc-read deadline and the GD lock watchdog measure on,
-	 * and until 2026-09-20 nothing started it unless a title played CD-DA. A
-	 * title that streams its music as data instead -- Crazy Taxi -- therefore
-	 * had no working read deadline at all: a lost chunk fell through to the
-	 * coarse PMCR backstop and froze the game for 7 s (AGENTS.md 4.5).
-	 */
-	gd_deadline_timer_start();
+	/* The performance counter just started is also the loader's clock: every
+	 * deadline and period measures on it (clk_since(), adapter.h). */
 
 #if G2DMA_BENCH
 	g2dma_bench();

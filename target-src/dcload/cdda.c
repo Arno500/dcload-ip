@@ -98,21 +98,15 @@
 /* ------------------------------------------------------------------ timers */
 
 /*
- * TMU2 is the deadline clock (adapter.h): Pck/4 = 12.5 MHz, free running from
- * 0xffffffff, so `start - TCNT2` is elapsed ticks. TMU1 is the loop clock:
- * Pck/16, TCOR = one AICA loop (end_tm), so `end_tm - TCNT1` is ticks into the
- * loop.
+ * The deadline clock is the loader's (clk_now()/clk_since(), adapter.h): Pck/4
+ * ticks. TMU1 is the loop clock: Pck/16, TCOR = one AICA loop (end_tm), so
+ * `end_tm - TCNT1` is ticks into the loop.
  */
 #define TMU_TSTR           (*(volatile unsigned char *)0xffd80004)
-#define TMU_TCOR2          (*(volatile unsigned int *)0xffd80020)
-#define TMU_TCNT2          TMU2_COUNT       /* adapter.h -- one definition */
-#define TMU_TCR2           (*(volatile unsigned short *)0xffd80028)
-#define TMU_START_TMU2     0x04
 #define TMU_TCOR1          (*(volatile unsigned int *)0xffd80014)
 #define TMU_TCNT1          (*(volatile unsigned int *)0xffd80018)
 #define TMU_TCR1           (*(volatile unsigned short *)0xffd8001c)
 #define TMU_START_TMU1     0x02
-#define TMU_TCR_PCK4       0                /* TMU2, UNIE clear */
 #define TMU_TCR_PCK16      1                /* TMU1, UNIE clear */
 
 /*
@@ -132,7 +126,7 @@
  * libgcc's divider, AGENTS.md 14.15). */
 #define TICKS_PER_FRAME_X16 ((TICKS_X8192 + 256u) / 512u)
 
-/* A key-off needs a moment to take effect (isoldr waits too): 1 ms on TMU2. */
+/* A key-off needs a moment to take effect (isoldr waits too): 1 ms on the loader's clock. */
 #define KEYOFF_SPIN_TICKS  12500u
 
 /*
@@ -207,7 +201,7 @@
 #define CDDA_CHECK_FETCHES 13u
 
 #define FETCH_FRAMES       (FETCH_SECTORS * FRAMES_PER_SECTOR)
-/* One sub-fetch of audio in TMU2 ticks (Pck/4 = 12.5 MHz): 44100 Hz. */
+/* One sub-fetch of audio in Pck/4 ticks (12.5 MHz, clk_since()): 44100 Hz. */
 #define CDDA_FETCH_TMU2    (FETCH_FRAMES * 2834u / 10u)
 #define RING_SAMPLES       (CDDA_RING_FETCHES * FETCH_FRAMES)   /* per channel */
 #define RING_BYTES         SAMPLE_BYTES(RING_SAMPLES)
@@ -254,7 +248,7 @@
 #define CDDA_LOOP_FOREVER  0x0fu
 
 /* The adapter loop's seconds timeout: a backstop only (it counts whole seconds
- * on the PMCR). The TMU2 deadlines below are the ones that matter. */
+ * on the PMCR). The Pck/4 deadlines below are the ones that matter. */
 #define CDDA_TIMEOUT_SECONDS       2
 
 /*
@@ -298,7 +292,7 @@
 /*
  * A service gap this long has drained more of the lead than is left: the
  * position model wraps, so past it a stale ring reads exactly like a fresh one
- * (AGENTS.md 4.13) and only TMU2 -- the clock the model is not derived from --
+ * (AGENTS.md 4.13) and only the loader's clock -- the one the model is not derived from --
  * can tell. Start over instead. In Pck/4 ticks, hence the * 4.
  */
 #define CDDA_GAP_LIMIT_TICKS \
@@ -361,10 +355,10 @@ static struct {
 
 	/* --- position model --- */
 	unsigned int end_tm;        /* TMU1 reload = one AICA loop, in Pck/16 ticks */
-	unsigned int svc_mark;      /* TMU2 at the last service that ran */
+	unsigned int svc_mark;      /* clk_now() at the last service that ran */
 	unsigned int svc_marked;    /* that mark is valid */
-	unsigned int svc_gap;       /* TMU2 ticks the last service came after */
-	unsigned int listen_mark;   /* TMU2 at the last listening window */
+	unsigned int svc_gap;       /* Pck/4 ticks the last service came after */
+	unsigned int listen_mark;   /* clk_now() at the last listening window */
 
 	/* --- channels: [0] = left, [1] = right --- */
 	unsigned int disdl[2];      /* send level mirrored from the game */
@@ -390,7 +384,7 @@ unsigned int g_cdda_retv_nodata;    /* our LBA came back without our data */
 unsigned int g_cdda_mutes;          /* keyed off before an unfilled part: a silence */
 unsigned int g_cdda_ch_stolen;      /* channels taken by the title, restarted */
 unsigned int g_cdda_room_min = 0xffffffffu; /* least lead ever seen, TMU1 ticks */
-unsigned int g_cdda_svc_gap_max;    /* longest gap between services, TMU2 ticks */
+unsigned int g_cdda_svc_gap_max;    /* longest gap between services, Pck/4 ticks */
 unsigned int g_cdda_toc_fails;      /* failed DC22 attempts */
 unsigned int g_cdda_last_lba;       /* FAD of the last sub-fetch served */
 unsigned int g_cdda_end_tm;         /* the loop period in use, TMU1 ticks */
@@ -474,12 +468,6 @@ static void cdda_scale_from_host(unsigned int ppm)
 	}
 }
 
-/* The deadline clock is started at boot now and owned by cdfs_syscalls.c, so
- * that a title which never plays CD-DA still gets a working read deadline --
- * which is what Crazy Taxi did not have (AGENTS.md 4.5). Kept as a call rather
- * than dropped: these three sites are the ones that must not run before it. */
-#define cdda_deadline_timer_start() gd_deadline_timer_start()
-
 /* Start TMU1 as the loop clock, in the key-on critical section. The first
  * count starts one lag above TCOR, which cdda_elapsed() reads as "the loop has
  * not begun yet": that is how the lag is applied. */
@@ -530,7 +518,7 @@ static unsigned int cdda_true_elapsed(void)
  * overwrites audio still playing), the TRUE one for everything that measures.
  *
  * It is a difference modulo one loop, so it cannot see a lead that has gone
- * past zero: a whole loop late reads as a full ring. The service gap on TMU2
+ * past zero: a whole loop late reads as a full ring. The service gap on the loader's clock
  * (CDDA_GAP_LIMIT_TICKS) is what covers that.
  */
 static unsigned int cdda_lead(unsigned int e)
@@ -856,7 +844,6 @@ static void cdda_channels_start(void)
 	unsigned int sr;
 
 	cdda_read_game_level(1);
-	cdda_deadline_timer_start();
 	cd.need_restream = 0;
 	cd.ch_bad_run = 0;
 	cd.check_in = CDDA_CHECK_FETCHES;
@@ -888,8 +875,8 @@ static void cdda_channels_stop(void)
 	aica_channel_off(CDDA_CH_LEFT);
 	aica_channel_off(CDDA_CH_RIGHT);
 	g2_fifo_wait();
-	t0 = TMU_TCNT2;
-	while (tmu2_since(t0) < KEYOFF_SPIN_TICKS)
+	t0 = clk_now();
+	while (clk_since(t0) < KEYOFF_SPIN_TICKS)
 	{
 		/* spin */
 	}
@@ -900,7 +887,7 @@ static void cdda_channels_stop(void)
 /* ------------------------------------------------------------------ TOC */
 
 /* Ask the host for the whole disc's table of contents (DC22, area 2), once per
- * session. Runs before any key-on, so it starts TMU2 itself. */
+ * session. Runs before any key-on. */
 static int cdda_load_toc(void)
 {
 	command_3int_t *command =
@@ -911,7 +898,6 @@ static int cdda_load_toc(void)
 	{
 		return 0;
 	}
-	cdda_deadline_timer_start();
 	cdda_timer_calibrate();
 
 	for (try = 0; try < CDDA_TOC_RETRIES; try++)
@@ -923,7 +909,7 @@ static int cdda_load_toc(void)
 
 		syscall_retval = (unsigned int)-1;
 		timeout_loop = CDDA_TIMEOUT_SECONDS;
-		fine_deadline_start = TMU_TCNT2;
+		fine_deadline_start = clk_now();
 		fine_deadline_ticks = CDDA_TOC_DEADLINE_TICKS;
 		build_send_packet(sizeof(command_3int_t));
 		bb->loop(0);
@@ -1052,7 +1038,7 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors, unsigned int stage
 
 	syscall_retval = (unsigned int)-1;
 	timeout_loop = CDDA_TIMEOUT_SECONDS;
-	fine_deadline_start = TMU_TCNT2;
+	fine_deadline_start = clk_now();
 	fine_deadline_ticks = CDDA_FETCH_DEADLINE_TICKS;
 	/* Open the door for this answer only. */
 	g_bin_stage_lo = (unsigned int)cdda_pcm;
@@ -1076,7 +1062,7 @@ static int cdda_fetch(unsigned int lba, unsigned int sectors, unsigned int stage
 		if (timed_out)
 		{
 			bin_window_close();
-			fine_deadline_start = TMU_TCNT2;
+			fine_deadline_start = clk_now();
 			fine_deadline_ticks = CDDA_DRAIN_DEADLINE_TICKS;
 			drain_iters = CDDA_DRAIN_ITERS;
 			bin_echo_suppress(1);
@@ -1220,7 +1206,7 @@ static unsigned int cdda_next_sectors(unsigned int want_frames)
 
 /*
  * The source has run out: note how much real audio is still ahead of the AICA,
- * counted down afterwards on TMU2, and let the fill carry on laying silence so
+ * counted down afterwards on the loader's clock, and let the fill carry on laying silence so
  * the AICA can never reach the ring as it was a loop ago.
  */
 static void cdda_drain(void)
@@ -1348,7 +1334,6 @@ static void cdda_prime(void)
 	cd.svc_marked = 0;
 	cd.restart = 1;
 	cdda_channels_stop();
-	cdda_deadline_timer_start();
 #if !CDDA_ADPCM
 	cdda_floor(0, RING_BYTES);
 #endif
@@ -1434,13 +1419,13 @@ static void cdda_service_body(void)
 	 * network continuously anyway.
 	 */
 	if (filled || svc_no_listen
-	    || tmu2_since(cd.listen_mark) < CDDA_LISTEN_PERIOD_TICKS)
+	    || clk_since(cd.listen_mark) < CDDA_LISTEN_PERIOD_TICKS)
 	{
 		return;
 	}
-	cd.listen_mark = TMU_TCNT2;
+	cd.listen_mark = clk_now();
 	drain_iters = CDDA_SERVICE_DRAIN_ITERS;
-	fine_deadline_start = TMU_TCNT2;
+	fine_deadline_start = clk_now();
 	fine_deadline_ticks = CDDA_SERVICE_DRAIN_DEADLINE_TICKS;
 	bb->loop(0);
 	fine_deadline_ticks = 0;
@@ -1472,10 +1457,11 @@ void cdda_service(void)
 	}
 
 	/* How long the ring went unattended: the music only moves when the title
-	 * calls the GD driver. TMU2 also counts the drain out, because the model
-	 * the rest of the file uses wraps and the end of a track does not. */
-	now = TMU_TCNT2;
-	cd.svc_gap = cd.svc_marked ? (unsigned int)(cd.svc_mark - now) : 0u;
+	 * calls the GD driver. The loader's clock also counts the drain out,
+	 * because the model the rest of the file uses wraps and the end of a
+	 * track does not. */
+	now = clk_now();
+	cd.svc_gap = cd.svc_marked ? now - cd.svc_mark : 0u;
 	if ((int)cd.svc_gap < 0)
 	{
 		/* The tick's service ran between reading `now` and here and moved
@@ -1483,6 +1469,7 @@ void cdda_service(void)
 		 * the stream twice (Shenmue II, g_cdda_svc_gap_max 0xffffffc8). */
 		cd.svc_gap = 0u;
 	}
+	cd.svc_gap >>= 4;	/* cycles to Pck/4 ticks */
 	if (cd.svc_gap > g_cdda_svc_gap_max)
 	{
 		g_cdda_svc_gap_max = cd.svc_gap;

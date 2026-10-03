@@ -14,8 +14,8 @@
  *         AICA as a title's sound driver would. Whether that is safe decides
  *         whether a DMA may be left running under a title (G2DMA_CONCURRENT).
  *
- * Every figure is in g_bench[] (below) and on screen. Times are TMU2 ticks
- * (Pck/4, 12.5 per microsecond) per transfer: 1536 bytes for RX, 2368 for the
+ * Every figure is in g_bench[] (below) and on screen. Times are clk_since()
+ * ticks (Pck/4, 12.5 per microsecond) per transfer: 1536 bytes for RX, 2368 for the
  * AICA. A positive control proves the checker counts a wrong word.
  *
  * It uses what is idle at boot: gd_stage (.hiram, a disc read's stage), the
@@ -161,11 +161,11 @@ static unsigned int aica_bad(unsigned int off, unsigned int words, unsigned int 
 /* g2dma_wait(), noting the end bit before it is cleared. */
 static int bench_wait(unsigned int ch)
 {
-	unsigned int t0 = TMU2_COUNT;
+	unsigned int t0 = clk_now();
 
 	while (g2dma_busy(ch))
 	{
-		if ((unsigned int)(t0 - TMU2_COUNT) > G2DMA_WAIT_TICKS)
+		if (clk_since(t0) > G2DMA_WAIT_TICKS)
 		{
 			return -1;
 		}
@@ -186,7 +186,7 @@ static unsigned int rx_once(unsigned int how, unsigned char *buf)
 	while (G2_FIFO & 0x20U)
 	{
 	}
-	t0 = TMU2_COUNT;
+	t0 = clk_now();
 	if (how == 0U)
 	{
 		GAPS_WINPTR = 0x81840000U + GAPS_BENCH_OFF;
@@ -208,7 +208,7 @@ static unsigned int rx_once(unsigned int how, unsigned char *buf)
 			return ~0U;
 		}
 	}
-	t = t0 - TMU2_COUNT;
+	t = clk_since(t0);
 	g_bench[4 + how] += ram_bad(buf, RX_LEN / 4U, 1);
 	return t;
 }
@@ -251,9 +251,9 @@ static void bench_aica(void)
 	for (k = 0, sum = 0; k < AI_RUNS; k++)
 	{
 		aica_fill(AICA_A, AI_LEN / 4U, 0);
-		t0 = TMU2_COUNT;
+		t0 = clk_now();
 		aica_fill(AICA_A, AI_LEN / 4U, 0x77U);
-		sum += t0 - TMU2_COUNT;
+		sum += clk_since(t0);
 		g_bench[17] += aica_bad(AICA_A, AI_LEN / 4U, 0x77U);
 	}
 	g_bench[16] = sum / AI_RUNS;
@@ -266,7 +266,7 @@ static void bench_aica(void)
 			aica_fill(AICA_A, AI_LEN / 4U, 0);
 			SB_ISTERR = SB_ISTERR;
 			fifo_wait();
-			t0 = TMU2_COUNT;
+			t0 = clk_now();
 			g2dma_start(ch, src, 0x00800000U + AICA_A, AI_LEN, G2DMA_TO_G2);
 			if (bench_wait(ch) < 0)
 			{
@@ -274,7 +274,7 @@ static void bench_aica(void)
 				G2DMA_EN(ch) = 0;
 				break;
 			}
-			sum += t0 - TMU2_COUNT;
+			sum += clk_since(t0);
 			g_bench[19] |= SB_ISTERR;
 			g_bench[12 + ch] += aica_bad(AICA_A, AI_LEN / 4U, 0x100U + ch);
 		}

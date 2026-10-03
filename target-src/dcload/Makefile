@@ -443,6 +443,12 @@ CFLAGS += -DRTL_RX_DMA=$(RTL_RX_DMA)
 GA_KATANA_READS ?= 1
 CFLAGS += -DGA_KATANA_READS=$(GA_KATANA_READS)
 
+# Diagnostic only: what an asynchronous chunk that missed its deadline had
+# received, and the state of reception at that moment (g_gaf_*). Never in a
+# shipped set.
+GA_FAIL_PROBE ?= 0
+CFLAGS += -DGA_FAIL_PROBE=$(GA_FAIL_PROBE)
+
 # G2 DMA bench (g2bench.c, docs/g2-dma-investigation.md step 0): at boot,
 # measures which DMA channels reach the BBA's SRAM and the AICA on this
 # console, and runs a torture round (CPU PIO on the AICA while two DMAs are
@@ -453,6 +459,10 @@ CFLAGS += -DG2DMA_BENCH=$(G2DMA_BENCH)
 ifeq ($(G2DMA_BENCH),1)
 # The bench's ~1.2 KB would push .gdstage past _stack: two sectors less of it.
 CFLAGS += -DGD_STAGE_BIG_SECTORS=2
+else ifeq ($(GA_FAIL_PROBE),1)
+# The probe's counters do not fit the HIGH family's 128 bytes: one sector less,
+# which only Windows CE's staged reads use.
+CFLAGS += -DGD_STAGE_BIG_SECTORS=3
 else ifeq ($(DCLOAD_IS_LOW),1)
 # The LOW (CD) build never serves a Windows CE title -- the host places those
 # in the HIGH family, and .gdstage is only used under the MMU -- so its stage is

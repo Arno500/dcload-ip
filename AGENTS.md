@@ -156,7 +156,7 @@ Compiler flags disable everything that could move code behind your back:
 | `video.s` / `video.h` | on-screen text (uses the BIOS font through `0x8c0000b4`). |
 | `packet.c/.h`, `bswap.h` | packet builder/parser, byte order, the Internet checksum (`csum_sum16()`). |
 | `net.c/.h` | ARP/ICMP/UDP glue, `announce_presence()`. |
-| `adapter.c/.h` | adapter interface (`bb`), the TMU2 fine deadline, `tmu2_since()`, `bb_irq_hold()`. |
+| `adapter.c/.h` | adapter interface (`bb`), the loader's clock (`clk_now()`/`clk_since()`, §4.5) and the fine deadline, `bb_irq_hold()`. |
 | `hiram.h` | `HIRAM_BUF`: put a large buffer in `.hiram` instead of BSS. |
 | `rtl8139.c/.h` | BBA driver, RX ring (§4.8), warm start (§4.9), RX by G2 DMA (§4.16). |
 | `lan_adapter.c/.h` | LAN Adapter driver (`WITH_LAN_ADAPTER`). |
@@ -230,7 +230,7 @@ a build variable because it is per-game (§4.11). Defaults (LOW layout):
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` = `0xdeadbeef` magic, `+8` = syscall trampoline pointer (the example-program ABI). |
-| `0x8c00d668` | `_end` with default flags (2026-10-03). Code and BSS are all below it. Over the `0x8c00c000` bound (§4.6). |
+| `0x8c00d638` | `_end` with default flags (2026-10-03). Code and BSS are all below it. Over the `0x8c00c000` bound (§4.6). |
 | `_end`..`_stack` | the loader's stack; also `.gdstage` (NOLOAD, `GD_STAGE_BIG_SECTORS` × 2 KB), used only under a Windows CE title (§4.15). |
 | `0x8c00f400` | `_stack` (LOW layout), **the VBR handed to the title**, the link address of `exception`, and the BIOS VBR. Only `_stack` moves with the base. |
 | `0x8c010000` | the title's load address; `exception.bin` ends just before it. |
@@ -345,24 +345,53 @@ command runs, never under a title.
    retrying a LoadBinary that is never echoed.
 3. **No function live across a yield may take the address of a local**: a
    parked frame is restored onto whatever `r15` the next ExecServer has.
-4. **Every wait needs a millisecond deadline on TMU2** (`fine_deadline_*`,
-   `GD_READ_DEADLINE_TICKS` 250 ms for disc reads). `gd_deadline_timer_start()`
-   starts TMU2 from `main()` (idempotent; restarting it mid-read would break
-   that read's deadline). The seconds timeout counts whole seconds on the PMCR
-   (2 s fires at 3 s), `RTL_IDLE_POLL_LIMIT` only counts polls with no frame,
-   and both are disarmed when `timeout_loop` is cleared under a wait. Arm, call,
-   then clear — never clear someone else's.
-   **Measure with `tmu2_since()`**, never `start - TMU2_COUNT`: a KOS title owns
-   TMU2 and reloads it every second, and the raw subtraction fired every
-   deadline in progress at each reload. `gd_deadline_timer_start()` leaves any
-   Pck/4 timer with a period of 0.96 s or more alone; intervals measured on TMU2
-   must stay under that period.
+4. **Every wait needs a millisecond deadline on the loader's clock**
+   (`fine_deadline_*`, `GD_READ_DEADLINE_TICKS` 250 ms for disc reads). The
+   seconds timeout counts whole seconds on the same counter (2 s fires at 3 s),
+   `RTL_IDLE_POLL_LIMIT` only counts polls with no frame, and both are disarmed
+   when `timeout_loop` is cleared under a wait. Arm, call, then clear — never
+   clear someone else's.
+   **The clock is performance counter 1, never a TMU** (`clk_now()`,
+   `clk_since()`, `adapter.h`): started by `main()` counting CPU cycles,
+   `>> 4` = Pck/4 ticks, so every `*_TICKS` constant and every millisecond the
+   host prints keep their unit; it wraps every 21.4 s. A title owns its TMUs:
+   KOS reloads TMU2 every second. Under Sonic Adventure 2, measured on TMU2,
+   asynchronous reads were judged 250 ms late one frame after their request —
+   re-asked every 16.7 ms, the ADX music starved — while synchronous reads
+   (inside one syscall) never were: the title disturbs TMU2 between two looks
+   (how is still to be read off `g_gaf_tmu2`, `GA_FAIL_PROBE`). The loader neither
+   programs nor reads TMU2. KOS clears this counter once in its init, before
+   any read; `g_pmcr_backwards` counts a later restart. **flycast reads 0
+   from it without the local `sh4_mmr.cpp` patch** (§11): every deadline is
+   then dead there.
+
+**The GD lock's C sections run masked.** `gd_take()` raises IMASK to 15
+before taking the lock and `gd_give()` gives the caller's IMASK back (only
+IMASK: T and the rest of SR stay). ReqCmd, GetCmdStat, GetDrvStat and
+ChangeDataType hold it for a few instructions, no network, nothing waited for.
+Unmasked, a title's handler that landed inside one and polled the driver until
+it stopped answering BUSY waited on a holder that could not resume: Shenmue II
+froze before its menu (2026-10-03: GetDrvStat held it 266 ms while the driver
+kept answering BUSY). The server's own hold (`es_enter`) stays interruptible:
+it waits on the network, and BUSY is the BIOS's answer then too. Anything
+added between `gd_take()` and `gd_give()` must stay short and must not wait;
+`gdGdcReset()` and the watchdog release with `gd_release()`, which leaves SR
+alone.
 
 **Stuck-lock watchdog.** `gd_lock_watchdog()` (from GetDrvStat/GetCmdStat)
-releases the GD lock if it is held while the server is parked and
-`g_gd_lock_gen` has not moved for `GD_LOCK_STUCK_TICKS`. It has never fired
-(`g_gd_lock_stuck` 0) — read that as unproven (§14.9). `g_gd_lock_owner` /
-`_stuck_owner` say who held it.
+releases the GD lock if it is held while the server is parked,
+`g_gd_lock_gen` has not moved for `GD_LOCK_STUCK_TICKS`, **and no C syscall is
+inside** (`g_gd_lock_owner` 0). Its one recorded release was wrong: the
+Shenmue II hold above, which it handed to the polling handler while the
+interrupted call later released the lock a second time. Leaving such a hold
+(`g_gd_lock_held_long`) froze the title and silenced the loader, whose tick
+needs the lock free. On TMU2, which Shenmue II stops for its RTC calibration,
+the watchdog seldom reached 250 ms: the same freeze, intermittent and deaf
+(2026-10-02). With the mask, `g_gd_lock_held_long` must stay 0.
+`_stuck_owner` / `_stuck_ticks` describe the last of either. `GA_FAIL_PROBE`
+builds add `g_gd_busy_c` (BUSY from a C section: 0), `g_gd_busy_srv`, and the
+last caller told BUSY (`g_gd_busy_pr`, `g_gd_busy_sr`: IMASK > 0 means it
+called from an interrupt).
 
 **Constants** (`cdfs_syscalls.c`, override with `-D`):
 
@@ -415,13 +444,13 @@ isoldr does not meet this because its image ends at `0x8c007400`.
 
 **Where it stands (2026-10-03):**
 
-- **LOW (the CD build): `_end = 0x8c00d668`, 5.6 KB over the bound.** The CD
+- **LOW (the CD build): `_end = 0x8c00d638`, 5.6 KB over the bound.** The CD
   loader cannot host a retail Katana title at its own base. That is accepted
   (user decision, 2026-09-21): the host chainloads its own HIGH set before any
   disc image and refuses a low base whose image reaches a range the title
   paints (`low_loader_painted_by_title`). Say so when a change makes it worse.
-  `.gdstage` ends 1408 B under `_stack`.
-- **HIGH (the host's set): `_end = base+0x9b74`, `.gdstage` ends 128 B under
+  `.gdstage` ends 1472 B under `_stack`.
+- **HIGH (the host's set): `_end = base+0x9b2c`, `.gdstage` ends 192 B under
   `_stack` (`base+0xbc00`).** This is the binding budget. The next bytes come
   from `GD_STAGE_BIG_SECTORS` (2 KB a sector, costs Windows CE's staged reads)
   or from a feature flag of §4.3.
@@ -648,7 +677,7 @@ design description**; this section is the summary and the rules. History:
   the channels are keyed off and the stream restarts at what was last heard
   (`cdda_current_lba()`): `g_cdda_mutes`. The lead is a difference modulo one
   loop, so it cannot see itself gone past zero; a **service gap** over
-  `CDDA_GAP_LIMIT_TICKS` (838 ms) says so on TMU2 instead. **Key-off silences
+  `CDDA_GAP_LIMIT_TICKS` (838 ms) says so on the loader's clock instead. **Key-off silences
   because register 20 carries RR = `0x1f`**; RR = 0 holds the level.
 - **Clock**: `end_tm` comes from `CDDA_TICKS_X8192` (isoldr's constant × 16;
   `580480` on flycast, whose clocks are exact) and the host's trim: a ppm scale
@@ -700,7 +729,7 @@ design description**; this section is the summary and the rules. History:
 4. Key on only over a whole lead; key off before the lead runs out.
 5. A fetch is complete only on its own window: close it before the request.
 6. Measure with the true model; trigger with the lagged one. Anything that could
-   outlast one loop is judged on TMU2.
+   outlast one loop is judged on the loader's clock (`clk_since()`).
 7. All AICA access by the CPU inside `g2_lock()`, with a FIFO wait at most every
    eight 32-bit stores. `g2_lock()` first waits for the ring's own DMA
    (`g2dma_quiesce()`, §4.16). In ADPCM the ring is written by DMA: unaligned
@@ -743,14 +772,14 @@ Constants in `cdda.c`: `CDDA_FETCH_DEADLINE_TICKS` 20 ms,
 
 | Question | Counters |
 | --- | --- |
-| Is it healthy? | `g_cdda_plays`, `g_cdda_fetches` (sub-fetches, ~19/s), `g_cdda_fetch_fails`, `g_cdda_mutes`, `g_cdda_room_min` (least lead seen, TMU1 ticks, 3125 ≈ 1 ms; ~893 ms is healthy), `g_cdda_svc_gap_max` (longest time without a service, TMU2 ticks) |
+| Is it healthy? | `g_cdda_plays`, `g_cdda_fetches` (sub-fetches, ~19/s), `g_cdda_fetch_fails`, `g_cdda_mutes`, `g_cdda_room_min` (least lead seen, TMU1 ticks, 3125 ≈ 1 ms; ~893 ms is healthy), `g_cdda_svc_gap_max` (longest time without a service, Pck/4 ticks) |
 | Right answers? | `g_cdda_wrong_lba`, `g_cdda_retv_nodata`, `g_cdda_stale_lbin` |
 | Channels | `g_cdda_ch_stolen` |
 | Clock | `g_cdda_end_tm`, `g_cdda_scale_ppm` (1000000 = no trim yet) |
 | Misc | `g_cdda_toc_fails`, `g_cdda_last_lba` |
 
-TMU1 is Pck/16 (3125 ticks/ms) and TMU2 Pck/4 (12500): `--diag` prints both in
-milliseconds.
+TMU1 is Pck/16 (3125 ticks/ms) and the loader's clock Pck/4 (12500, §4.5):
+`--diag` prints both in milliseconds.
 
 #### Open questions and limits
 
@@ -768,7 +797,7 @@ milliseconds.
 - A completion test must be about this transfer: a window left over from the
   previous one, same address and size, is already complete.
 - A model that wraps cannot see a whole period of lateness: judge it on a clock
-  it is not derived from (TMU2).
+  it is not derived from (the loader's clock).
 - A counter panel cannot report a schedule: dropped frames came from bursty
   fetching while every counter was healthy.
 - In a differential format a hole is carried forward by the decoder: muting
@@ -792,8 +821,8 @@ reversible: a KOS program calling `cdrom_init()` spins the drive back up.
    vector. ABI: r7 = function index, r6 = 0.
 2. **The BIOS driver is a coroutine too**: `ReqCmd` only queues the STOP; it
    progresses while we call `ExecServer`. `InitSystem` is the fallback.
-3. **Bounded on a spin count** (`GD_SPINDOWN_SPIN_LIMIT`), since TMU2 is not
-   running that early. A drive that will not answer is left spinning.
+3. **Bounded on a spin count** (`GD_SPINDOWN_SPIN_LIMIT`), in the style of
+   the other hardware waits. A drive that will not answer is left spinning.
 
 `g_gd_spindown`: final command status + 2 (**4** = COMPLETED; 1 FAILED, 2 IDLE,
 5 STREAMING), 7 "the driver would not take the command", 8 "it never finished",
@@ -1211,7 +1240,8 @@ hook, the tick's idle listen.
   counted before the lock), `g_gd_park_longs`, `g_cdfs_sync_chunks`,
   `g_cdfs_sync_reentered`, `g_gd_spindown`, `g_cdfs_read_retries`/`_fails`/
   `_holes`/`_stale`, `g_gd_stale_lbin`, `g_gd_in_transfer`, and the lock group
-  (`g_gd_lock_stuck`/`_stuck_owner`/`_stuck_ticks`/`g_gd_lock_owner`/`_gen`).
+  (`g_gd_lock_stuck`/`g_gd_lock_held_long`/`_stuck_owner`/`_stuck_ticks`/
+  `g_gd_lock_owner`/`_gen`).
   **`_fails` and `_holes` are different ends of the link**: fails means the host
   never answered, holes means it answered short. Since the host stopped
   acknowledging disc reads, `_holes` is the only place a lost packet in a read
@@ -1222,7 +1252,7 @@ hook, the tick's idle listen.
 - RX: `g_rx_frames`, `g_rx_polls`, `g_rx_wraps`, `g_rx_overflow`, `g_rx_reinit`,
   `g_rx_linkchange`, `g_rx_link_giveup`, `g_rx_hdr_defer`, `g_rx_resync`,
   `g_rx_missed` (the chip's own drop tally), `g_rx_last_capr`/`_cbr`.
-- Timeouts: `g_fine_timeouts` (TMU2 deadline exits) and `g_idle_polls_max` are
+- Timeouts: `g_fine_timeouts` (fine deadline exits) and `g_idle_polls_max` are
   **different exits** — reading the second as "no timeout fired" hid a 3 s
   freeze. `g_pmcr_backwards`.
 - DHCP / warm start: `g_dhcp_replies`, `g_dhcp_not_ours`, `g_warm_start`,
@@ -1341,6 +1371,14 @@ against a capture on the wire) to tell lost TX from lost RX.
     came as the title's IML4, not our IML2 (§4.16). Read the title's masks
     (`g_irq_iml`) before choosing where to listen, and count the event at any
     level before concluding it does not fire.
+23. **Measuring across the title on a clock the title can touch.** A wait that
+    spans the title's own code — an asynchronous read, a period mark, a service
+    gap — is only as good as a clock nobody else writes. TMU2 was ours until
+    Sonic Adventure 2: its asynchronous reads "timed out" at the first look,
+    one frame after the request, and the signature was
+    a count that could not add up (65 deadline exits of 250 ms in 4.5 s of a
+    one-at-a-time engine). Check the arithmetic of a timeout counter against
+    wall time before chasing what it seems to report (§4.5 invariant 4).
 
 ## 15. Where to look first
 

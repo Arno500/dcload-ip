@@ -20,14 +20,6 @@ HIRAM_BUF __attribute__((aligned(32))) unsigned char raw_current_pkt[RAW_RX_PKT_
 // The performance gains are well worth the 2 wasted bytes.
 __attribute__((aligned(2))) unsigned char * current_pkt = &(raw_current_pkt[2]);
 
-unsigned int tmu2_since(unsigned int start)
-{
-	unsigned int now = TMU2_COUNT;
-
-	/* Counting down: a count above the start means TMU2 reloaded since. */
-	return (now <= start) ? start - now : start - now + TMU2_TCOR + 1U;
-}
-
 int adapter_detect() {
 	// Try the BBA first.
 	if (adapter_bba.detect() >= 0) {

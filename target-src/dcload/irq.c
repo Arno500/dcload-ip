@@ -66,7 +66,7 @@ volatile unsigned int g_irq_refused_vbr;
 volatile unsigned int g_irq_entries;		/* every interrupt through the hook (irq_hook.S) */
 volatile unsigned int g_irq_work;		/* non-zero: take the slow path and call irq_tick */
 volatile unsigned int g_irq_ticks;		/* irq_tick calls */
-volatile unsigned int g_irq_tick_max;		/* longest irq_tick, TMU2 ticks (Pck/4) */
+volatile unsigned int g_irq_tick_max;		/* longest irq_tick, Pck/4 ticks (clk_since()) */
 volatile unsigned int g_irq_tick_sum;		/* all of them: the CPU the tick takes */
 volatile unsigned int g_irq_evt_last;		/* INTEVT of the last tick */
 volatile unsigned int g_irq_rx;			/* BBA RX interrupts taken (Katana) */
@@ -219,7 +219,7 @@ void irq_hook_check(void)
 	__asm__ volatile ("ldc %0,sr" : : "r" (sr) : "memory");
 }
 
-/* How often the tick feeds CD-DA: 5 ms of TMU2 (Pck/4). A sub-fetch is 53 ms
+/* How often the tick feeds CD-DA: 5 ms (Pck/4 ticks). A sub-fetch is 53 ms
  * of audio, so this catches up ten times faster than the audio drains. */
 #define IRQ_CDDA_PERIOD 62500U
 /* How often it looks at a disc read on the wire: 0.5 ms. A Katana title may
@@ -233,7 +233,9 @@ void irq_tick(void)
 #if IRQ_IDLE_LISTEN
 	static unsigned int listen_mark;
 #endif
-	unsigned int t0 = TMU2_COUNT;
+	/* Marks are raw counts of the loader's clock (adapter.h); an interval is
+	 * (t0 - mark) >> 4, in Pck/4 ticks like the periods. */
+	unsigned int t0 = clk_now();
 	unsigned int dt;
 	/* The end bit of our RX DMA while a frame is on it, else 0: any other G2
 	 * DMA end is the title's, to be neither cleared nor swallowed. */
@@ -252,7 +254,7 @@ void irq_tick(void)
 		 * (AGENTS.md 4.16). Such an entry must not fall into the "looked a
 		 * moment ago" limit below: a finished DMA is a reason to look now.
 		 * rx_settle() clears the bit when it finishes the frame. */
-		read_mark = t0 + IRQ_READ_PERIOD;
+		read_mark = t0 - (IRQ_READ_PERIOD << 4);
 	}
 	if (g_irq_evt_last == g_irq_rx_evt && ((SB_IST(1) & EXT_BBA) || (SB_IST(0) & ours)))
 	{
@@ -266,7 +268,7 @@ void irq_tick(void)
 		}
 		SB_ISTNRM = ours;		/* w1c: our DMA's line falls, whatever else this tick does */
 		g_irq_rx++;
-		read_mark = t0 + IRQ_READ_PERIOD;	/* look at the read now */
+		read_mark = t0 - (IRQ_READ_PERIOD << 4);	/* look at the read now */
 		g_irq_swallow = !((SB_IST(0) & rx_iml[0] & ~ours)
 				  | (SB_IST(1) & rx_iml[1] & ~EXT_BBA)
 				  | (SB_IST(2) & rx_iml[2]));
@@ -277,7 +279,7 @@ void irq_tick(void)
 		/* The GD path owns the network -- or CD-DA does: a Katana title's
 		 * GetDrvStat services it before taking the lock. */
 	}
-	else if ((unsigned int)(read_mark - t0) < IRQ_READ_PERIOD && gd_async_busy())
+	else if (((t0 - read_mark) >> 4) < IRQ_READ_PERIOD && gd_async_busy())
 	{
 		/* A read is on the wire and was looked at a moment ago. */
 	}
@@ -290,13 +292,13 @@ void irq_tick(void)
 	/* Before CD-DA: when the title's interrupts come more than 5 ms apart
 	 * (VBlank only), every tick finds CD-DA due and a listen placed after it
 	 * never ran. Due once in 50 ms, it leaves CD-DA the other ticks. */
-	else if ((unsigned int)(listen_mark - t0) >= 625000U	/* 50 ms */
+	else if (((t0 - listen_mark) >> 4) >= 625000U	/* 50 ms */
 		 && (listen_mark = t0, gd_idle_listen()))
 	{
 	}
 #endif
 #if WITH_CDDA
-	else if ((unsigned int)(cdda_mark - t0) >= IRQ_CDDA_PERIOD)
+	else if (((t0 - cdda_mark) >> 4) >= IRQ_CDDA_PERIOD)
 	{
 		cdda_mark = t0;
 		cdda_service_tick();
@@ -305,7 +307,7 @@ void irq_tick(void)
 
 	g_rx_dma_tick = 0;
 	g2dma_release();
-	dt = tmu2_since(t0);
+	dt = clk_since(t0);
 	g_irq_tick_sum += dt;
 	if (dt > g_irq_tick_max)
 	{
