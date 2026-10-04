@@ -55,6 +55,8 @@ static void pktcpy(unsigned char *dest, unsigned char *src, unsigned int n);
 static int rtl_bb_rx(void);
 #if WITH_IRQ_HOOK
 static int rx_settle(unsigned int wait);
+#else
+static inline int rx_settle(unsigned int wait) { (void)wait; return 0; }	/* no hook: no RX DMA */
 #endif
 
 /*
@@ -1164,8 +1166,6 @@ static int rx_settle(unsigned int wait)
 	}
 	return 0;
 }
-#else
-#define rx_settle(wait) 0
 #endif
 
 static int rtl_bb_rx()

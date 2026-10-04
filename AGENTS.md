@@ -189,10 +189,12 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `PKT_BUFS_IN_HIRAM` | `1` | packet buffers and the CD-DA staging buffer in `.hiram` instead of BSS | saves 5440 B |
 | `WITH_CDDA` | `1` | CD-DA engine (§4.13) and `g2dma.c` | ~5.2 KB |
 | `WITH_LAN_ADAPTER` | `1` | HIT-0300 driver; 0 = BBA only | ~2 KB |
+| `WITH_BBA` | `1` | HIT-0400 driver (`rtl8139.c`); 0 = LAN Adapter only, and no asynchronous reads, RX interrupt, RX DMA or idle listen | ~4 KB |
+| `DCLOAD_OS` | `all` | `katana`, `kos` or `wince`: leave out what that kind of title never runs (§4.18); sets `WITH_KATANA`/`WITH_KOS`/`WITH_WINCE` and the defaults of `WITH_IRQ_HOOK`, `GD_ASYNC_KATANA`, `IRQ_IDLE_LISTEN`, `RTL_RX_DMA` | up to ~4 KB |
 | `WITH_MAPLE` | `1` | serve `MAPL` | ~650 B |
 | `WITH_PMCR_CMD` | `0` | serve `PMCR` (`perfctr.c` stays); no host sends it | ~800 B |
 | `WITH_GD_SPINDOWN` | `0` | stop the real drive at boot (§4.14) | 160 B |
-| `WITH_IRQ_HOOK` | `1` | the interrupt hook (§4.15) | ~800 B |
+| `WITH_IRQ_HOOK` | `1` (`0` for `kos`) | the interrupt hook (§4.15) | ~800 B |
 | `GD_ASYNC_KATANA` | `1` | the hook in Katana titles too, and their disc reads through the asynchronous engine (§4.5); needs `WITH_IRQ_HOOK` | ~150 B |
 | `GA_KATANA_READS` | `1` | with `GD_ASYNC_KATANA`, 0 keeps the hook (CD-DA from the tick, idle listen) but serves Katana reads synchronously | -- |
 | `WITH_MARK_CMD` | `1` HIGH, `0` LOW | serve `MARK` (§8) | 432 B |
@@ -600,7 +602,7 @@ loader there before uploading the title. Things this must not break:
 `loaders/dcload-relocatable.elf` at `0x8ce00000` with `DCLOAD_EMIT_RELOCS=1`
 (`LOADER_BASES` is empty; list bases there to get pre-linked ELFs back). It
 does not deploy: copy the ELF to the host's `loaders/` and prove the copy by
-md5 (§14.19). **One set is kept there**; an A/B is a build into a directory of
+md5 (§14.19). It also links the twelve variants of §4.18 next to it. **One set is kept there**; an A/B is a build into a directory of
 its own, passed with `--loader-dir` — a flycast set needs
 `DREAMCAST_IP=192.168.1.130 CDDA_TICKS_X8192=580480` (§3.5, §4.13). The host
 relocates the image to any base in either family:
@@ -1079,6 +1081,35 @@ isoldr's `HAVE_MULTI_DISC`.
 - Cost: HIGH `_end` = base+`0x9d44`, `.gdstage` ended 1696 B under `_stack`,
   after `GD_STAGE_BIG_SECTORS` went from 4 to 3 (default in `cdfs_syscalls.c`;
   only Windows CE's staged reads use it).
+
+### 4.18 Loader variants
+
+`make loaders` builds, next to the universal `dcload-relocatable.elf`, one
+relocatable image per network driver × kind of title × CD-DA:
+`dcload-{bba,lan}-{katana,kos,wince}-{cdda,nocdda}.elf` (`LOADER_DRIVERS`,
+`LOADER_OSES`). Each leaves out what its case never runs, so that a loader can
+fit where the universal one does not (§4.6). `MAPL` is kept in all of them.
+
+| `DCLOAD_OS` | Left out |
+| --- | --- |
+| `katana` | CE paths (`gd_mmu_on()` is 0: staging, page walk, MMU retries), CE's interrupt entry, KOS paths (`g_gd_kos` is the constant 0), the host file syscalls (crt0's table answers -1: `dc_nosys`, `syscalls.c`) |
+| `kos` | the interrupt hook (KOS's table is never recognised), CE paths |
+| `wince` | the Katana entry, the RX interrupt and RX DMA, KOS paths, file syscalls |
+
+- `bba` = `WITH_LAN_ADAPTER=0`, `lan` = `WITH_BBA=0`. A LAN Adapter build
+  has no fine deadline: its loop never read one (`adapter.c` defines the
+  variables for the shared code), so its waits end on the seconds timeout.
+- `all` builds byte for byte as before the variants: the object order is
+  kept in `DCLOBJECTS` on purpose. Check the md5 of `dcload.bin` and
+  `dcload-relocatable.elf` against the previous build after touching any of
+  these guards.
+- Image (`_end - base`) on 2026-10-04: universal 40452; `bba-katana-cdda`
+  34764, `-nocdda` 28728; `bba-kos` 33368 / 27016; `bba-wince` 34464 /
+  28316; `lan-katana` 30668 / 24540; `lan-kos` 31920 / 25584; `lan-wince`
+  31028 / 24908. `.hiram` stays 9.2-11.8 KB in high RAM. All relocate to
+  `0x8c004000`, `0x8ce00000`, `0x8cee0000`, `0x8cfe0000`.
+- **The host does not pick them yet**: it chainloads the universal image.
+  Not measured on hardware or under flycast.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 

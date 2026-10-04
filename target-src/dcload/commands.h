@@ -108,6 +108,8 @@ void cmd_pmcr(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #endif
 #if WITH_MARK_CMD
 void cmd_mark(ip_header_t * ip, udp_header_t * udp, command_t * command);
+#endif
+#if WITH_DISC_SWAP
 void cmd_disc(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #endif
 

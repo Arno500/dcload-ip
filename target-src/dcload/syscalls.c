@@ -43,7 +43,9 @@ unsigned char* syscall_data; // Used by cmd_retval and gdbpacket syscall
  * side-channel for; CD-DA uses it to carry the clock trim (cdda.c). */
 unsigned int syscall_retsize = 0;
 
+#if WITH_KOS
 static struct dirent our_dir; // Here's a global array
+#endif
 
 /* send command, enable bb, bb_loop(), then return */
 // Not all commands do bb_loop, though, like dcexit
@@ -83,6 +85,12 @@ void build_send_packet(int command_len)
 	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + command_len);
 }
 
+#if WITH_KOS
+/*
+ * THE HOST FILE SYSCALLS (crt0's table). Only a KOS title calls them -- and
+ * homebrew run from the CD's own build, which is DCLOAD_OS=all. A variant
+ * without KOS keeps the table, every entry answering -1 (below).
+ */
 /*
  * A RUNNING KOS TITLE'S CONSOLE IS SENT, NOT ASKED FOR (2026-10-02).
  *
@@ -123,6 +131,8 @@ static int console_write(int fd, const unsigned char *buf, size_t count)
 	return count;
 }
 
+#endif /* WITH_KOS */
+
 void dcexit(void)
 {
 	bb->stop(); // Disable packet RX
@@ -135,6 +145,7 @@ void dcexit(void)
 	build_send_packet(COMMAND_LEN); // Send exit packet to dc-tool
 }
 
+#if WITH_KOS
 // Receive a buffer from dc-tool
 int read(int fd, void *buf, size_t count)
 {
@@ -461,3 +472,35 @@ int rewinddir(DIR *dir)
 
 	return syscall_retval;
 }
+
+#else /* !WITH_KOS */
+
+int dc_nosys(void)
+{
+	return -1;
+}
+
+/* crt0's syscall table names them all: one answer for every entry. */
+__asm__(
+	".global _read\n.set _read,_dc_nosys\n"
+	".global _write\n.set _write,_dc_nosys\n"
+	".global _open\n.set _open,_dc_nosys\n"
+	".global _close\n.set _close,_dc_nosys\n"
+	".global _creat\n.set _creat,_dc_nosys\n"
+	".global _link\n.set _link,_dc_nosys\n"
+	".global _unlink\n.set _unlink,_dc_nosys\n"
+	".global _chdir\n.set _chdir,_dc_nosys\n"
+	".global _chmod\n.set _chmod,_dc_nosys\n"
+	".global _lseek\n.set _lseek,_dc_nosys\n"
+	".global _fstat\n.set _fstat,_dc_nosys\n"
+	".global _time\n.set _time,_dc_nosys\n"
+	".global _stat\n.set _stat,_dc_nosys\n"
+	".global _utime\n.set _utime,_dc_nosys\n"
+	".global _opendir\n.set _opendir,_dc_nosys\n"
+	".global _closedir\n.set _closedir,_dc_nosys\n"
+	".global _readdir\n.set _readdir,_dc_nosys\n"
+	".global _gethostinfo\n.set _gethostinfo,_dc_nosys\n"
+	".global _gdbpacket\n.set _gdbpacket,_dc_nosys\n"
+	".global _rewinddir\n.set _rewinddir,_dc_nosys\n");
+
+#endif /* WITH_KOS */

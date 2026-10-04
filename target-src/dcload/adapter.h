@@ -77,6 +77,12 @@ extern unsigned int g_warm_ip;
 extern adapter_t * bb;
 extern adapter_t adapter_la;
 extern adapter_t adapter_bba;
+/* The live driver is the BBA's: always false in a LAN Adapter only build. */
+#if WITH_BBA
+#define bb_is_bba() (bb == &adapter_bba)
+#else
+#define bb_is_bba() 0
+#endif
 
 // Set this variable to non-zero if you want the loop to exit.
 extern volatile unsigned char escape_loop;
@@ -155,14 +161,18 @@ extern unsigned int g_fine_timeouts;
  * the read's ReturnValue for its own. KOS masks its own dcload syscalls
  * (fs_dcload.c, plain_dclsc), so masking the GD side closes the pair.
  */
+#if WITH_KOS
 extern unsigned int g_gd_kos;
+#else
+#define g_gd_kos 0U	/* a variant without KOS paths (DCLOAD_OS, Makefile) */
+#endif
 
 static inline unsigned int bb_irq_hold(void)
 {
 	unsigned int sr;
 
 	__asm__ volatile ("stc sr,%0" : "=r" (sr));
-	if (((*(volatile unsigned int *)0xff000010U & 1U) || g_gd_kos)
+	if (((WITH_WINCE && (*(volatile unsigned int *)0xff000010U & 1U)) || g_gd_kos)
 	    && (~sr & 0xf0U))
 	{
 		__asm__ volatile ("ldc %0,sr" : : "r" (sr | 0xf0U) : "memory");

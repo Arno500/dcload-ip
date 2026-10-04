@@ -39,6 +39,12 @@
 
 #if WITH_IRQ_HOOK
 
+#if !WITH_BBA
+/* A LAN Adapter only build: no RX interrupt, no RX DMA (rx_iml stays 0). */
+#define rtl_rx_dma_bit() 0U
+#define rtl_irq_ack()    do { } while (0)
+#endif
+
 extern unsigned short irq_tramp[], irq_tramp_end[];
 extern unsigned int irq_tramp_stack[], irq_tramp_entry[];
 extern void irq_entry(void);
@@ -143,10 +149,12 @@ void irq_hook_check(void)
 	for (i = 0; i < TRAMP_FREE && (!t[i] || t[i] == SH_NOP); i++)
 	{
 	}
-	nops = t[TRAMP_FREE] == SH_NOP && t[TRAMP_FREE + 1] == SH_NOP
+	/* Each entry only in a build that serves its kind (DCLOAD_OS, Makefile). */
+	nops = WITH_KATANA && t[TRAMP_FREE] == SH_NOP && t[TRAMP_FREE + 1] == SH_NOP
 		&& t[TRAMP_FREE + 2] == SH_NOP;
 	if ((vbr >> 29) != 4U || i < TRAMP_FREE	/* P1 only: no TLB under BL */
-		|| (!nops && (t[TRAMP_FREE] != CE_INT_0
+		|| (!nops && (!WITH_WINCE
+			      || t[TRAMP_FREE] != CE_INT_0
 			      || t[TRAMP_FREE + 1] != CE_INT_1
 			      || t[TRAMP_FREE + 2] != CE_INT_2)))
 	{
@@ -190,7 +198,7 @@ void irq_hook_check(void)
 	g_irq_nop_entry = nops;
 	rx_iml = 0;
 	g_irq_rx_evt = 0;
-	if (nops)
+	if (nops && WITH_BBA)
 	{
 		/* IML2 (IRL 13, INTEVT 0x3a0), IML4 (IRL 11, 0x360), IML6 (IRL 9,
 		 * 0x320) -- KOS asic.c: "691x -> irq 13 ... 693x -> irq 9". The
@@ -229,7 +237,10 @@ void irq_hook_check(void)
 
 void irq_tick(void)
 {
-	static unsigned int cdda_mark, read_mark;
+	static unsigned int read_mark;
+#if WITH_CDDA
+	static unsigned int cdda_mark;
+#endif
 #if IRQ_IDLE_LISTEN
 	static unsigned int listen_mark;
 #endif

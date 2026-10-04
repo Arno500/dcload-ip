@@ -272,6 +272,34 @@ CFLAGS += -DPKT_BUFS_IN_HIRAM=$(PKT_BUFS_IN_HIRAM)
 WITH_LAN_ADAPTER ?= 1
 CFLAGS += -DWITH_LAN_ADAPTER=$(WITH_LAN_ADAPTER)
 
+# Build the HIT-0400 BBA driver (rtl8139.c). 0 = a LAN Adapter only loader,
+# the host's choice once it knows which adapter answered (`make loaders`
+# builds one set per adapter). Asynchronous reads, the RX interrupt, RX DMA
+# and the idle listen are BBA only and go with it.
+WITH_BBA ?= 1
+CFLAGS += -DWITH_BBA=$(WITH_BBA)
+ifeq ($(WITH_BBA)$(WITH_LAN_ADAPTER),00)
+  $(error WITH_BBA=0 and WITH_LAN_ADAPTER=0: no network driver left)
+endif
+
+# Which titles the loader serves (AGENTS.md 4.18). `all` (the CD's build and
+# the universal set) serves every kind; a variant leaves out what its kind
+# never runs:
+#   katana  -- no Windows CE paths (MMU staging, CE page walk, CE's interrupt
+#              entry), no host file syscalls, no KOS paths;
+#   kos     -- the host file syscalls and the KOS console; no interrupt hook
+#              (KOS's vector table is never recognised), no CE paths;
+#   wince   -- the MMU paths and CE's entry; no Katana entry, no RX interrupt,
+#              no RX DMA, no file syscalls, no KOS paths.
+DCLOAD_OS ?= all
+ifeq ($(filter $(DCLOAD_OS),all katana kos wince),)
+  $(error DCLOAD_OS must be all, katana, kos or wince, not '$(DCLOAD_OS)')
+endif
+WITH_KATANA := $(if $(filter all katana,$(DCLOAD_OS)),1,0)
+WITH_KOS    := $(if $(filter all kos,$(DCLOAD_OS)),1,0)
+WITH_WINCE  := $(if $(filter all wince,$(DCLOAD_OS)),1,0)
+CFLAGS += -DWITH_KATANA=$(WITH_KATANA) -DWITH_KOS=$(WITH_KOS) -DWITH_WINCE=$(WITH_WINCE)
+
 # Serve the MAPL command (host-to-DC Maple passthrough) and the driver behind
 # it. Worth 656 bytes. A session that only boots a title never uses it;
 # with this at 0 a MAPL packet is simply not answered.
@@ -416,14 +444,14 @@ CFLAGS += -DWITH_PMCR_CMD=$(WITH_PMCR_CMD)
 # runs on the title's interrupts and not only when the title calls it. Only a
 # table showing CE's exact interrupt entry is patched; anything else is left
 # alone and the GD path works as without it.
-WITH_IRQ_HOOK ?= 1
+WITH_IRQ_HOOK ?= $(if $(filter 1,$(WITH_KATANA) $(WITH_WINCE)),1,0)
 CFLAGS += -DWITH_IRQ_HOOK=$(WITH_IRQ_HOOK)
 
 # Katana titles' disc reads served asynchronously too (AGENTS.md 4.5): the
 # interrupt hook goes into their vector table as well (their entry starts with
 # nops, irq.c), and its tick moves the read while the title runs, as under
 # Windows CE. 0 = no hook for them, the synchronous loop.
-GD_ASYNC_KATANA ?= 1
+GD_ASYNC_KATANA ?= $(if $(filter 11,$(WITH_KATANA)$(WITH_IRQ_HOOK)),1,0)
 CFLAGS += -DGD_ASYNC_KATANA=$(GD_ASYNC_KATANA)
 
 # The interrupt hook's tick listens to the network (at most 1 ms, every 50 ms)
@@ -433,14 +461,14 @@ CFLAGS += -DGD_ASYNC_KATANA=$(GD_ASYNC_KATANA)
 # the wire only inside GD waits. BBA only; costs up to 2 % of the CPU, with
 # SR.BL set, while the title is not loading. Off in the LOW (CD) build for its
 # bytes: the host chainloads its own set before any disc image.
-IRQ_IDLE_LISTEN ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+IRQ_IDLE_LISTEN ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,$(if $(filter 11,$(WITH_BBA)$(WITH_IRQ_HOOK)),1,0))
 CFLAGS += -DIRQ_IDLE_LISTEN=$(IRQ_IDLE_LISTEN)
 
 # The BBA's RX frames by G2 DMA from the hook's tick (AGENTS.md 4.16). 0 takes
 # every frame by CPU, as before 2026-09-28 -- the A/B for a title that the DMA
 # might disturb. Off in the LOW (CD) build, for its bytes: the host chainloads
 # its own set before any disc image.
-RTL_RX_DMA ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+RTL_RX_DMA ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,$(if $(filter 111,$(WITH_BBA)$(WITH_KATANA)$(WITH_IRQ_HOOK)),1,0))
 CFLAGS += -DRTL_RX_DMA=$(RTL_RX_DMA)
 
 # With GD_ASYNC_KATANA, 0 keeps the hook in Katana titles (CD-DA from the
@@ -479,12 +507,19 @@ endif
 OBJCOPY	= $(TARGETOBJCOPY)
 READELF	= $(TARGETREADELF)
 
-DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o video.o memcpy.o memcmp.o memfuncs.o packet.o net.o adapter.o rtl8139.o dhcp.o dcload.o perfctr.o cdfs_redir.o cdfs_syscalls.o syscalls.o commands.o
+# The link order is kept as it was before the variants (2026-10-04), so that
+# the default build stays byte for byte the same.
+DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o video.o memcpy.o memcmp.o memfuncs.o packet.o net.o adapter.o $(if $(filter 1,$(WITH_BBA)),rtl8139.o) dhcp.o dcload.o perfctr.o cdfs_redir.o cdfs_syscalls.o syscalls.o commands.o
 ifeq ($(WITH_LAN_ADAPTER),1)
   DCLOBJECTS += lan_adapter.o
 endif
 ifeq ($(WITH_CDDA),1)
-  DCLOBJECTS += cdda.o g2dma.o
+  DCLOBJECTS += cdda.o
+endif
+# The hook suspends the title's G2 DMA, the BBA's RX may go by DMA, and CD-DA
+# writes its rings by DMA: g2dma.c serves all three.
+ifneq ($(filter 1,$(WITH_CDDA) $(WITH_IRQ_HOOK) $(WITH_BBA)),)
+  DCLOBJECTS += g2dma.o
 endif
 
 ifeq ($(G2DMA_BENCH),1)
@@ -602,6 +637,25 @@ LOADER_DIR   = loaders
 # every address in it, in either layout family. This one is SCRATCH_BASE on the
 # host side, so an unrelocated copy still lands somewhere sane.
 LOADER_RELOC_BASE = 0x8ce00000
+# The variants `make loaders` builds next to the universal image: every
+# combination of these, CD-DA or not. Empty either list to skip them.
+LOADER_DRIVERS = bba lan
+LOADER_OSES    = katana kos wince
+
+# One relocatable image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
+# The relocations are the whole point of it, and objcopy is well within its
+# rights to drop them: fail rather than ship an ELF the host would refuse to move.
+define reloc_loader
+$(MAKE) --no-print-directory clean >/dev/null || exit 1; \
+$(MAKE) --no-print-directory DCLOAD_BASE=$(LOADER_RELOC_BASE) DCLOAD_EMIT_RELOCS=1 $(2) \
+         dcload exception.bin >/dev/null || exit 1; \
+$(OBJCOPY) --add-section .guestvbr=exception.bin \
+           --set-section-flags .guestvbr=alloc,load,contents,readonly \
+           --change-section-address .guestvbr=$(DCLOAD_GUEST_VBR) \
+           dcload $(LOADER_DIR)/$(1) || exit 1; \
+$(READELF) -S $(LOADER_DIR)/$(1) | grep -q '\.rela\.text' || \
+  { echo "[loaders] ERROR: relocations did not survive objcopy in $(1)"; exit 1; }
+endef
 
 .PHONY : loaders
 loaders:
@@ -638,18 +692,17 @@ loaders:
 	@# than shipping a vector table that jumps to the wrong base on the first
 	@# exception a title takes.
 	@echo "[loaders] linking relocatable dcload at $(LOADER_RELOC_BASE)"
-	@$(MAKE) --no-print-directory clean >/dev/null || exit 1
-	@$(MAKE) --no-print-directory DCLOAD_BASE=$(LOADER_RELOC_BASE) DCLOAD_EMIT_RELOCS=1 \
-	         dcload exception.bin >/dev/null || exit 1
-	@$(OBJCOPY) --add-section .guestvbr=exception.bin \
-	           --set-section-flags .guestvbr=alloc,load,contents,readonly \
-	           --change-section-address .guestvbr=$(DCLOAD_GUEST_VBR) \
-	           dcload $(LOADER_DIR)/dcload-relocatable.elf || exit 1
-	@# The relocations are the whole point of that image, and objcopy is well
-	@# within its rights to drop them. Fail here rather than ship an ELF the
-	@# host would silently refuse to move.
-	@$(READELF) -S $(LOADER_DIR)/dcload-relocatable.elf | grep -q '\.rela\.text' || \
-	  { echo "[loaders] ERROR: relocations did not survive objcopy"; exit 1; }
+	@$(call reloc_loader,dcload-relocatable.elf,)
+	@# The variants (AGENTS.md 4.18): one per network driver, kind of title and
+	@# CD-DA or not, each the same relocatable image with what it never runs
+	@# left out. The host picks one once it knows the adapter and the title;
+	@# dcload-relocatable.elf above serves everything and stays the fallback.
+	@for drv in $(LOADER_DRIVERS); do for os in $(LOADER_OSES); do for cd in 1 0; do \
+	  name=dcload-$$drv-$$os-$$( [ $$cd = 1 ] && echo cdda || echo nocdda ).elf; \
+	  flags="DCLOAD_OS=$$os WITH_CDDA=$$cd $$( [ $$drv = bba ] && echo WITH_LAN_ADAPTER=0 || echo WITH_BBA=0 )"; \
+	  echo "[loaders] linking $$name ($$flags)"; \
+	  $(call reloc_loader,$$name,$$flags); \
+	done; done; done
 	@$(MAKE) --no-print-directory clean >/dev/null && $(MAKE) --no-print-directory all >/dev/null
 	@echo "[loaders] built:" && ls -l $(LOADER_DIR)
 

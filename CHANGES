@@ -1,5 +1,8 @@
 WHAT'S NEW IN 2.0.4
 
+* Loader variants: `make loaders` also builds one relocatable image per
+  network driver (BBA, LAN Adapter), kind of title (Katana, KOS, Windows CE)
+  and CD-DA or not, each leaving out what its case never runs (§4.18).
 * Disc swap in game: `dcload-ip-rs swap-disc <image>` makes the served disc
   change; the title sees the lid open then close (`DISC` command, §4.17).
 * GD-ROM drive emulation for retail titles: dcload answers a launched title's

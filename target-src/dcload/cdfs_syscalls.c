@@ -501,7 +501,9 @@ unsigned int g_gd_park_longs;
  * It also sends KOS's console writes as DC25 (syscalls.c) and masks the
  * adapter waits (bb_irq_hold(), adapter.h): the host points KOS's console here.
  */
+#if WITH_KOS
 unsigned int g_gd_kos;
+#endif
 
 /*
  * Non-zero while a disc read (ReadSectors, GetTOC) waits in bb->loop().
@@ -773,6 +775,10 @@ static unsigned int gd_stage_big[GD_STAGE_BIG_SECTORS * 512]
 /* The title runs with address translation on (MMUCR.AT): Windows CE. */
 static int gd_mmu_on(void)
 {
+	if (!WITH_WINCE)
+	{
+		return 0;	/* a variant that never serves CE: its paths fold away */
+	}
 	return *(volatile unsigned int *)0xff000010U & 1U;
 }
 
@@ -1366,7 +1372,7 @@ volatile unsigned int g_ga_wakes;	/* the thread resumed with a chunk on the wire
 #endif
 static int gd_async_on(void)
 {
-	return bb == &adapter_bba && g_irq_hooked
+	return bb_is_bba() && g_irq_hooked
 	    && ((GD_ASYNC_KATANA && GA_KATANA_READS) || gd_mmu_on());
 }
 
@@ -1722,7 +1728,7 @@ static void ga_listen(void)
  * nothing for its whole length). */
 int gd_idle_listen(void)
 {
-	if (ga_state != GA_IDLE || g_gd_in_transfer || bb != &adapter_bba)
+	if (ga_state != GA_IDLE || g_gd_in_transfer || !bb_is_bba())
 	{
 		return 0;
 	}
@@ -3016,7 +3022,7 @@ int gdGdcGetDrvStat(int *status)
 	/* Only between commands: a title's interrupt handler calls this too, and
 	 * stopping the audio inside a read's wait or a service is invariant 2. */
 	if (g_disc_pending && !g_gd_in_transfer && !cdda_busy
-	    && !gd_async_busy() && _GDS.status != CMD_STAT_STREAMING)
+	    && !(WITH_IRQ_HOOK && gd_async_busy()) && _GDS.status != CMD_STAT_STREAMING)
 	{
 		g_disc_pending = 0;
 		cdda_disc_changed();
