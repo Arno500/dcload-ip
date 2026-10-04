@@ -116,8 +116,10 @@
 #define CMD_WAIT_IRQ            0x01
 
 /* Drive status, as returned by gdGdcGetDrvStat. */
+#define CD_STATUS_BUSY          0x00
 #define CD_STATUS_PAUSED        0x01
 #define CD_STATUS_PLAYING       0x03
+#define CD_STATUS_OPEN          0x06
 
 /* Media type. */
 #define CD_GDROM                0x80
@@ -125,7 +127,32 @@
 /* Sense keys the BIOS reports through status[0]/status[1]. */
 #define CMD_ERR_NOERROR         0
 #define CMD_ERR_HARDWARE        15
+#define CMD_ERR_NOTREADY        2
+#define CMD_ERR_UNITATTENTION   6
 #define CMD_ERR_ILLEGALREQUEST  32
+
+#if WITH_DISC_SWAP
+/*
+ * Disc swap (§4.17), counted in gdGdcGetDrvStat calls like isoldr's
+ * HAVE_MULTI_DISC (~60 a second in a title's frame loop): lid open at the
+ * second call, closed after DISC_SWAP_CLOSE_CALLS, and once past DISC_SWAP_ATTN_CALLS the next command
+ * is answered UNIT ATTENTION, once, as a drive does. The count stops at DISC_SWAP_COUNT_MAX.
+ */
+#ifndef DISC_SWAP_CLOSE_CALLS
+#define DISC_SWAP_CLOSE_CALLS 240
+#endif
+/* After the lid closes the drive recognises the disc: commands fail NOT
+ * READY with ASC 0x104 for this many calls (gdFs: -37, GDD_ERR_CHECKBUSY),
+ * then the first one gets UNIT ATTENTION. */
+#ifndef DISC_SWAP_CHECK_CALLS
+#define DISC_SWAP_CHECK_CALLS 120
+#endif
+#define DISC_SWAP_CHECK_END (DISC_SWAP_CLOSE_CALLS + DISC_SWAP_CHECK_CALLS)
+#ifndef DISC_SWAP_ATTN_CALLS
+#define DISC_SWAP_ATTN_CALLS (DISC_SWAP_CHECK_END + 30)
+#endif
+#define DISC_SWAP_COUNT_MAX 1023
+#endif
 
 #define GDC_CHN_ERROR           0
 #define GDC_PARAMS_COUNT        4
@@ -386,6 +413,10 @@ typedef struct gd_state {
 	unsigned int sec_size;
 	unsigned int mode;
 	unsigned int flags;
+
+	unsigned int disc_change;	/* GetDrvStat calls since a swap; 0 = none */
+	int need_reinit;		/* UNIT ATTENTION until CMD_INIT */
+	int asc;			/* status[1] of a NOT READY (§4.17) */
 } gd_state_t;
 
 /*
@@ -734,7 +765,7 @@ HIRAM_BUF static unsigned int gd_stage[GD_STAGE_SECTORS * 512]
  * synchronous, pays one round trip more per 20 sectors.
  */
 #ifndef GD_STAGE_BIG_SECTORS
-#define GD_STAGE_BIG_SECTORS 4
+#define GD_STAGE_BIG_SECTORS 3
 #endif
 static unsigned int gd_stage_big[GD_STAGE_BIG_SECTORS * 512]
 	__attribute__((section(".gdstage"), aligned(32)));
@@ -744,6 +775,38 @@ static int gd_mmu_on(void)
 {
 	return *(volatile unsigned int *)0xff000010U & 1U;
 }
+
+/*
+ * GD_RING_TRACE (diagnostic, never in a shipped set): the last 512 GD syscalls
+ * as three words each, kept in gd_stage_big -- unused under a Katana title,
+ * which has no MMU -- so it costs no BSS. Read with GDB/SBIQ at gd_stage_big.
+ *   w0 = kind << 24 | a << 8 | b      w1, w2 = values (see the callers)
+ * kind 1 ReqCmd: a = cmd, b = 0, w1 = channel returned, w2 = req_count
+ * kind 2 GetCmdStat: a = channel, b = rv + 1, w1 = status[0] | status[1] << 16,
+ *        w2 = status[2] | status[3] << 16 (before the call returns)
+ * kind 3 GetDrvStat: a = rv, b = 0, w1 = status[0], w2 = status[1]
+ */
+#ifndef GD_RING_TRACE
+#define GD_RING_TRACE 0
+#endif
+#if GD_RING_TRACE
+unsigned int g_gdr_n;
+static void gdr(unsigned int kind, unsigned int a, unsigned int b,
+		unsigned int w1, unsigned int w2)
+{
+	if (!gd_mmu_on() && GD_STAGE_BIG_SECTORS >= 3)
+	{
+		unsigned int *r = &gd_stage_big[(g_gdr_n & 0x1ff) * 3];
+
+		r[0] = (kind << 24) | ((a & 0xffff) << 8) | (b & 0xff);
+		r[1] = w1;
+		r[2] = w2;
+		g_gdr_n++;
+	}
+}
+#else
+#define gdr(k, a, b, w1, w2) do { } while (0)
+#endif
 
 static int gd_retries_left(int retries)
 {
@@ -1129,6 +1192,37 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 
 	g_cdfs_sync_chunks++;
 	return CMD_STAT_COMPLETED;
+}
+
+/*
+ * BootROM service 2, syBtCheckDisc (cdfs_redir.s, sysvec_redir). The BIOS
+ * answers it from the drive; this answers it from the image being served:
+ * 0 once the first 7 sectors of the boot sector's IP.BIN sit at 0x8c008100,
+ * which is where syBtGetCurrentSystemID reads the disc's number and product
+ * from (the boot disc's copy is at 0x8c008000). Negative while the lid is
+ * open or the drive is "checking" (§4.17), as the BIOS answers.
+ */
+#define IP_BIN_CURRENT_ADDR 0x8c008100U
+#define IP_BIN_CURRENT_SECTORS 7
+int gd_bios_check_disc(void)
+{
+#if WITH_DISC_SWAP
+	unsigned int saved_size;
+	int st;
+
+	if (_GDS.disc_change && _GDS.disc_change <= DISC_SWAP_CHECK_END)
+	{
+		return -1;
+	}
+	saved_size = _GDS.sec_size;
+	_GDS.sec_size = 2048;
+	st = ReadSectors(IP_BIN_CURRENT_ADDR, GD_BOOT_SECTOR_LBA,
+			 IP_BIN_CURRENT_SECTORS);
+	_GDS.sec_size = saved_size;
+	return (st == CMD_STAT_COMPLETED) ? 0 : -1;
+#else
+	return 0;
+#endif
 }
 
 #if GD_TRACE && GD_TRACE_VADDR
@@ -1921,9 +2015,15 @@ static void data_transfer(void)
 	/* Posted at once, not after the yield below: the chunk is on the wire
 	 * while the title runs, and a read costs one frame less. The title still
 	 * sees PROCESSING first -- the answer takes ~2 ms, the loop yields long
-	 * before. */
-	if (_GDS.param[1] && gd_async_on()
-	    && (_GDS.param[1] > 1 || gd_is_virtual(_GDS.param[2])))
+	 * before.
+	 *
+	 * ONE SECTOR TOO (2026-10-03). Served synchronously, a Katana title's
+	 * one-sector read had the CPU read the BBA through G2 with the title's
+	 * interrupts on and its G2 DMA running (AGENTS.md 4.5, known gaps); the
+	 * tick reads it with SR.BL set and that DMA suspended. Shenmue II froze
+	 * twice right after one into 0x8c282f00, deaf, the AICA looping its ring
+	 * (2026-10-02, -03). Same latency: the synchronous path yields first. */
+	if (_GDS.param[1] && gd_async_on())
 	{
 		data_transfer_async();
 		_GDS.ata_status = CMD_WAIT_INTERNAL;
@@ -1951,11 +2051,10 @@ static void data_transfer(void)
 	}
 
 	/*
-	 * Single shot, blocking, in three cases -- isoldr's SD path exactly
-	 * (loader/syscalls.c:542-545):
+	 * Single shot, blocking, in two cases -- isoldr's SD path, less its
+	 * one-sector case (loader/syscalls.c:542-545):
 	 *
 	 *   - chunking disabled;
-	 *   - one sector, where slicing buys nothing;
 	 *   - GD_BULK_SECTORS or more, and this is the one that is easy to miss.
 	 *     isoldr's own comment: "It's looks like the game in loading state
 	 *     (request big data), so we can increase general loading speed if load
@@ -1966,18 +2065,22 @@ static void data_transfer(void)
 	 * Sonic Adventure issues a 105-sector read immediately before the read it
 	 * has always died on, so this is not a hypothetical difference.
 	 *
-	 * NOT FOR KOS (g_gd_kos): this path never retries, and KOS does not
-	 * either -- a FAILED read is EIO, a short fread, and the GTA III port's
-	 * librw asserts and exits (2026-10-02, one lost request under flycast, in
-	 * MISC.TXD). Its one-sector reads take data_transfer_emu_async() and its
-	 * retries; KOS's vblank handler resumes the server after the yield.
+	 * THIS PATH NEVER RETRIES: one lost frame and the title is told FAILED.
+	 * So one-sector reads take data_transfer_emu_async() and its retries --
+	 * same round trip, a yield and a re-ask only on a loss. They came here
+	 * until 2026-10-03: under KOS a FAILED read is EIO and the GTA III port's
+	 * librw exited (2026-10-02, MISC.TXD); a Katana title reports it, and
+	 * Shenmue II stopped on "Data Read Error -26 TEXTURES.PKS" after one ring
+	 * resync (g_cdfs_read_fails 1, g_cdfs_read_retries 0). The bulk case is
+	 * kept from KOS for the same reason (its vblank handler resumes the
+	 * server after a retry's yield).
 	 */
 #if GD_BULK_SECTORS > 0
-	if (((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1) ||
+	if (((GD_EMU_ASYNC == 0) ||
 	     (_GDS.param[1] >= (unsigned int)GD_BULK_SECTORS))
 	    && !gd_is_virtual(_GDS.param[2]) && !g_gd_kos)
 #else
-	if (((GD_EMU_ASYNC == 0) || (_GDS.param[1] == 1))
+	if ((GD_EMU_ASYNC == 0)
 	    && !gd_is_virtual(_GDS.param[2]) && !g_gd_kos)
 #endif
 	{
@@ -2382,6 +2485,9 @@ static void reset_GDS(void)
 	_GDS.sec_size = 2048;
 	_GDS.mode = 1024;
 	_GDS.flags = 8192;
+	_GDS.disc_change = 0;
+	_GDS.need_reinit = 0;
+	_GDS.asc = 0;
 }
 
 /*
@@ -2407,6 +2513,40 @@ void gdcServerMain(void)
 
 		if (_GDS.status == CMD_STAT_PROCESSING)
 		{
+#if WITH_DISC_SWAP
+		  if (_GDS.disc_change >= 2 && _GDS.disc_change <= DISC_SWAP_CHECK_END)
+		  {
+			/* The lid is open, then the drive checks the new disc: every
+			 * command fails NOT READY, as a drive does. Shenmue II polls
+			 * CMD_GETSCD every frame and gdFs turns key 2 with ASC 0x3a into
+			 * -23 (TRAYOPEND) and with 0x104 into -37 (CHECKBUSY), the two
+			 * steps its swap screen waits for (§4.17). */
+			_GDS.err = CMD_ERR_NOTREADY;
+			if (_GDS.disc_change <= DISC_SWAP_CLOSE_CALLS)
+			{
+				_GDS.asc = 0x3a;
+				_GDS.ata_status = 6;
+			}
+			else
+			{
+				_GDS.asc = 0x104;
+				_GDS.ata_status = 0;
+			}
+			_GDS.status = CMD_STAT_COMPLETED;
+		  }
+		  else if (_GDS.need_reinit && _GDS.cmd != CMD_INIT)
+		  {
+			/* A new disc: the first command after the lid closed fails
+			 * once, as on a drive; the title retries or re-inits. */
+			_GDS.need_reinit = 0;
+			g_disc_ua++;
+			_GDS.asc = 0;
+			_GDS.err = CMD_ERR_UNITATTENTION;
+			_GDS.status = CMD_STAT_COMPLETED;
+		  }
+		  else
+#endif
+		  {
 			switch (_GDS.cmd)
 			{
 			case CMD_PIOREAD:
@@ -2482,6 +2622,12 @@ void gdcServerMain(void)
 				get_scd();
 				break;
 			case CMD_INIT:
+#if WITH_DISC_SWAP
+				/* The title is re-initialising: no attention to give. */
+				_GDS.need_reinit = 0;
+#endif
+				_GDS.status = CMD_STAT_COMPLETED;
+				break;
 			case CMD_NOP:
 			case CMD_REQ_MODE:
 			case CMD_SET_MODE:
@@ -2492,6 +2638,7 @@ void gdcServerMain(void)
 				_GDS.status = CMD_STAT_COMPLETED;
 				break;
 			}
+		  }
 		}
 
 		gdcExitToGame();
@@ -2642,6 +2789,39 @@ static void gd_service_net(void)
 #define gd_service_net() do { } while (0)
 #endif
 
+#if WITH_DISC_SWAP
+unsigned int g_disc_swaps;		/* generations accepted */
+unsigned int g_disc_swap_busy;		/* answered "busy" */
+volatile unsigned int g_disc_pending;	/* accepted, lid not started yet */
+unsigned int g_disc_lid;		/* disc_change as last seen by GetDrvStat */
+unsigned int g_disc_ua;			/* commands answered UNIT ATTENTION */
+static unsigned int g_disc_gen;
+
+/*
+ * DISC from the host (cmd_disc). Accepted only between GD commands, so every
+ * read served before the answer is the old disc's and every one after is the
+ * new one's: the host installs the new image on this answer. Runs inside a
+ * network wait, so it only notes the request; gdGdcGetDrvStat plays the lid.
+ */
+int gd_disc_request(unsigned int generation)
+{
+	if (generation && generation == g_disc_gen)
+	{
+		return 0;
+	}
+	if (g_gd_in_transfer || _GDS.status == CMD_STAT_PROCESSING
+	    || _GDS.status == CMD_STAT_STREAMING)
+	{
+		g_disc_swap_busy++;
+		return 1;
+	}
+	g_disc_gen = generation;
+	g_disc_swaps++;
+	g_disc_pending = 1;
+	return 0;
+}
+#endif
+
 int gdGdcReqCmd(int cmd, int *param)
 {
 	int gd_chn = GDC_CHN_ERROR;
@@ -2717,6 +2897,7 @@ int gdGdcReqCmd(int cmd, int *param)
 	}
 
 	gd_give();
+	gdr(1, (unsigned int)cmd, 0, (unsigned int)gd_chn, (unsigned int)_GDS.req_count);
 	return gd_chn;
 }
 
@@ -2766,6 +2947,13 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 		if (_GDS.err)
 		{
 			status[0] = _GDS.err;
+			/* NOT READY comes with ASC 0x3a, "medium not present": the gdFs
+			 * layer only calls it TRAYOPEND (-23) with that code and a drive
+			 * status of OPEN or BUSY (§4.17). */
+			if (_GDS.err == CMD_ERR_NOTREADY)
+			{
+				status[1] = _GDS.asc;
+			}
 			rv = CMD_STAT_FAILED;
 		}
 		else
@@ -2797,6 +2985,9 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 	}
 
 	gd_give();
+	gdr(2, (unsigned int)gd_chn, (unsigned int)(rv + 1),
+	    ((unsigned int)status[0] & 0xffff) | ((unsigned int)status[1] << 16),
+	    ((unsigned int)status[2] & 0xffff) | ((unsigned int)status[3] << 16));
 	gd_trace('S', (unsigned int)gd_chn, (unsigned int)rv,
 		 (unsigned int)status[2]);
 	return rv;
@@ -2804,6 +2995,8 @@ int gdGdcGetCmdStat(int gd_chn, int *status)
 
 int gdGdcGetDrvStat(int *status)
 {
+	int rv = 0;
+
 	g_gd_idx_counts[4]++;
 	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
@@ -2816,6 +3009,22 @@ int gdGdcGetDrvStat(int *status)
 	 * command state and the audio stream is not part of it. */
 	cdda_service();
 
+#if WITH_DISC_SWAP
+	/* Top level of a syscall: where the audio may be stopped. */
+	int lid_started = 0;
+
+	/* Only between commands: a title's interrupt handler calls this too, and
+	 * stopping the audio inside a read's wait or a service is invariant 2. */
+	if (g_disc_pending && !g_gd_in_transfer && !cdda_busy
+	    && !gd_async_busy() && _GDS.status != CMD_STAT_STREAMING)
+	{
+		g_disc_pending = 0;
+		cdda_disc_changed();
+		_GDS.disc_change = 1;
+		lid_started = 1;
+	}
+#endif
+
 	if (GD_TAKE(3))
 	{
 		return CMD_STAT_BUSY;
@@ -2823,15 +3032,58 @@ int gdGdcGetDrvStat(int *status)
 
 	/* PLAYING while there is music, whatever the data path is doing: a
 	 * title polls this to know whether its own PLAY took. */
+#if WITH_DISC_SWAP
+	if (cdda_state() == CDDA_PLAYING
+	    && !(_GDS.disc_change && _GDS.disc_change <= DISC_SWAP_CHECK_END))
+#else
 	if (cdda_state() == CDDA_PLAYING)
+#endif
 	{
 		_GDS.drv_stat = CD_STATUS_PLAYING;
 	}
+#if WITH_DISC_SWAP
+	if (_GDS.disc_change)
+	{
+		if (!lid_started && _GDS.disc_change < DISC_SWAP_COUNT_MAX)
+		{
+			_GDS.disc_change++;
+		}
+		if (_GDS.disc_change == 2)
+		{
+			_GDS.drv_stat = CD_STATUS_OPEN;
+			_GDS.drv_media = 0;		/* CD_CDDA */
+		}
+		else if (_GDS.disc_change == DISC_SWAP_CLOSE_CALLS + 1)
+		{
+			/* Lid closed: the drive is busy recognising the disc. */
+			_GDS.drv_stat = CD_STATUS_BUSY;
+			_GDS.drv_media = CD_GDROM;
+			rv = 2;
+		}
+		else if (_GDS.disc_change == DISC_SWAP_CHECK_END + 1)
+		{
+			/* Recognised. Only the transitions: afterwards the title owns the
+			 * status. */
+			_GDS.drv_stat = CD_STATUS_PAUSED;
+			rv = 2;
+		}
+		else if (_GDS.disc_change < 10)
+		{
+			rv = 1;
+		}
+		if (_GDS.disc_change == DISC_SWAP_ATTN_CALLS + 1)
+		{
+			_GDS.need_reinit = 1;
+		}
+		g_disc_lid = _GDS.disc_change;
+	}
+#endif
 	status[0] = _GDS.drv_stat;
 	status[1] = _GDS.drv_media;
 
 	gd_give();
-	return 0;
+	gdr(3, (unsigned int)rv, 0, (unsigned int)status[0], (unsigned int)status[1]);
+	return rv;
 }
 
 int gdGdcChangeDataType(int *param)

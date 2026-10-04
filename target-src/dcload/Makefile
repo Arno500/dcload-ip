@@ -291,6 +291,12 @@ CFLAGS += -DWITH_MAPLE=$(WITH_MAPLE)
 WITH_MARK_CMD ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
 CFLAGS += -DWITH_MARK_CMD=$(WITH_MARK_CMD)
 
+# DISC: the host swaps the served disc image in game; the GD emulation then
+# opens and closes the lid (§4.17). Off in the LOW (CD) family, which never
+# serves an image: the host chainloads the HIGH set first.
+WITH_DISC_SWAP ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+CFLAGS += -DWITH_DISC_SWAP=$(WITH_DISC_SWAP)
+
 # ---------------------------------------------------------------------------
 # CD-DA (cdda.c). The design is described at the top of cdda.c, the counters
 # and status in AGENTS.md 4.13.
@@ -449,6 +455,11 @@ CFLAGS += -DGA_KATANA_READS=$(GA_KATANA_READS)
 GA_FAIL_PROBE ?= 0
 CFLAGS += -DGA_FAIL_PROBE=$(GA_FAIL_PROBE)
 
+# The last 512 GD syscalls in gd_stage_big (cdfs_syscalls.c, GD_RING_TRACE):
+# Katana titles only, costs ~250 B. Diagnostic: never in a shipped set.
+GD_RING_TRACE ?= 0
+CFLAGS += -DGD_RING_TRACE=$(GD_RING_TRACE)
+
 # G2 DMA bench (g2bench.c, docs/g2-dma-investigation.md step 0): at boot,
 # measures which DMA channels reach the BBA's SRAM and the AICA on this
 # console, and runs a torture round (CPU PIO on the AICA while two DMAs are
@@ -457,18 +468,12 @@ CFLAGS += -DGA_FAIL_PROBE=$(GA_FAIL_PROBE)
 G2DMA_BENCH ?= 0
 CFLAGS += -DG2DMA_BENCH=$(G2DMA_BENCH)
 ifeq ($(G2DMA_BENCH),1)
-# The bench's ~1.2 KB would push .gdstage past _stack: two sectors less of it.
+# The bench's ~1.2 KB would push .gdstage past _stack: one sector less than the default.
 CFLAGS += -DGD_STAGE_BIG_SECTORS=2
 else ifeq ($(GA_FAIL_PROBE),1)
-# The probe's counters do not fit the HIGH family's 128 bytes: one sector less,
-# which only Windows CE's staged reads use.
-CFLAGS += -DGD_STAGE_BIG_SECTORS=3
-else ifeq ($(DCLOAD_IS_LOW),1)
-# The LOW (CD) build never serves a Windows CE title -- the host places those
-# in the HIGH family, and .gdstage is only used under the MMU -- so its stage is
-# one sector short, which pays for the G2 DMA channel bookkeeping (the image
-# had no room left under _stack, 2026-10-01).
-CFLAGS += -DGD_STAGE_BIG_SECTORS=3
+# The probe's counters do not fit the HIGH family's room: one sector less than
+# the default, which only Windows CE's staged reads use.
+CFLAGS += -DGD_STAGE_BIG_SECTORS=2
 endif
 
 OBJCOPY	= $(TARGETOBJCOPY)

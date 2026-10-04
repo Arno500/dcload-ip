@@ -22,6 +22,7 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 #define CMD_MAPLE    "MAPL" /* Maple packet */
 #define CMD_PMCR 		 "PMCR" /* Performance counter packet */
 #define CMD_MARK     "MARK" /* paint or check witness words in free RAM */
+#define CMD_DISC     "DISC" /* host swapped the disc image: open the lid, close it */
 
 #define COMMAND_LEN  12
 
@@ -38,6 +39,9 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 #endif
 #ifndef WITH_MARK_CMD
 #define WITH_MARK_CMD 1
+#endif
+#ifndef WITH_DISC_SWAP
+#define WITH_DISC_SWAP 1
 #endif
 
 extern unsigned int tool_ip;
@@ -81,6 +85,10 @@ extern unsigned int g_gd_stale_lbin;
 /* The ReturnValue a disc read waits for, GD_READ_TAG | its LBA; 0 = any.
  * See g_retval_want in commands.c. */
 #define GD_READ_TAG 0x40000000U
+/* A disc read whose LBA is this means "the sector the disc boots from": the
+ * host resolves it (DiscFormat::boot_sector), the loader cannot know (BootROM
+ * service 2, gd_bios_check_disc). Answered with this value in the tag. */
+#define GD_BOOT_SECTOR_LBA 0x3ffffffeU
 extern unsigned int g_retval_want;
 /* End the wait as soon as the window is complete, instead of on the host's
  * ReturnValue. See the definition. */
@@ -100,6 +108,7 @@ void cmd_pmcr(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #endif
 #if WITH_MARK_CMD
 void cmd_mark(ip_header_t * ip, udp_header_t * udp, command_t * command);
+void cmd_disc(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #endif
 
 #endif

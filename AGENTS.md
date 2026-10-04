@@ -196,9 +196,10 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `GD_ASYNC_KATANA` | `1` | the hook in Katana titles too, and their disc reads through the asynchronous engine (§4.5); needs `WITH_IRQ_HOOK` | ~150 B |
 | `GA_KATANA_READS` | `1` | with `GD_ASYNC_KATANA`, 0 keeps the hook (CD-DA from the tick, idle listen) but serves Katana reads synchronously | -- |
 | `WITH_MARK_CMD` | `1` HIGH, `0` LOW | serve `MARK` (§8) | 432 B |
+| `WITH_DISC_SWAP` | `1` HIGH, `0` LOW | serve `DISC`: the host swaps the served image, the lid opens and closes (§4.17) | ~520 B |
 | `IRQ_IDLE_LISTEN` | `1` HIGH, `0` LOW | the hook's tick listens to the network (≤ 1 ms every 50 ms) when nothing else owns it, so `--diag`, the stack watch and `MARK` are answered while a title does not read its disc | ~220 B |
 | `RTL_RX_DMA` | `1` HIGH, `0` LOW | the BBA's RX frames by G2 DMA from the tick (§4.16); 0 = every frame by CPU | ~150 B |
-| `GD_STAGE_BIG_SECTORS` | `4` HIGH, `3` LOW, `2` with the bench | size of `.gdstage` (§4.15) | 2 KB a sector |
+| `GD_STAGE_BIG_SECTORS` | `3` (`2` with the bench or `GA_FAIL_PROBE`) | size of `.gdstage` (§4.15) | 2 KB a sector |
 | `DCLOAD_GC_SECTIONS` | `1` | `--gc-sections`; also reveals dead code | saves 328 B |
 | `DCLOAD_LTO` | `0` | `-flto`. **Off on purpose**: it changes the depth of the C frame the GD coroutine parks (§4.5 — check `g_gd_park_longs` on hardware) and suppresses the `*.asm` listings | saves ~2.4 KB |
 
@@ -230,7 +231,7 @@ a build variable because it is per-game (§4.11). Defaults (LOW layout):
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` = `0xdeadbeef` magic, `+8` = syscall trampoline pointer (the example-program ABI). |
-| `0x8c00d638` | `_end` with default flags (2026-10-03). Code and BSS are all below it. Over the `0x8c00c000` bound (§4.6). |
+| `0x8c00d5e0` | `_end` with default flags (2026-10-03). Code and BSS are all below it. Over the `0x8c00c000` bound (§4.6). |
 | `_end`..`_stack` | the loader's stack; also `.gdstage` (NOLOAD, `GD_STAGE_BIG_SECTORS` × 2 KB), used only under a Windows CE title (§4.15). |
 | `0x8c00f400` | `_stack` (LOW layout), **the VBR handed to the title**, the link address of `exception`, and the BIOS VBR. Only `_stack` moves with the base. |
 | `0x8c010000` | the title's load address; `exception.bin` ends just before it. |
@@ -264,8 +265,11 @@ model. The driver a title is written against is a **coroutine**, so:
 - **Asynchronous reads** (`data_transfer_async()`, the `ga_*` functions): the
   read is posted, the title runs, and **the hook's tick** (§4.15) collects each
   chunk and posts the next. Used under Windows CE with the hook in, and under
-  Katana titles with `GD_ASYNC_KATANA` (BBA only), for reads of more than one
-  sector. With the MMU off the destination is physical and the host writes it
+  Katana titles with `GD_ASYNC_KATANA` (BBA only), for every read — one
+  sector included since 2026-10-03: served synchronously, it read the BBA
+  through G2 with the title's interrupts on and its G2 DMA running, and
+  Shenmue II froze twice right after one (deaf loader, AICA looping its
+  ring). With the MMU off the destination is physical and the host writes it
   directly, `GA_PHYS_SECTORS` (6) a chunk — what the RX ring holds undrained;
   a virtual destination is staged and copied (§4.15). A chunk is done with its
   ReturnValue, not merely a whole window. Counters: `g_ga_posts`,
@@ -273,8 +277,12 @@ model. The driver a title is written against is a **coroutine**, so:
   `g_ga_wakes`.
 - **KOS titles** (`g_gd_kos`, set by the host before `EXEC`, §16): a read
   starts without the first yield, as isoldr does for KOS (KOS sleeps on
-  PROCESSING until its G1 DMA-end or vblank handler), and a one-sector read
-  takes the retrying path (KOS never retries: one failure is EIO).
+  PROCESSING until its G1 DMA-end or vblank handler).
+- **Every read retries**; without the hook, one-sector reads take
+  `data_transfer_emu_async()`: isoldr's single shot for one sector told the title FAILED on one
+  lost frame — EIO under KOS, "Data Read Error -26" in Shenmue II
+  (`g_cdfs_read_fails` 1, `g_cdfs_read_retries` 0). Only the disabled
+  `GD_EMU_ASYNC == 0` / `GD_BULK_SECTORS` cases still read in one shot.
 - `gdGdcGetCmdStat` reports progress (`COMPLETED` consumed once, then `IDLE`;
   `req_count` never 0 or 1). `gdGdcGetDrvStat` reports PLAYING while a read or
   CD-DA is live and calls `cdda_service()` **before** taking the GD lock.
@@ -414,7 +422,10 @@ called from an interrupt).
 **Known gaps:**
 
 - **No `g2_lock()` around CPU reads of the BBA on the synchronous Katana path**
-  (a 250 ms read deadline would stall the title's sound). Under the tick and
+  (a 250 ms read deadline would stall the title's sound, and a title handler
+  waiting on its own suspended DMA would deadlock, interrupts being on). With
+  the hook in, disc reads no longer take it; CD-DA fetches started from
+  `GetDrvStat` still do. Under the tick and
   under KOS the title's G2 DMA is suspended (§4.16).
 - `CMD_INIT`, `CMD_REQ_MODE` and `CMD_SET_MODE` are force-completed with
   **nothing written back**. Count first (`g_gd_cmd_counts[24]`, `[30]`, `[31]`)
@@ -444,16 +455,17 @@ isoldr does not meet this because its image ends at `0x8c007400`.
 
 **Where it stands (2026-10-03):**
 
-- **LOW (the CD build): `_end = 0x8c00d638`, 5.6 KB over the bound.** The CD
+- **LOW (the CD build): `_end = 0x8c00d5e0`, 5.6 KB over the bound.** The CD
   loader cannot host a retail Katana title at its own base. That is accepted
   (user decision, 2026-09-21): the host chainloads its own HIGH set before any
   disc image and refuses a low base whose image reaches a range the title
   paints (`low_loader_painted_by_title`). Say so when a change makes it worse.
-  `.gdstage` ends 1472 B under `_stack`.
-- **HIGH (the host's set): `_end = base+0x9b2c`, `.gdstage` ends 192 B under
-  `_stack` (`base+0xbc00`).** This is the binding budget. The next bytes come
-  from `GD_STAGE_BIG_SECTORS` (2 KB a sector, costs Windows CE's staged reads)
-  or from a feature flag of §4.3.
+  `.gdstage` ends 1568 B under `_stack`.
+- **HIGH (the host's set): `_end = base+0x9d0c`, `.gdstage` ends 1760 B under
+  `_stack` (`base+0xbc00`)** (2026-10-03, with `DISC` and `GD_STAGE_BIG_SECTORS`
+  3). This is the binding budget. The next bytes come from
+  `GD_STAGE_BIG_SECTORS` (2 KB a sector, costs Windows CE's staged reads) or
+  from a feature flag of §4.3.
 
 Rules when adding anything DC-side:
 
@@ -1005,6 +1017,69 @@ what is gained is CPU, not transfer time.
   invisible there, and so is a title's mask carrying our event. The console is
   the judge.
 
+### 4.17 Changing the disc in game
+
+The host (`dcload-ip-rs swap-disc <image>`, its `AGENTS.md` §1) serves another
+image to the running title; the loader plays a real drive's lid. Modelled on
+isoldr's `HAVE_MULTI_DISC`.
+
+- **`DISC`** (host → DC, answered): `address` = generation (host-chosen, 1..),
+  reply `size` 0 accepted (a repeated generation is accepted again), 1 busy,
+  `0xffffffff` refused. `gd_disc_request()` (`cdfs_syscalls.c`) answers busy
+  while a GD command is `PROCESSING`/`STREAMING` or `g_gd_in_transfer` is set,
+  so **every read served before the answer is the old disc's**; the host
+  installs the new image on the answer. `cmd_disc()` only notes the generation
+  (`g_disc_pending`): it can run inside a read's wait, where nothing else may
+  transmit (§4.5 invariant 1).
+- **The lid** is played by `gdGdcGetDrvStat`, counted in its calls like isoldr's.
+  At the top of the syscall, before the lock, and **only between commands**
+  (not in a transfer, not inside a CD-DA service, command not
+  `PROCESSING`/`STREAMING`: a title's interrupt handler calls it too, §4.5
+  invariant 2) the pending swap calls `cdda_disc_changed()` (stop the audio,
+  forget the cached TOC) and starts `disc_change` (return 1 below 10 calls).
+  Call 2: `drv_stat = OPEN` (6), media 0, for `DISC_SWAP_CLOSE_CALLS` (240, 4 s
+  at 60 calls a second: Shenmue II's "swap disc" screen did not see 30) calls.
+  Call `DISC_SWAP_CLOSE_CALLS` + 1: PAUSED, `CD_GDROM`, return 2 -- that call only; after it the status
+  is the title's again (PLAYING reported as usual). The count stops at 1023.
+- **Commands fail while the lid is open** (`disc_change` 2..`DISC_SWAP_CLOSE_CALLS`):
+  the server completes every command with `err = 2` (NOT READY) and
+  `ata_status = 6`, so `GetCmdStat` says FAILED with `status[0] = 2`,
+  `status[1] = 0x3a` (ASC "medium not present"). gdFs's completion code
+  (disassembled: `0x8c1ef042`) turns NOT READY (-29) into -23 (TRAYOPEND) only
+  with `status[1] == 0x3a` and a `GetDrvStat` of OPEN or BUSY, and key 6 into
+  -33. Shenmue II's swap screen (`0x8c0801a0`) waits for -23 from
+  `gdFsGetErrStat` of the system handle, which only gets an answer when its
+  `gdFsReqDrvStat` command completes. Reporting OPEN in `GetDrvStat` alone did
+  not move the game (2026-10-04, flycast and console).
+- **The recognition window.** After the open window (`DISC_SWAP_CLOSE_CALLS`)
+  commands fail NOT READY with `status[1] = 0x104` for `DISC_SWAP_CHECK_CALLS`
+  (120) calls, drive status BUSY: gdFs maps that to -37 (`CHECKBUSY`), which
+  moves Shenmue II's swap screen from "wait for the tray" (`0x8c0801a0`) to
+  "wait for the media change" (`0x8c080240`); UNIT ATTENTION then moves it on.
+- **BootROM service 2, `syBtCheckDisc`.** The title then calls vector
+  `0x8c0000e0` (r4 = 2), which the real BIOS answers from the DRIVE -- the CD
+  dcload booted from -- so the title compared the wrong disc ("Invalid disk").
+  `cdfs_redir_enable()` takes that vector too (`sysvec_redir`, saved and
+  restored with the GD pair): `gd_bios_check_disc()` reads 7 sectors of the
+  served image's IP.BIN to `0x8c008100`, where `syBtGetCurrentSystemID` reads
+  the disc number and product from (`0x8c008000` holds the boot disc's header,
+  put there by the host), and returns 0; -1 while the lid or the check window
+  runs. The LBA on the wire is `GD_BOOT_SECTOR_LBA` (`0x3ffffffe`): only the
+  host knows `boot_sector()`. Every other function (1 = BIOS menu) goes to the
+  saved BIOS handler untouched. isoldr does the same (`syscalls.s`).
+- **UNIT ATTENTION, once.** At call `DISC_SWAP_ATTN_CALLS` + 1 (close + 30 + 1)
+  `need_reinit` is set; the next command other than `CMD_INIT` is completed with
+  `err = 6` (`GetCmdStat` says FAILED, `status[0] = 6`) and clears it. `CMD_INIT`
+  clears it too. isoldr keeps failing everything until a reset, which hangs a
+  title that only retries.
+- **Limits.** Windows CE never calls `GetDrvStat`, so no swap under CE. A title
+  that answers an open lid with `syBtExit()` goes back to the BIOS menu
+  (§14.14) and the session ends. Not measured on hardware or under flycast.
+- Counters: `g_disc_swaps`, `g_disc_swap_busy`.
+- Cost: HIGH `_end` = base+`0x9d44`, `.gdstage` ended 1696 B under `_stack`,
+  after `GD_STAGE_BIG_SECTORS` went from 4 to 3 (default in `cdfs_syscalls.c`;
+  only Windows CE's staged reads use it).
+
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
 `loader.s` + `disable.s`, linked at `-Ttext=0x8c010000`, `objcopy`'d, then
@@ -1100,6 +1175,7 @@ Target-side `command_t` is `packed, aligned(4)`; host-side only `packed`.
 | `MAPL` | — | host-to-DC Maple packet |
 | `PMCR` | — | performance-counter control (`WITH_PMCR_CMD`, off) |
 | `MARK` | — | paint / check witness words (`WITH_MARK_CMD`) |
+| `DISC` | — | the host swapped the disc image (`WITH_DISC_SWAP`, §4.17) |
 | `EXPT` | `CMD_EXCEPTION` | DC-to-host exception dump |
 
 `syscalls.h` (both ends) defines `DC00`–`DC22` (exit, fstat, write, read, open,
@@ -1416,6 +1492,9 @@ title patches (GAPS guard, GD driver body, Windows CE, KOS), `MARK`, `--diag`,
 VM2, pacing and the CD-DA encoder are described there. `dc-tool-ip` remains the
 reference for the basic protocol. **Never run `cargo` in the user's `target/`**
 (it breaks their Windows build); use `CARGO_TARGET_DIR=<scratchpad>`.
+
+**`DISC`** (§4.17) is answered 0/1/`0xffffffff` and the host opens the new image
+before asking, installing it only on 0.
 
 **Contracts the DC side must keep in step with.** There are no feature bits:
 the host chainloads its own `loaders/` for every disc image, so that directory

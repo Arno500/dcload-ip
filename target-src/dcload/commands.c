@@ -961,6 +961,29 @@ void cmd_mark(ip_header_t * ip, udp_header_t * udp, command_t * command)
 }
 #endif /* WITH_MARK_CMD */
 
+#if WITH_DISC_SWAP
+/*
+ * DISC: the host has opened another disc image. address = generation (1, 2...),
+ * size = 0. Reply, same address: size 0 accepted (a repeat of a generation
+ * already accepted is accepted again), 1 busy (a GD command is in flight: the
+ * host asks again), 0xffffffff refused. Only notes the generation: the lid
+ * sequence is played by gdGdcGetDrvStat (cdfs_syscalls.c), and this may run
+ * inside a read's wait, where nothing else may transmit (§4.5 invariant 1).
+ */
+void cmd_disc(ip_header_t * ip, udp_header_t * udp, command_t * command)
+{
+	command_t * response = (command_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
+	int rv = gd_disc_request(ntohl(command->address));
+
+	memcpy(response, command, COMMAND_LEN);
+	response->size = htonl((unsigned int)rv);
+
+	make_ip(ntohl(ip->src), ntohl(ip->dest), UDP_H_LEN + COMMAND_LEN, IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
+	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
+	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
+}
+#endif /* WITH_DISC_SWAP */
+
 #if WITH_PMCR_CMD
 // The 6 performance counter control functions are:
 /*

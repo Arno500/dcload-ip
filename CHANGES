@@ -1,5 +1,7 @@
 WHAT'S NEW IN 2.0.4
 
+* Disc swap in game: `dcload-ip-rs swap-disc <image>` makes the served disc
+  change; the title sees the lid open then close (`DISC` command, §4.17).
 * GD-ROM drive emulation for retail titles: dcload answers a launched title's
   BIOS GD-ROM syscalls itself and fetches the sectors over the network from a
   disc image on the PC. This is served by the companion Rust host,

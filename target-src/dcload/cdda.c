@@ -1618,6 +1618,12 @@ int cdda_stop(void)
 	return 0;
 }
 
+void cdda_disc_changed(void)
+{
+	(void)cdda_stop();
+	cdda_toc_valid = 0;
+}
+
 int cdda_seek(unsigned int lba)
 {
 	if (cd.state == CDDA_STATE_STOPPED)

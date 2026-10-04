@@ -75,6 +75,8 @@
 	.extern _gdGdcCartRead
 	.extern _gdGdcDummy
 	.extern _gdcServerMain
+	.extern _gd_bios_check_disc
+	.extern _gd_bios_check_disc
 
 	.section .text
 	.global _cdfs_redir_enable
@@ -125,6 +127,8 @@ _cdfs_redir_save:
 	mov.l r0, @r1
 	mov.l @(4,r2),r0
 	mov.l r0, @(4,r1)
+	mov.l @(36,r2),r0
+	mov.l r0, @(8,r1)
 already_saved:
 	rts
 	nop
@@ -135,16 +139,20 @@ _cdfs_redir_disable:
 	mov.l @r1, r0
 	mov.l r0, @r2
 	mov.l @(4,r1), r0
-	rts
 	mov.l r0, @(4,r2)
+	mov.l @(8,r1), r0
+	rts
+	mov.l r0, @(36,r2)
 
 _cdfs_redir_enable:
 	mov.l cdfs_entry_k, r0
 	mov.l cdfs_redir_k, r1
 	mov.l r1, @r0
 	mov.l cdfs_redir_c0_k, r1
-	rts
 	mov.l r1, @(4,r0)
+	mov.l sysvec_redir_k, r1
+	rts
+	mov.l r1, @(36,r0)
 
 .align 2
 cdfs_entry_k:
@@ -154,10 +162,45 @@ cdfs_saved_k:
 cdfs_saved:
 	.long 0		! 0xac0000bc as the BIOS left it
 	.long 0		! 0xac0000c0 as the BIOS left it
+	.long 0		! 0xac0000e0 as the BIOS left it (the BootROM service vector)
 cdfs_redir_k:
 	.long cdfs_redir
 cdfs_redir_c0_k:
 	.long cdfs_redir_c0
+sysvec_redir_k:
+	.long sysvec_redir
+
+! THE BOOTROM SERVICE VECTOR, 0x8c0000e0 (the "system vector"): r4 selects the
+! function -- 1 back to the BIOS menu, 2 syBtCheckDisc. The vector sits 0x24
+! after 0xbc, so it is saved, armed and restored with the GD pair (@(36,rN)).
+! Function 2 is the one a multi-disc title calls after a tray event (SDK:
+! gdfserr.txt): the BIOS reads the IP.BIN of the disc in the DRIVE, which here
+! is the CD dcload booted from, so the title judged the wrong disc. isoldr
+! replaces it the same way (syscalls.s, _sys_do_bioscall, syBtCheckDisc). This
+! one reads the IP.BIN of the image being served instead; everything else goes
+! to the BIOS untouched, r4-r7 intact.
+.align 2
+sysvec_redir:
+	mov r4, r0
+	cmp/eq #2, r0
+	bf sysvec_pass
+	sts.l pr, @-r15
+	mov.l sysvec_check_k, r0
+	jsr @r0
+	nop
+	lds.l @r15+, pr
+	rts
+	nop
+sysvec_pass:
+	mov.l sysvec_saved_k, r0
+	mov.l @r0, r0
+	jmp @r0
+	nop
+.align 2
+sysvec_check_k:
+	.long _gd_bios_check_disc
+sysvec_saved_k:
+	.long cdfs_saved + 8
 
 ! int gd_lock(void) -- returns 0 when acquired, 1 when already held.
 ! TAS.B sets T when the byte WAS zero, i.e. when we just took it.

@@ -49,4 +49,11 @@ int gd_async_busy(void);
  * it. Non-zero if it did (cdfs_syscalls.c, IRQ_IDLE_LISTEN). */
 int gd_idle_listen(void);
 
+/* DISC from the host (commands.c, WITH_DISC_SWAP): 0 accepted, 1 busy (a
+ * command is in flight), -1 refused. gdGdcGetDrvStat plays the lid. */
+int gd_disc_request(unsigned int generation);
+extern unsigned int g_disc_swaps, g_disc_swap_busy;
+extern volatile unsigned int g_disc_pending;
+extern unsigned int g_disc_lid, g_disc_ua;
+
 #endif

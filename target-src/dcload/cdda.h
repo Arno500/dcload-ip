@@ -37,6 +37,8 @@ int cdda_pause(void);
 int cdda_release(void);
 int cdda_stop(void);
 int cdda_seek(unsigned int lba);
+/* The disc was swapped: stop, forget the cached TOC (cdda.c). */
+void cdda_disc_changed(void);
 
 /* Keep the stream fed. Cheap when there is nothing to refill. */
 void cdda_service(void);
@@ -63,6 +65,7 @@ unsigned int cdda_audio_status(void);    /* SCD audio status (0x11 playing ...) 
 #define cdda_release()              (-1)
 #define cdda_stop()                 (-1)
 #define cdda_seek(a)                (-1)
+#define cdda_disc_changed()         do { } while (0)
 #define cdda_service()              do { } while (0)
 #define cdda_service_between_chunks() do { } while (0)
 #define cdda_service_tick()         do { } while (0)
