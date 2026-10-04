@@ -1,0 +1,174 @@
+/* Sega Dreamcast linker script for the CORE layout -- TEMPLATE (AGENTS.md 4.19).
+ *
+ * Like dcload.x.in it is run through the C preprocessor by the Makefile
+ * (DCLOAD_LAYOUT=core) and the result, dcload.x, is gitignored build output.
+ *
+ * THE WHOLE RESIDENT LOADER IN THE SYSTEM HOLE. A title that uses all of high RAM
+ * (Shenmue II after a disc swap) overwrites any loader up there, and the only
+ * ground a Katana title leaves to the system is 0x8c004000..0x8c00c000 -- minus
+ * the IP.BIN header the title reads back at 0x8c008000 (the boot disc's) and
+ * 0x8c008100 (the current disc's, written by gd_bios_check_disc). So:
+ *
+ *   core_lo  0x8c004000..0x8c008000   crt0 (magic at +4, trampoline at +8, the
+ *                                     jump table at +0..+0x20), then the
+ *                                     biggest objects' code
+ *   hole     0x8c008000..DCLOAD_IPBIN_HOLE_END   nothing of ours, never zeroed
+ *   core_hi  hole end..DCLOAD_CORE_LIMIT   the rest of the code, .rodata, .data,
+ *                                     .bss, the former .hiram buffers and the two
+ *                                     stacks a title leaves running (the hook's
+ *                                     and the network exchange's)
+ *   prexec   DCLOAD_MAPLE..DCLOAD_STACK   the Maple DMA buffer (MAPL, before EXEC
+ *                                     only) and the loader's own main-loop stack:
+ *                                     RAM a title paints and owns once it runs
+ *
+ * _end is the top of everything resident, so crt0's BSS clearing (_edata.._end)
+ * covers .hiram and the stacks and never touches the hole (all .data is above
+ * it), and every host-side test that reads `end` sees the true image.
+ */
+
+OUTPUT_FORMAT("elf32-shl", "elf32-shl", "elf32-shl")
+OUTPUT_ARCH(sh)
+ENTRY(start)
+
+MEMORY
+{
+  core_lo (rwx) : ORIGIN = DCLOAD_BASE,           LENGTH = 0x8c008000 - DCLOAD_BASE
+  core_hi (rwx) : ORIGIN = DCLOAD_IPBIN_HOLE_END, LENGTH = DCLOAD_CORE_LIMIT - DCLOAD_IPBIN_HOLE_END
+  prexec  (rw)  : ORIGIN = DCLOAD_MAPLE,          LENGTH = DCLOAD_STACK - DCLOAD_MAPLE
+}
+
+SECTIONS
+{
+  .text_lo :
+  {
+    __text_lo_start = .;
+    *dcload-crt0.o(.text .text.*)
+    *cdfs_redir.o(.text .text.*)
+    *cdfs_syscalls.o(.text .text.*)
+    *rtl8139.o(.text .text.*)
+    *lan_adapter.o(.text .text.*)
+    *commands.o(.text .text.*)
+    *net.o(.text .text.*)
+    __text_lo_end = .;
+  } > core_lo =0
+
+  .text :
+  {
+    *(.text)
+    *(.text.*)
+    *(.stub)
+    *(.gnu.warning)
+    *(.gnu.linkonce.t*)
+  } > core_hi =0
+  _etext = .;
+  PROVIDE (etext = .);
+  .rodata ALIGN(4) : { *(.rodata) *(.rodata.*) *(.gnu.linkonce.r*) } > core_hi
+  .data   ALIGN(4) :
+  {
+    *(.data)
+    *(.data.*)
+    *(.gnu.linkonce.d*)
+    SORT(CONSTRUCTORS)
+  } > core_hi
+  .ctors  ALIGN(4) :
+  {
+    ___ctors = .;
+    KEEP (*(.ctors))
+    ___ctors_end = .;
+  } > core_hi
+  .dtors  ALIGN(4) :
+  {
+    ___dtors = .;
+    KEEP (*(.dtors))
+    ___dtors_end = .;
+  } > core_hi
+  .got    ALIGN(4) : { *(.got.plt) *(.got) } > core_hi
+  .sdata  ALIGN(4) : { *(.sdata) *(.sdata.*) *(.gnu.linkonce.s.*) } > core_hi
+  . = ALIGN(32 / 8);
+  _edata = .;
+  PROVIDE (edata = .);
+  __bss_start = .;
+  .sbss   ALIGN(4) : { *(.dynsbss) *(.sbss) *(.sbss.*) *(.scommon) } > core_hi
+  .bss    ALIGN(4) :
+  {
+    *(.dynbss)
+    *(.bss)
+    *(.bss.*)
+    *(COMMON)
+    . = ALIGN(32 / 8);
+  } > core_hi
+
+  /* The packet buffers, the TOC/stream stage and the asynchronous-read table:
+   * inside the image here, not in high RAM (hiram.h). Zeroed by crt0 (they are
+   * below _end), twice over. */
+  .hiram ALIGN(32) (NOLOAD) :
+  {
+    __hiram_start = .;
+    *(.hiram)
+    *(.hiram.*)
+    __hiram_end = .;
+  } > core_hi
+
+  /* The big GD stage is Windows CE's; a core serves Katana titles only. It stays
+   * as an empty section so the symbols exist. */
+  .gdstage ALIGN(32) (NOLOAD) :
+  {
+    __gdstage_start = .;
+    *(.gdstage)
+    __gdstage_end = .;
+  } > core_hi
+
+  /* The stacks a title leaves running, at the top of the core: the interrupt
+   * hook's (irq.c) and the network exchange's (cdfs_redir.s). Not in the Maple
+   * page, which a title paints. */
+  .corestk ALIGN(8) (NOLOAD) :
+  {
+    _irq_stack_lo = .;
+    . += CORE_IRQ_STACK;
+    _irq_stack_top = .;
+    _xchg_stack_lo = .;
+    . += CORE_XCHG_STACK;
+    _xchg_stack_top = .;
+  } > core_hi
+
+  . = ALIGN(32 / 8);
+  _end = .;
+  PROVIDE (end = .);
+
+  PROVIDE (_dcload_base = ORIGIN(core_lo));
+  PROVIDE (_maple_dma_buffer = DCLOAD_MAPLE);
+  __ipbin_hole_start = 0x8c008000;
+  __ipbin_hole_end = DCLOAD_IPBIN_HOLE_END;
+  /* Which layout this is, for the host (loaders.rs footprint_from_elf). An
+   * absolute symbol: no C code names it, so no relocation exists to move it. */
+  _dcload_layout = 2;
+
+  .stab 0 : { *(.stab) }
+  .stabstr 0 : { *(.stabstr) }
+  .comment 0 : { *(.comment) }
+  .debug          0 : { *(.debug) }
+  .line           0 : { *(.line) }
+  .debug_aranges  0 : { *(.debug_aranges) }
+  .debug_pubnames 0 : { *(.debug_pubnames) }
+  .debug_info     0 : { *(.debug_info) }
+  .debug_abbrev   0 : { *(.debug_abbrev) }
+  .debug_line     0 : { *(.debug_line) }
+  .debug_frame    0 : { *(.debug_frame) }
+  .debug_str      0 : { *(.debug_str) }
+  .debug_loc      0 : { *(.debug_loc) }
+  .debug_macinfo  0 : { *(.debug_macinfo) }
+}
+
+/* The loader's own main-loop stack top. At the BIOS VBR, as in the LOW family:
+ * what is under it, above the Maple buffer, is the title's own once it runs. */
+_stack = DCLOAD_STACK;
+
+ASSERT(( _dcload_base == 0x8c004000 ), "Error: the core layout is pinned at 0x8c004000")
+ASSERT(( __text_lo_end <= 0x8c008000 ), "Error: .text_lo does not fit under the IP.BIN header at 0x8c008000: move an object to the second half (CORE_TEXT_LO)")
+ASSERT(( _edata >= DCLOAD_IPBIN_HOLE_END ), "Error: initialised data below the end of the IP.BIN hole: crt0 would clear it")
+ASSERT(( _end <= DCLOAD_CORE_LIMIT ), "Error: the core is over DCLOAD_CORE_LIMIT (a Katana title paints 0x8c00c000..0x8c00f400): shrink it")
+ASSERT(( __hiram_end <= _irq_stack_lo ), "Error: .hiram overlaps the hook stack")
+ASSERT(( _xchg_stack_top == _end ), "Error: the exchange stack is not the top of the core")
+ASSERT(( __gdstage_end == __gdstage_start ), "Error: the big GD stage is not used by a core (GD_STAGE_BIG_SECTORS 0)")
+ASSERT(( _maple_dma_buffer >= DCLOAD_CORE_LIMIT ), "Error: the Maple DMA buffer is inside the core")
+ASSERT(( _maple_dma_buffer + 0x800 + 4096 <= _stack ), "Error: under 4 KB of main-loop stack above the Maple buffer")

@@ -28,5 +28,10 @@ void la_bb_start(void);
 void la_bb_stop(void);
 int la_bb_tx(unsigned char *pkt, int len);
 void la_bb_loop(int is_main_loop);
+/* The packet-ready interrupt (Holly EXT bit 2): on = enable in DLCR3. It is
+ * level sensitive and stays up while a packet waits, so the hook's tick masks
+ * it (la_irq_ack) and the read drains the buffer. */
+void la_irq_enable(int on);
+void la_irq_ack(void);
 
 #endif

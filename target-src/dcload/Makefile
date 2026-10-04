@@ -93,7 +93,39 @@ DCLOAD_BASE ?= 0x8c004000
 DCLOAD_GUEST_VBR = 0x8c00f400
 
 DCLOAD_IS_LOW := $(shell [ $$(( $(DCLOAD_BASE) )) -lt $$(( 0x8c010000 )) ] && echo 1 || echo 0)
-ifeq ($(DCLOAD_IS_LOW),1)
+
+# The CORE layout (AGENTS.md 4.19, dcload-core.x.in): the whole resident loader
+# in the system hole 0x8c004000..0x8c00c000, with a gap for the IP.BIN header,
+# nothing in high RAM. Pinned at 0x8c004000 (the host uploads it as it is, it
+# is never relocated) and for Katana titles. `make DCLOAD_LAYOUT=core`.
+DCLOAD_LAYOUT ?=
+ifeq ($(DCLOAD_LAYOUT),core)
+  ifneq ($(DCLOAD_BASE),0x8c004000)
+    $(error DCLOAD_LAYOUT=core is pinned at DCLOAD_BASE=0x8c004000)
+  endif
+  DCLOAD_OS ?= katana
+  ifneq ($(DCLOAD_OS),katana)
+    $(error DCLOAD_LAYOUT=core serves Katana titles only: DCLOAD_OS=katana)
+  endif
+  DCLOAD_RESIDENT ?= 1
+  WITH_CDDA ?= 0
+  WITH_DISC_SWAP ?= 1
+  WITH_MARK_CMD ?= 0
+  DCLOAD_STACK ?= $(DCLOAD_GUEST_VBR)
+  DCLOAD_MAPLE ?= 0x8c00c000
+  DCLOAD_HIRAM ?= $(DCLOAD_MAPLE)
+  DCLOAD_CORE_LIMIT ?= 0x8c00c000
+  DCLOAD_IPBIN_HOLE_END ?= 0x8c008200
+  CORE_IRQ_STACK ?= 0x400
+  CORE_XCHG_STACK ?= 0x600
+  DCLOAD_LAYOUT_ID = 2
+  CFLAGS += -DDCLOAD_LAYOUT_CORE=1 -DGD_STAGE_SECTORS=1 -DGD_STAGE_BIG_SECTORS=0 \
+            -Wa,--defsym,DCLOAD_LAYOUT_CORE=1
+endif
+
+ifeq ($(DCLOAD_LAYOUT),core)
+  # (stack, Maple and the limits are set above)
+else ifeq ($(DCLOAD_IS_LOW),1)
   DCLOAD_STACK ?= $(DCLOAD_GUEST_VBR)
   DCLOAD_HIRAM ?= 0x8cfe9000
   DCLOAD_MAPLE ?= 0x8cfe8000
@@ -282,6 +314,21 @@ ifeq ($(WITH_BBA)$(WITH_LAN_ADAPTER),00)
   $(error WITH_BBA=0 and WITH_LAN_ADAPTER=0: no network driver left)
 endif
 
+# The LAN Adapter takes part in asynchronous disc reads, the RX interrupt and
+# the idle listen like the BBA (its loop keeps the same contract). 0 returns it
+# to synchronous reads: the A/B for the console, since its data port is one
+# byte a G2 access and a chunk then costs a few ms of CPU inside the tick.
+GA_LAN ?= 1
+CFLAGS += -DGA_LAN=$(GA_LAN)
+
+# A RESIDENT loader serves a running title and nothing else (AGENTS.md 4.18):
+# no screen (video.s is not linked; every display call is a stub), no DHCP (its
+# address is put in the image by the host, or carried by the BBA's warm start).
+# Only the variants `make loaders` builds are resident; the CD's build and the
+# universal image keep their start-up screen and DHCP.
+DCLOAD_RESIDENT ?= 0
+CFLAGS += -DDCLOAD_RESIDENT=$(DCLOAD_RESIDENT)
+
 # Which titles the loader serves (AGENTS.md 4.18). `all` (the CD's build and
 # the universal set) serves every kind; a variant leaves out what its kind
 # never runs:
@@ -299,6 +346,10 @@ WITH_KATANA := $(if $(filter all katana,$(DCLOAD_OS)),1,0)
 WITH_KOS    := $(if $(filter all kos,$(DCLOAD_OS)),1,0)
 WITH_WINCE  := $(if $(filter all wince,$(DCLOAD_OS)),1,0)
 CFLAGS += -DWITH_KATANA=$(WITH_KATANA) -DWITH_KOS=$(WITH_KOS) -DWITH_WINCE=$(WITH_WINCE)
+# What VERS reports about this build (commands.c, cmd_version).
+DCLOAD_OS_ID := $(if $(filter katana,$(DCLOAD_OS)),1,$(if $(filter kos,$(DCLOAD_OS)),2,$(if $(filter wince,$(DCLOAD_OS)),3,0)))
+DCLOAD_LAYOUT_ID ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+CFLAGS += -DDCLOAD_OS_ID=$(DCLOAD_OS_ID) -DDCLOAD_LAYOUT_ID=$(DCLOAD_LAYOUT_ID)
 
 # Serve the MAPL command (host-to-DC Maple passthrough) and the driver behind
 # it. Worth 656 bytes. A session that only boots a title never uses it;
@@ -461,7 +512,7 @@ CFLAGS += -DGD_ASYNC_KATANA=$(GD_ASYNC_KATANA)
 # the wire only inside GD waits. BBA only; costs up to 2 % of the CPU, with
 # SR.BL set, while the title is not loading. Off in the LOW (CD) build for its
 # bytes: the host chainloads its own set before any disc image.
-IRQ_IDLE_LISTEN ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,$(if $(filter 11,$(WITH_BBA)$(WITH_IRQ_HOOK)),1,0))
+IRQ_IDLE_LISTEN ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,$(if $(filter 1,$(WITH_IRQ_HOOK)),1,0))
 CFLAGS += -DIRQ_IDLE_LISTEN=$(IRQ_IDLE_LISTEN)
 
 # The BBA's RX frames by G2 DMA from the hook's tick (AGENTS.md 4.16). 0 takes
@@ -509,7 +560,7 @@ READELF	= $(TARGETREADELF)
 
 # The link order is kept as it was before the variants (2026-10-04), so that
 # the default build stays byte for byte the same.
-DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o video.o memcpy.o memcmp.o memfuncs.o packet.o net.o adapter.o $(if $(filter 1,$(WITH_BBA)),rtl8139.o) dhcp.o dcload.o perfctr.o cdfs_redir.o cdfs_syscalls.o syscalls.o commands.o
+DCLOBJECTS	= dcload-crt0.o disable.o startup_support.o go.o $(if $(filter 1,$(DCLOAD_RESIDENT)),,video.o) memcpy.o memcmp.o memfuncs.o packet.o net.o adapter.o $(if $(filter 1,$(WITH_BBA)),rtl8139.o) dhcp.o dcload.o perfctr.o cdfs_redir.o cdfs_syscalls.o syscalls.o commands.o
 ifeq ($(WITH_LAN_ADAPTER),1)
   DCLOBJECTS += lan_adapter.o
 endif
@@ -558,9 +609,16 @@ all: dcload.bin exception.bin
 # ORIGIN is what has to move. dcload.x.in is the source; dcload.x is build
 # output and is gitignored. Run through the C preprocessor with -P (no line
 # markers, which ld would reject).
-dcload.x: dcload.x.in Makefile ../../Makefile.cfg
+ifeq ($(DCLOAD_LAYOUT),core)
+DCLOAD_X_IN = dcload-core.x.in
+else
+DCLOAD_X_IN = dcload.x.in
+endif
+dcload.x: $(DCLOAD_X_IN) Makefile ../../Makefile.cfg
 	$(CC) -E -P -x c -DDCLOAD_BASE=$(DCLOAD_BASE) -DDCLOAD_STACK=$(DCLOAD_STACK) \
-	      -DDCLOAD_HIRAM=$(DCLOAD_HIRAM) -DDCLOAD_MAPLE=$(DCLOAD_MAPLE) $< -o $@
+	      -DDCLOAD_HIRAM=$(DCLOAD_HIRAM) -DDCLOAD_MAPLE=$(DCLOAD_MAPLE) \
+	      $(if $(filter core,$(DCLOAD_LAYOUT)),-DDCLOAD_CORE_LIMIT=$(DCLOAD_CORE_LIMIT) -DDCLOAD_IPBIN_HOLE_END=$(DCLOAD_IPBIN_HOLE_END) -DCORE_IRQ_STACK=$(CORE_IRQ_STACK) -DCORE_XCHG_STACK=$(CORE_XCHG_STACK)) \
+	      $< -o $@
 
 # DCLOAD_EMIT_RELOCS=1 keeps the relocations in the ELF (`ld -q`), which is what
 # lets the HOST move this image to any base without a rebuild -- see the
@@ -641,6 +699,19 @@ LOADER_RELOC_BASE = 0x8ce00000
 # combination of these, CD-DA or not. Empty either list to skip them.
 LOADER_DRIVERS = bba lan
 LOADER_OSES    = katana kos wince
+# The CORE loaders (AGENTS.md 4.19), one per driver: pinned at 0x8c004000, so
+# linked natively, with no relocations to keep and nothing for the host to move.
+LOADER_CORE_DRIVERS = bba lan
+
+# One pinned image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
+define pinned_loader
+$(MAKE) --no-print-directory clean >/dev/null || exit 1; \
+$(MAKE) --no-print-directory DCLOAD_LAYOUT=core $(2) dcload exception.bin >/dev/null || exit 1; \
+$(OBJCOPY) --add-section .guestvbr=exception.bin \
+           --set-section-flags .guestvbr=alloc,load,contents,readonly \
+           --change-section-address .guestvbr=$(DCLOAD_GUEST_VBR) \
+           dcload $(LOADER_DIR)/$(1) || exit 1
+endef
 
 # One relocatable image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
 # The relocations are the whole point of it, and objcopy is well within its
@@ -699,10 +770,16 @@ loaders:
 	@# dcload-relocatable.elf above serves everything and stays the fallback.
 	@for drv in $(LOADER_DRIVERS); do for os in $(LOADER_OSES); do for cd in 1 0; do \
 	  name=dcload-$$drv-$$os-$$( [ $$cd = 1 ] && echo cdda || echo nocdda ).elf; \
-	  flags="DCLOAD_OS=$$os WITH_CDDA=$$cd $$( [ $$drv = bba ] && echo WITH_LAN_ADAPTER=0 || echo WITH_BBA=0 )"; \
+	  flags="DCLOAD_RESIDENT=1 DCLOAD_OS=$$os WITH_CDDA=$$cd $$( [ $$drv = bba ] && echo WITH_LAN_ADAPTER=0 || echo WITH_BBA=0 )"; \
 	  echo "[loaders] linking $$name ($$flags)"; \
 	  $(call reloc_loader,$$name,$$flags); \
 	done; done; done
+	@for drv in $(LOADER_CORE_DRIVERS); do \
+	  name=dcload-core-$$drv-katana.elf; \
+	  flags="$$( [ $$drv = bba ] && echo WITH_LAN_ADAPTER=0 || echo WITH_BBA=0 )"; \
+	  echo "[loaders] linking $$name (DCLOAD_LAYOUT=core $$flags)"; \
+	  $(call pinned_loader,$$name,$$flags); \
+	done
 	@$(MAKE) --no-print-directory clean >/dev/null && $(MAKE) --no-print-directory all >/dev/null
 	@echo "[loaders] built:" && ls -l $(LOADER_DIR)
 

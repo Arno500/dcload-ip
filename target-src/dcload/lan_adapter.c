@@ -53,9 +53,21 @@ adapter_t adapter_la = {
 };
 
 static volatile unsigned char lan_link_up = 0;
+/* The chip was found configured as dcload leaves it, and adopted without a
+ * reset (la_warm_usable); the link then never went down. */
+static unsigned char la_warm;
+/* The hardware waits are bounded on the loader's clock, as the BBA's are
+ * (RTL_TX_WAIT_TICKS): 10 ms is five times a 1514-byte frame at 10 Mbit. */
+#define LA_TX_WAIT_TICKS 125000U
+/* Polls with nothing received before a seconds timeout is judged (the BBA's
+ * RTL_IDLE_POLL_LIMIT counterpart; a LAN poll is slower, so fewer). */
+#define LA_IDLE_POLL_LIMIT 400000u
 // This needs to persist across program loads and resets, so it needs to go in .data section
 static volatile unsigned char first_transmit = 2;
 static int bb_started = 0;
+/* Calls made out of sequence (bb_tx/bb_rx while stopped); was a screen message
+ * and a hang, which under a title froze the machine. */
+unsigned int g_la_oos;
 
 static void net_strobe_eeprom(void);
 static void net_read_eeprom(uint8 *data);
@@ -174,6 +186,42 @@ static void disp_status2(const char * status)
 
 #endif
 
+/*
+ * WARM START (the BBA's rtl_warm_usable() counterpart, AGENTS.md 4.9): a loader
+ * that chainloads another leaves this chip configured -- ENA DLC with
+ * DLCR6_FLAGS, bank 2, transmitter and receiver set up, a station address
+ * programmed -- and only reception stopped. A reset and the EEPROM read would
+ * cost ~100 ms plus the init sleeps, and a 2.3 s wait for the link. Nothing
+ * else survives a reset: a chip that was never set up fails every test below.
+ */
+static int la_warm_usable(void)
+{
+	uint8 mac[6];
+	int i, any = 0;
+
+	if (((REG(7) >> 6) & 3) != 2)			/* chip type */
+		return 0;
+	if ((REG(6) & 0xff) != DLCR6_FLAGS)		/* enabled, our memory setup */
+		return 0;
+	if (((REG(7) >> 2) & 3) != 2)			/* the BMPR bank dcload leaves */
+		return 0;
+	if (REG(5) & 0x03)				/* reception was left on: not ours */
+		return 0;
+	if (REG(15) & 0x40)				/* link fail: nothing to adopt */
+		return 0;
+	SETBANK(0);
+	for (i = 0; i < 6; i++)
+	{
+		mac[i] = REG(i + 8);
+		any |= mac[i];
+	}
+	SETBANK(2);
+	if (!any)
+		return 0;
+	memcpy(adapter_la.mac, mac, 6);
+	return 1;
+}
+
 /* Reset the lan adapter and verify that it's there and alive */
 int la_bb_detect(void)
 {
@@ -187,19 +235,25 @@ int la_bb_detect(void)
 	}
 
 	if (bb_started != 0) {
-		clear_lines(168, 24, LAN_BG_COLOR);
-		draw_string(30, 168, "bb_detect() called out of sequence!", 0xf800);
-		for (;;)
-			;
+		g_la_oos++;
+		return -1;
 	}
 
-	/* Reset the interface */
-	xpc[0x0480] = 0;
-	xpc[0x0480] = 1;
-	xpc[0x0480] = 0;
+	if (la_warm_usable())
+	{
+		/* Configured as dcload leaves it: no reset, no 100 ms wait. */
+		la_warm = 1;
+	}
+	else
+	{
+		/* Reset the interface */
+		xpc[0x0480] = 0;
+		xpc[0x0480] = 1;
+		xpc[0x0480] = 0;
 
-	/* Give it a few ms to come back */
-	net_sleep_ms(100);
+		/* Give it a few ms to come back */
+		net_sleep_ms(100);
+	}
 
 	/* Read the chip type and verify it */
 	type = (REG(7) >> 6) & 3;
@@ -227,6 +281,16 @@ int la_bb_init(void)
 
 	if (bb_started == 2) {
 		DEBUG("bb_init exited, already done\r\n");
+		return 0;
+	}
+
+	if (la_warm) {
+		/* Adopted without a reset: reception is off (stop() leaves it so);
+		 * start() turns it back on. */
+		first_transmit = 1;
+		lan_link_up = 1;
+		bb_started = 3;
+		la_bb_start();
 		return 0;
 	}
 
@@ -319,6 +383,7 @@ int la_bb_init(void)
 /* Start lan adapter */
 void la_bb_start(void)
 {
+	g2dma_quiesce();
 	DEBUG("bb_start entered\r\n");
 
 	if (bb_started != 3) {
@@ -336,6 +401,7 @@ void la_bb_start(void)
 /* Stop lan adapter */
 void la_bb_stop(void)
 {
+	g2dma_quiesce();
 	DEBUG("bb_stop entered\r\n");
 
 	if (bb_started != 2) {
@@ -348,9 +414,14 @@ void la_bb_stop(void)
 	while (REG(10) & 0x7f)
 		net_sleep_ms(2);
 */
-	while(!(REG(0) & 0x80)) // wait for any prior transmit of all packets in transmit buffer to finish
 	{
-		net_sleep_ms(2);
+		unsigned int t0 = clk_now();
+		while(!(REG(0) & 0x80)) // wait for any prior transmit of all packets in transmit buffer to finish
+		{
+			if (clk_since(t0) > LA_TX_WAIT_TICKS)
+				break;	// bounded (AGENTS.md 4.8): the title's tick may be here with SR.BL set
+			net_sleep_ms(1);
+		}
 	}
 	// We could reset first_transmit, or we could leave the TMT OK bit high for the next time (better)
 
@@ -359,6 +430,19 @@ void la_bb_stop(void)
 
 	bb_started = 3;
 	DEBUG("bb_stop exited\r\n");
+}
+
+/* The RX interrupt, for the hook (irq.c). Only while a disc chunk is on the
+ * wire; the chip's interrupts are otherwise off ("dcload doesn't use them"). */
+void la_irq_enable(int on)
+{
+	REGW(3) = on ? 0x80 : 0x00;	// DLCR3: PKTRDY enable
+}
+
+void la_irq_ack(void)
+{
+	g2dma_quiesce();
+	REGW(3) = 0x00;			// the line falls; re-armed per chunk
 }
 
 // For stats
@@ -391,10 +475,8 @@ int la_bb_tx(unsigned char *pkt, int len)
 	DEBUG("bb_tx entered\r\n");
 	// transmission CAN still occur if RX is stopped (bb_started == 3)
 	if (bb_started < 2) {
-		clear_lines(168, 24, LAN_BG_COLOR);
-		draw_string(30, 168, "bb_tx() called out of sequence!", 0xf800);
-		for (;;)
-			;
+		g_la_oos++;	/* out of sequence: drop the frame, every sender retries */
+		return 0;
 	}
 
 	len &= 0x07ff; // max length is 11 bits, meaning 4095-byte packets...but it does
@@ -473,9 +555,12 @@ int la_bb_tx(unsigned char *pkt, int len)
 	}
 	else
 	{
+		unsigned int t0 = clk_now();
 		while(!(REG(0) & 0x80)) // wait for prior transmit (in the other bank, since dcload uses dual-bank mode) to finish
 		{
-			net_sleep_ms(2);
+			if (clk_since(t0) > LA_TX_WAIT_TICKS)
+				return 0;	// bounded (AGENTS.md 4.8); the frame is dropped and asked again
+			net_sleep_ms(1);
 		}
 		REGW(0) = 0x80; // clear transmit in progress
 	}
@@ -501,10 +586,8 @@ static int la_bb_rx(void)
 	DEBUG("bb_rx entered\r\n");
 
 	if (bb_started != 2) {
-		clear_lines(168, 24, LAN_BG_COLOR);
-		draw_string(30, 168, "bb_rx() called out of sequence!", 0xf800);
-		for (;;)
-			;
+		g_la_oos++;	/* reception is off: nothing to read, and no hang */
+		return 0;
 	}
 
 	for (count = 0; ; count++)
@@ -607,6 +690,7 @@ void la_bb_loop(int is_main_loop)
 	unsigned int loop_start[2] = {0};
 	unsigned int loop_measure[2] = {0};
 	unsigned int prev_loop_elapsed = 0;
+	unsigned int idle_polls = 0;
 
 	DEBUG("bb_loop entered\r\n");
 
@@ -616,15 +700,20 @@ void la_bb_loop(int is_main_loop)
 		{
 			disp_info();
 		}
-		// This adapter does not support autonegotiation, so this delay ensures that
-		// the other end of the link (which probably does support it) has time to
-		// realize this device uses NLPs instead of FLPs. It takes 50-150ms for this
-		// device to enter LINK FAIL, so wait 150ms to start in link fail.
-		net_sleep_ms(150);
+		if (!la_warm)
+		{
+			// This adapter does not support autonegotiation, so this delay ensures that
+			// the other end of the link (which probably does support it) has time to
+			// realize this device uses NLPs instead of FLPs. It takes 50-150ms for this
+			// device to enter LINK FAIL, so wait 150ms to start in link fail.
+			net_sleep_ms(150);
 
-		// In the event a user actually connects to something NOT using autonegotiation,
-		// set lan_link_up to 0 so that this loop can work with those, too.
-		lan_link_up = 0;
+			// In the event a user actually connects to something NOT using autonegotiation,
+			// set lan_link_up to 0 so that this loop can work with those, too.
+			lan_link_up = 0;
+		}
+		// A warm start never lost the link (la_warm_usable() read LINK FAIL
+		// clear): nothing to wait for, as for the BBA's g_warm_start.
 	}
 
 	if (timeout_loop > 0)
@@ -645,6 +734,23 @@ void la_bb_loop(int is_main_loop)
 			}
 			REGW(1) = 0x80; // clear packet ready
 			// Hardware will re-set this bit if there's another packet in the receive buffer
+			idle_polls = 0;
+		}
+		else
+		{
+			idle_polls++;
+		}
+
+		/* The real deadline, as the BBA's: nothing has arrived for a very long time. */
+		if ((timeout_loop > 0) && (idle_polls > LA_IDLE_POLL_LIMIT))
+		{
+			if (idle_polls > g_idle_polls_max)
+			{
+				g_idle_polls_max = idle_polls;
+			}
+			idle_polls = 0;
+			timeout_loop = -1;
+			escape_loop = 1;
 		}
 
 		// Check for ethernet cable
@@ -665,6 +771,15 @@ void la_bb_loop(int is_main_loop)
 		}
 		else if(__builtin_expect(!lan_link_up, 0))
 		{
+			/* The link wait is the main loop's: a title's GD wait would sit in
+			 * a 2.3 s spin with SR.BL possibly set (the tick). A chip that is
+			 * not yet up there simply has nothing to say. */
+			if (!is_main_loop && running)
+			{
+				lan_link_up = 1;
+			}
+			else
+			{
 			// There is an excellent thread on U-Boot's mailing list about how long to
 			// wait for autonegotiation to complete:
 			// https://lists.denx.de/pipermail/u-boot/2009-February/047056.html
@@ -703,6 +818,7 @@ void la_bb_loop(int is_main_loop)
 
 			// Good to go!
 			lan_link_up = 1;
+			}
 		}
 
 #ifdef LAN_ADAPTER_DEBUG
@@ -720,10 +836,37 @@ void la_bb_loop(int is_main_loop)
 			set_ip_dhcp();
 		}
 
+		/* Bounded drain: leave after a fixed number of polls instead of
+		 * waiting for a reply (the asynchronous reads' look at the ring). */
+		if (drain_iters > 0 && --drain_iters == 0)
+		{
+			escape_loop = 1;
+		}
+
+		/* The fine deadline, before the seconds one so it wins when both are
+		 * armed. On the loader's clock (adapter.h). */
+		if (fine_deadline_ticks
+		    && clk_since(fine_deadline_start) > fine_deadline_ticks)
+		{
+			g_fine_timeouts++;
+			timeout_loop = -1;
+			escape_loop = 1;
+		}
+
 		if(timeout_loop > 0)
 		{
 			PMCR_Read(DCLOAD_PMCR, loop_measure);
-			unsigned int loop_secs_elapsed = PMCR_Delta_Seconds(*(unsigned long long int*)loop_measure - *(unsigned long long int*)loop_start);
+			/* Never let this run backwards (rtl_bb_loop has the story): a
+			 * counter that went down means "no information", not "time up". */
+			unsigned long long int now = *(unsigned long long int*)loop_measure;
+			unsigned long long int start = *(unsigned long long int*)loop_start;
+			if (now < start)
+			{
+				*(unsigned long long int*)loop_start = now;
+				start = now;
+				g_pmcr_backwards++;
+			}
+			unsigned int loop_secs_elapsed = PMCR_Delta_Seconds(now - start);
 			if(prev_loop_elapsed != loop_secs_elapsed)
 			{
 				if(dhcp_attempts > 1) // Don't show a counter yet if it's the first attempt

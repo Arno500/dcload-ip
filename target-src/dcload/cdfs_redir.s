@@ -549,7 +549,11 @@ _gd_on_loader_stack:
 	mov.l	@r15+,r14
 .align 2
 ols_stack_k:
+.ifdef DCLOAD_LAYOUT_CORE
+	.long	_xchg_stack_top	! the core's own (dcload-core.x.in): the Maple page is the title's
+.else
 	.long	_maple_dma_buffer + 0x1000
+.endif
 ols_push_k:
 	.long	_fpu_push
 ols_pop_k:

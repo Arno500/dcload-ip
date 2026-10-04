@@ -189,7 +189,10 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `PKT_BUFS_IN_HIRAM` | `1` | packet buffers and the CD-DA staging buffer in `.hiram` instead of BSS | saves 5440 B |
 | `WITH_CDDA` | `1` | CD-DA engine (§4.13) and `g2dma.c` | ~5.2 KB |
 | `WITH_LAN_ADAPTER` | `1` | HIT-0300 driver; 0 = BBA only | ~2 KB |
-| `WITH_BBA` | `1` | HIT-0400 driver (`rtl8139.c`); 0 = LAN Adapter only, and no asynchronous reads, RX interrupt, RX DMA or idle listen | ~4 KB |
+| `WITH_BBA` | `1` | HIT-0400 driver (`rtl8139.c`); 0 = LAN Adapter only (no RX DMA) | ~4 KB |
+| `GA_LAN` | `1` | the LAN Adapter takes part in asynchronous reads, the idle listen and the RX interrupt (EXT bit 2); 0 = synchronous reads, the A/B (§4.18) | -- |
+| `DCLOAD_RESIDENT` | `0` (`1` for every variant and the core) | no screen, no DHCP; the host supplies the address (§4.18) | ~5.8 KB |
+| `DCLOAD_LAYOUT` | LOW/HIGH by base | `core`: the whole loader in the system hole, pinned at 0x8c004000 (§4.19) | -- |
 | `DCLOAD_OS` | `all` | `katana`, `kos` or `wince`: leave out what that kind of title never runs (§4.18); sets `WITH_KATANA`/`WITH_KOS`/`WITH_WINCE` and the defaults of `WITH_IRQ_HOOK`, `GD_ASYNC_KATANA`, `IRQ_IDLE_LISTEN`, `RTL_RX_DMA` | up to ~4 KB |
 | `WITH_MAPLE` | `1` | serve `MAPL` | ~650 B |
 | `WITH_PMCR_CMD` | `0` | serve `PMCR` (`perfctr.c` stays); no host sends it | ~800 B |
@@ -540,7 +543,11 @@ link-change events. So:
   `go()` and read into `g_warm_ip`. RAM cannot carry it (1st_read zero-fills,
   crt0 zeroes BSS). The DHCP lease is not carried. The screen shows
   `(Warm Start)`.
-- BBA only; the LAN Adapter always takes the cold path.
+- BBA only for the IP: the LAN Adapter has nowhere to carry it, so a resident LAN
+  loader is told its address by the host (§4.18). The LAN Adapter does adopt a chip
+  dcload left configured (`la_warm_usable()`: chip type, `DLCR6_FLAGS`, bank 2,
+  reception off, link good, a station address programmed), skipping the reset,
+  the EEPROM read and the 2.3 s link wait; anything else is the cold path.
 
 Commands are matched on the MAC and `our_ip` is taken from the packet
 (`cmd_loadbin()`), which is why the host can reach a DC without a lease.
@@ -1096,20 +1103,91 @@ fit where the universal one does not (§4.6). `MAPL` is kept in all of them.
 | `kos` | the interrupt hook (KOS's table is never recognised), CE paths |
 | `wince` | the Katana entry, the RX interrupt and RX DMA, KOS paths, file syscalls |
 
-- `bba` = `WITH_LAN_ADAPTER=0`, `lan` = `WITH_BBA=0`. A LAN Adapter build
-  has no fine deadline: its loop never read one (`adapter.c` defines the
-  variables for the shared code), so its waits end on the seconds timeout.
-- `all` builds byte for byte as before the variants: the object order is
-  kept in `DCLOBJECTS` on purpose. Check the md5 of `dcload.bin` and
-  `dcload-relocatable.elf` against the previous build after touching any of
-  these guards.
-- Image (`_end - base`) on 2026-10-04: universal 40452; `bba-katana-cdda`
-  34764, `-nocdda` 28728; `bba-kos` 33368 / 27016; `bba-wince` 34464 /
-  28316; `lan-katana` 30668 / 24540; `lan-kos` 31920 / 25584; `lan-wince`
-  31028 / 24908. `.hiram` stays 9.2-11.8 KB in high RAM. All relocate to
-  `0x8c004000`, `0x8ce00000`, `0x8cee0000`, `0x8cfe0000`.
-- **The host does not pick them yet**: it chainloads the universal image.
-  Not measured on hardware or under flycast.
+- `bba` = `WITH_LAN_ADAPTER=0`, `lan` = `WITH_BBA=0`.
+- **Windows CE keeps the hook, not the RX interrupt**: `rx_iml` is only armed for
+  the Katana entry (`irq.c`), so under CE the tick runs on CE's own timer
+  interrupts and every frame is read by CPU. The `wince` variant reproduces
+  that; routing the RX line under CE would be new behaviour.
+- `all` builds byte for byte as before the variants where nothing else changed:
+  the object order is kept in `DCLOBJECTS` on purpose. Check `dcload.bin` and
+  `dcload-relocatable.elf` against the previous build after touching these guards.
+
+**The LAN Adapter keeps the BBA's loop contract** (`la_bb_loop`): `drain_iters`,
+the fine deadline (`fine_deadline_*`, `g_fine_timeouts`), the idle-poll limit
+(`LA_IDLE_POLL_LIMIT`), the counter-backwards guard (`g_pmcr_backwards`), TX and
+stop waits bounded on the loader's clock (`LA_TX_WAIT_TICKS`), and no 2.3 s link
+spin under a title. Out-of-sequence calls count (`g_la_oos`) instead of
+drawing and hanging. With `GA_LAN=1` (default; 0 returns the LAN Adapter to
+synchronous reads, the console A/B) it takes part in asynchronous reads, the idle
+listen and the RX interrupt: `irq.c` routes Holly EXT bit 2 (`EXT_LAN`, KOS
+`ASIC_EVT_EXP_8BIT`) instead of the BBA's bit 3, with the packet-ready interrupt
+enabled in `DLCR3` while a chunk is on the wire (`la_irq_enable`) and masked by
+the tick (`la_irq_ack`). There is no RX DMA on it (the data port is one byte a G2
+access): **a chunk costs milliseconds of CPU inside the tick, with SR.BL set.
+Not measured on hardware.**
+
+**Resident variants** (`DCLOAD_RESIDENT=1`, what `make loaders` builds for
+every variant; the CD's build and the universal image keep their screen and
+DHCP): no `video.o`, every display call a stub (`dcload.c` `#else` block;
+crt0's jump table for `exception.S` still resolves), no DHCP (`set_ip_dhcp()` is
+empty, `net.c` drops DHCP replies). The address comes from the host: it writes
+`our_ip` and `dcload_syscall_port` into the image's `.data` after relocation and
+before upload (`variants::patch_resident`), or from the BBA's warm start. A
+resident BBA katana image is 23056 B against the universal 40860.
+
+**VERS's third field** (`cmd_version`): the variant word, `0xA5` in the top byte,
+bits 0-3 layout (0 LOW, 1 HIGH, 2 CORE), 4-7 kind of title (0 all, 1 Katana, 2 KOS,
+3 CE), then CD-DA, BBA, LAN, MARK, DISC, resident. The host reads it
+(`VariantWord`) and the adapter from the reply's `address` field.
+
+Image sizes (`_end - base`, 2026-10-04, resident): `bba-katana` 29092 with CD-DA /
+23056 without; `bba-kos` 27632 / 21280; `bba-wince` 28784 / 22636; `lan-katana`
+26940 / 20780; `lan-kos` 26440 / 20088; `lan-wince` 27160 / 21000. All relocate
+to `0x8c004000`, `0x8ce00000`, `0x8cee0000`, `0x8cfe0000`; `.hiram` stays 9.2-11.8 KB.
+
+### 4.19 The core: the whole loader in the system hole
+
+A title that uses all of high RAM overwrites any loader up there: Shenmue II
+after a disc swap writes 0x8cf00000-0x8d000000 (the loader at `0x8cf60000`
+and at `0x8cf90000` were both found zeroed, 2026-10-04). The only ground a Katana
+title leaves to the system is `0x8c004000..0x8c00c000` (it paints
+`0x8c00c000..0x8c00f400` "SEGA"), minus the IP.BIN header it reads back at
+`0x8c008000` and `0x8c008100`. `DCLOAD_LAYOUT=core` (`dcload-core.x.in`) puts the
+**whole resident loader there and nothing in high RAM**:
+
+| Range | Before EXEC | Under the title |
+| --- | --- | --- |
+| `0x8c004000..0x8c008000` | `.text_lo`: crt0 (magic +4, trampoline +8, table +0..0x20), `cdfs_redir`, `cdfs_syscalls`, the drivers, `commands`, `net` | same |
+| `0x8c008000..0x8c008200` | the IP.BIN header, written by the host | `0x8c008100`: the current disc's, by `gd_bios_check_disc` (1 sector, 0x100 bytes copied) |
+| hole end..`_end` (≤ `DCLOAD_CORE_LIMIT`, 0x8c00c000) | the rest of the code, `.rodata`, `.data`, `.bss`, `.hiram` (packet buffers, `ga_xpa`, a 1-sector `gd_stage`), `.corestk` | same, and the hook stack (1 KB) and exchange stack (1.5 KB) are live |
+| `0x8c00c000..0x8c00c800` | the Maple DMA buffer (`MAPL`, refused once the title runs) | the title's |
+| `0x8c00c800..0x8c00f400` | the loader's main-loop stack | the title's |
+
+- Pinned at `0x8c004000`: linked natively, uploaded as it is, never relocated
+  (`relocate()` refuses another base when `_dcload_layout == 2`). Katana only,
+  `WITH_CDDA=0`, `WITH_DISC_SWAP=1`, `WITH_MARK_CMD=0`, `GD_STAGE_SECTORS=1`,
+  `GD_STAGE_BIG_SECTORS=0` (zero-length `gd_stage_big`), resident.
+- `_end` is the top of everything resident, so crt0's BSS clearing covers `.hiram`
+  and the stacks and never the hole (all `.data` is above it: link assert).
+  `cdfs_redir.s` (`.ifdef DCLOAD_LAYOUT_CORE`) and `irq.c` use `_xchg_stack_top` /
+  `_irq_stack_top`, not the Maple page.
+- Measured 2026-10-04: BBA core `_end = 0x8c00b960` (about 1.7 KB under the limit),
+  LAN core `0x8c00b7a0`. **Sonic Adventure's stack (SP down to `0x8c00b91c`) does
+  not clear it: that title stays HIGH.** Snow Surfers (SP `0x8c00e460`), Shenmue II
+  and Crazy Taxi 2 (stacks in high RAM) do.
+- The host chooses it only on evidence (`variants::core_verdict`): a recorded
+  stack depth that clears the core, a startup that does not paint it, a Katana
+  title with no audio (no CD-DA in the core), and a learned map that uses
+  `HIGH_BUSY_BLOCKS` of the top 64 blocks; `--loader-core` forces it,
+  `--no-loader-core` forbids it. It chainloads like any other:
+  CD loader → universal at `0x8ce00000` → the core.
+- `IP.BIN`: the host writes only `min(2048, hole room)` bytes of the header; the
+  full bootstrap mode needs a high loader. Titles that read constants past
+  `0x8c008200` (Sonic Adventure loads up to `0x8c008208`) want `DCLOAD_IPBIN_HOLE_END`
+  raised.
+- **Not measured on hardware or under flycast.** Open risks: the stacks'
+  high-water marks (read `_irq_stack_lo.._xchg_stack_top` for the first non-zero
+  word), a title writing `0x8c008200..0x8c00c000`, and the LAN async path.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
@@ -1533,8 +1611,16 @@ is redeployed with any change here (§4.11, §14.19).
 
 - `MAX_XFER = 256 × CHUNK_SIZE` ↔ `BIN_INFO_MAP_SIZE` 256 (`commands.c`).
 - **VERS**: after the version string's NUL, 4-byte fields read *forward*: the
-  linked base, then the cable (0 VGA, 2 RGB, 3 composite). Append new fields at
-  the end; older loaders send fewer.
+  linked base, then the cable (0 VGA, 2 RGB, 3 composite), then the variant word
+  (§4.18). Append new fields at the end; older loaders send fewer. The reply's
+  `address` is `installed_adapter` (octal 0300 LAN / 0400 BBA).
+- **Variants and the core** (§4.18, §4.19): the host picks
+  `dcload-{bba,lan}-{katana,kos,wince}-{cdda,nocdda}.elf` or
+  `dcload-core-{bba,lan}-katana.elf` from the adapter, the kind of title and the
+  disc's audio, and falls back to `dcload-relocatable.elf`; it reads a loader's
+  footprint from its own ELF (`variants::footprint_from_elf`, symbols `end`,
+  `stack`, `maple_dma_buffer`, `dcload_layout`, `_ipbin_hole_*`). Renaming or
+  dropping one of those breaks it. Hops always use the universal image.
 - **Layout**: `loaders::layout()`, `live_footprint()`, `HIRAM_RESERVED`
   (`0x3000`), `LOADER_SPAN` (`0x10000`) mirror the Makefile layout (§4.11). The
   relocator assumes only `R_SH_DIR32`, linker-symbol addresses, and `.guestvbr`

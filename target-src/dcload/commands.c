@@ -745,6 +745,28 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	memcpy(response->data + datalength, &cable_be, 4);
 	datalength += 4;
 
+	/*
+	 * And four more, the third field: WHICH BUILD this is, so the host knows
+	 * what it is talking to without guessing from a base (the CD's loader and a
+	 * resident core both report 0x8c004000). Built from -D constants only, so
+	 * it needs no relocation:
+	 *   bits 0-3  layout   0 LOW, 1 HIGH, 2 CORE (AGENTS.md 4.19)
+	 *   bits 4-7  title kind: 0 all, 1 Katana, 2 KOS, 3 Windows CE
+	 *   bit 8 CD-DA, 9 BBA driver, 10 LAN driver, 11 MARK, 12 DISC, 13 resident
+	 *   bits 24-31  0xA5, so an older loader's absence reads as "unknown"
+	 */
+	unsigned int variant_be = htonl(0xA5000000U
+		| (DCLOAD_LAYOUT_ID & 15U)
+		| (DCLOAD_OS_ID & 15U) << 4
+		| (unsigned int)WITH_CDDA << 8
+		| (unsigned int)WITH_BBA << 9
+		| (unsigned int)WITH_LAN_ADAPTER << 10
+		| (unsigned int)WITH_MARK_CMD << 11
+		| (unsigned int)WITH_DISC_SWAP << 12
+		| (unsigned int)DCLOAD_RESIDENT << 13);
+	memcpy(response->data + datalength, &variant_be, 4);
+	datalength += 4;
+
 	response->size = htonl(datalength);
 	// Stuff the adapter type inside the otherwise unused address field. :)
 	// Added in version 2.0.0 for dc-tool-ip to be able to do performance tuning
@@ -807,6 +829,14 @@ void cmd_maple(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	unsigned char *buffer = pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN;
 	command_t * response = (command_t *)buffer;
 
+#ifdef DCLOAD_LAYOUT_CORE
+	/* The Maple buffer is RAM a title paints and uses once it runs (the core
+	 * keeps nothing there): a stray retransmitted MAPL would DMA into it. */
+	if (running)
+	{
+		return;
+	}
+#endif
 	memcpy(response, command, COMMAND_LEN);
 
 	/* MAPLE_RESPONSE_AGAIN is "busy, ask me again", and a VM2/VMUPro answers it

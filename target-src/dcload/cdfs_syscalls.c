@@ -1203,13 +1203,18 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
 /*
  * BootROM service 2, syBtCheckDisc (cdfs_redir.s, sysvec_redir). The BIOS
  * answers it from the drive; this answers it from the image being served:
- * 0 once the first 7 sectors of the boot sector's IP.BIN sit at 0x8c008100,
+ * 0 once the first 0x100 bytes of the boot sector's IP.BIN sit at 0x8c008100,
  * which is where syBtGetCurrentSystemID reads the disc's number and product
  * from (the boot disc's copy is at 0x8c008000). Negative while the lid is
  * open or the drive is "checking" (§4.17), as the BIOS answers.
+ *
+ * ONE SECTOR, THROUGH gd_stage, AND ONLY THE HEADER COPIED: it used to read 7
+ * sectors straight to 0x8c008100, 0x8c008100..0x8c00b900 -- which a core
+ * loader (AGENTS.md 4.19) has under its code. The header is all the title reads
+ * back (the system ID, the product, the area flags).
  */
 #define IP_BIN_CURRENT_ADDR 0x8c008100U
-#define IP_BIN_CURRENT_SECTORS 7
+#define IP_BIN_CURRENT_BYTES 0x100U
 int gd_bios_check_disc(void)
 {
 #if WITH_DISC_SWAP
@@ -1222,10 +1227,14 @@ int gd_bios_check_disc(void)
 	}
 	saved_size = _GDS.sec_size;
 	_GDS.sec_size = 2048;
-	st = ReadSectors(IP_BIN_CURRENT_ADDR, GD_BOOT_SECTOR_LBA,
-			 IP_BIN_CURRENT_SECTORS);
+	st = ReadSectors((unsigned int)gd_stage, GD_BOOT_SECTOR_LBA, 1);
 	_GDS.sec_size = saved_size;
-	return (st == CMD_STAT_COMPLETED) ? 0 : -1;
+	if (st != CMD_STAT_COMPLETED)
+	{
+		return -1;
+	}
+	memcpy((void *)IP_BIN_CURRENT_ADDR, gd_stage, IP_BIN_CURRENT_BYTES);
+	return 0;
 #else
 	return 0;
 #endif
@@ -1372,7 +1381,7 @@ volatile unsigned int g_ga_wakes;	/* the thread resumed with a chunk on the wire
 #endif
 static int gd_async_on(void)
 {
-	return bb_is_bba() && g_irq_hooked
+	return bb_async_capable() && g_irq_hooked
 	    && ((GD_ASYNC_KATANA && GA_KATANA_READS) || gd_mmu_on());
 }
 
@@ -1728,7 +1737,7 @@ static void ga_listen(void)
  * nothing for its whole length). */
 int gd_idle_listen(void)
 {
-	if (ga_state != GA_IDLE || g_gd_in_transfer || !bb_is_bba())
+	if (ga_state != GA_IDLE || g_gd_in_transfer || !bb_async_capable())
 	{
 		return 0;
 	}

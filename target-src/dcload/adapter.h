@@ -77,6 +77,19 @@ extern unsigned int g_warm_ip;
 extern adapter_t * bb;
 extern adapter_t adapter_la;
 extern adapter_t adapter_bba;
+/* Asynchronous disc reads, the RX interrupt and the idle listen serve the LAN
+ * Adapter too (its loop keeps the same contract as the BBA's: drain_iters, the
+ * fine deadline, bounded waits). GA_LAN=0 (Makefile) returns it to synchronous
+ * reads, the A/B for the console: its data port is one byte a G2 access, so a
+ * chunk costs a few milliseconds of CPU in the hook's tick. */
+#ifndef GA_LAN
+#define GA_LAN 1
+#endif
+#if WITH_LAN_ADAPTER && GA_LAN
+#define bb_async_capable() 1
+#else
+#define bb_async_capable() bb_is_bba()
+#endif
 /* The live driver is the BBA's: always false in a LAN Adapter only build. */
 #if WITH_BBA
 #define bb_is_bba() (bb == &adapter_bba)

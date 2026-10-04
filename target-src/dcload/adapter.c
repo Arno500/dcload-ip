@@ -13,18 +13,24 @@ int loop_secs_elapsed = 0;
 adapter_t * bb;
 
 #if !WITH_BBA
-// What rtl8139.c defines, for a LAN Adapter only build: no warm start (the
-// LAN Adapter always takes the cold path) and no RX DMA.
+// What rtl8139.c defines, for a LAN Adapter only build: no BBA warm start
+// and no RX DMA.
 unsigned char g_warm_start;
 unsigned int g_warm_ip;
 volatile unsigned int g_rx_dma_tick;
-// The adapter loop's limits (adapter.h); the LAN Adapter's loop does not
-// read them, so its waits end on the seconds timeout alone.
+#endif
+
+// The loop contract both drivers keep (adapter.h): a bounded drain, the fine
+// deadline, and the counters that say how a wait ended.
 volatile int drain_iters = 0;
 volatile unsigned int fine_deadline_ticks = 0;
 volatile unsigned int fine_deadline_start = 0;
 unsigned int g_fine_timeouts = 0;
-#endif
+// Times the performance counter read lower than it had before. Non-zero means
+// the clock cannot be trusted for deadlines on this machine.
+unsigned int g_pmcr_backwards = 0;
+// Poll iterations spent with nothing received, at the last timeout.
+unsigned int g_idle_polls_max = 0;
 
 // Packet receive buffer. HIRAM_BUF keeps its 1536 bytes out of the loader
 // image, where they would otherwise sit directly in the path of a title's

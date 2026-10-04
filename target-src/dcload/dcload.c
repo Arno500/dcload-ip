@@ -47,8 +47,8 @@
 
 // CPU clock cycles need doubles in 1 count = 1 cycle mode
 #ifndef BUS_RATIO_COUNTER
-__attribute__((aligned(8))) static const unsigned int const_perf_freq[2] = {PERFCOUNTER_SCALE_DOUBLE_HIGH, PERFCOUNTER_SCALE_DOUBLE_LOW};
-__attribute__((aligned(8))) static const unsigned int const_32[2] = {0x41f00000, 0x00000000}; // 2^32 in SH4 double format
+__attribute__((aligned(8), unused)) static const unsigned int const_perf_freq[2] = {PERFCOUNTER_SCALE_DOUBLE_HIGH, PERFCOUNTER_SCALE_DOUBLE_LOW};
+__attribute__((aligned(8), unused)) static const unsigned int const_32[2] = {0x41f00000, 0x00000000}; // 2^32 in SH4 double format
 // PERFCOUNTER_SCALE is always 32-bit, but it's a constant stored in memory so using a double is OK
 // When using doubles, the 32-bit halves need to be flipped since SH4 doesn't reoreder
 // endianness for the 32-bit halves of a 64-bit double.
@@ -77,6 +77,7 @@ volatile unsigned char running = 0;
 volatile unsigned int global_bg_color = BBA_BG_COLOR;
 volatile unsigned int installed_adapter = BBA_MODEL;
 
+#if !DCLOAD_RESIDENT
 static volatile unsigned int current_counter_array[2] = {0};
 static volatile unsigned int old_dhcp_lease_updater_array[2] = {0}; // To update lease time display
 static volatile unsigned char dont_renew = 0;
@@ -306,6 +307,40 @@ void disp_dhcp_next_attempt(unsigned int time_left)
 	draw_string(160, 448, dhcp_next_counter, STR_COLOR);
 }
 
+#else /* DCLOAD_RESIDENT */
+/*
+ * A RESIDENT LOADER HAS NO SCREEN AND NO DHCP (AGENTS.md 4.18): it is
+ * chainloaded to serve a running title, its address is put in the image by the
+ * host (or carried by the BBA's warm start) and a title owns the display. What
+ * crt0's jump table and the display calls in the drivers still name become
+ * stubs; the real display code, DHCP and the string helpers are not linked.
+ */
+char * exception_code_to_string(unsigned int expevt)
+{
+	(void)expevt;
+	return "";
+}
+void uint_to_string(unsigned int foo, unsigned char *bar) { (void)foo; (void)bar; }
+void uint_to_string_dec(unsigned int foo, char *bar) { (void)foo; (void)bar; }
+void clear_lines(unsigned int y, unsigned int n, unsigned int c) { (void)y; (void)n; (void)c; }
+void setup_video(unsigned int mode, unsigned int color) { (void)mode; (void)color; }
+void draw_string(int x, int y, const char *string, int colour) { (void)x; (void)y; (void)string; (void)colour; }
+void clrscr(int colour) { (void)colour; }
+void disp_info(void) { booted = 1; }
+void disp_status(const char * status) { (void)status; }
+void disp_dhcp_attempts_count(void) { }
+void disp_dhcp_next_attempt(unsigned int t) { (void)t; }
+void set_ip_dhcp(void) { }
+static void error_bb(char *msg)
+{
+	(void)msg;
+	while (1)
+	{
+		asm volatile ("sleep");
+	}
+}
+#endif /* DCLOAD_RESIDENT */
+
 // The C language technically requires that all uninitialized global variables
 // get initted to 0 via .bss, which is something I really don't like relying on.
 // 'our_ip' is declared in commands.c, of all places, and is not given an
@@ -355,6 +390,7 @@ static void set_ip_from_file(void)
 	// Now it's stored ip[0] 11-0-168-192 ip[3] (this is little endian data on a little endian system), which make_ip handles when building packets.
 }
 
+#if !DCLOAD_RESIDENT
 static void update_ip_display(unsigned int new_ip, const char *mode_string)
 {
 	clear_lines(126, 24, global_bg_color);
@@ -743,6 +779,8 @@ extern char _hiram_start[];
  * number, with no relocation, and quietly make the image un-relocatable. */
 extern char maple_dma_buffer[];
 
+#endif /* !DCLOAD_RESIDENT */
+
 /*
  * DCLOAD_ZERO_GAME_RAM -- hand the title a clean machine.
  *
@@ -1009,8 +1047,12 @@ int main(void)
 	if (adapter_detect() < 0)
 		error_bb("NO ETHERNET ADAPTER DETECTED!");
 
+#if !DCLOAD_RESIDENT
 	for(start = 0; start < 6; start++)
 		uchar_to_string_hex(bb->mac[start], mac_string + start*3);
+#else
+	(void)start;
+#endif
 
 	/*
 	 * A warm-started adapter hands us the address the previous instance was

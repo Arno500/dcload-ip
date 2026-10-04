@@ -40,9 +40,15 @@
 #if WITH_IRQ_HOOK
 
 #if !WITH_BBA
-/* A LAN Adapter only build: no RX interrupt, no RX DMA (rx_iml stays 0). */
+/* A LAN Adapter only build: no RX DMA. */
 #define rtl_rx_dma_bit() 0U
 #define rtl_irq_ack()    do { } while (0)
+#endif
+#if !WITH_LAN_ADAPTER
+#define la_irq_enable(on) do { } while (0)
+#define la_irq_ack()      do { } while (0)
+#else
+#include "lan_adapter.h"
 #endif
 
 extern unsigned short irq_tramp[], irq_tramp_end[];
@@ -96,8 +102,18 @@ volatile unsigned int g_irq_iml[9];		/* the title's IML2/4/6 NRM,EXT,ERR at inst
 #define SB_IST(n)  (((volatile unsigned int *)0xa05f6900U)[n])	/* NRM, EXT, ERR */
 #define SB_IML2    ((volatile unsigned int *)0xa05f6910U)	/* IML4, IML6 follow, 0x10 apart;
 								 * INTEVT 0x3a0, 0x360, 0x320 */
-#define EXT_BBA    8U
+#define EXT_BBA    8U	/* the BBA's: Holly EXT bit 3 */
+#define EXT_LAN    4U	/* the LAN Adapter's: EXT bit 2 (KOS ASIC_EVT_EXP_8BIT) */
 static volatile unsigned int *rx_iml;
+/* The live adapter's EXT bit, fixed when the hook is installed. */
+static unsigned int rx_ext = EXT_BBA;
+static inline void rx_irq_ack(void)
+{
+	if (rx_ext == EXT_BBA)
+		rtl_irq_ack();
+	else
+		la_irq_ack();
+}
 
 /* The end bit of the RX DMA armed on our level, among the ones the title's
  * mask there did not already hold (a shared IML6 is the title's too). */
@@ -116,7 +132,9 @@ void irq_rx_arm(unsigned int on)
 		rx_iml[0] &= ~rx_armed_dma;
 		rx_armed_dma = dma & ~rx_iml[0];
 		rx_iml[0] |= rx_armed_dma;
-		rx_iml[1] = (rx_iml[1] & ~EXT_BBA) | (on == 1U ? EXT_BBA : 0U);
+		rx_iml[1] = (rx_iml[1] & ~rx_ext) | (on == 1U ? rx_ext : 0U);
+		if (rx_ext != EXT_BBA)
+			la_irq_enable(on == 1U);
 	}
 }
 
@@ -170,7 +188,14 @@ void irq_hook_check(void)
 	/* The Maple page's first KB: the part of the MAPL receive buffer no title
 	 * ever makes us use, below gd_on_loader_stack()'s stack at the page top.
 	 * They must not be one stack: see 9b of docs/wince-investigation.md. */
+	#ifdef DCLOAD_LAYOUT_CORE
+	{
+		extern char irq_stack_top[];	/* dcload-core.x.in */
+		irq_tramp_stack[0] = (unsigned int)irq_stack_top;
+	}
+#else
 	irq_tramp_stack[0] = (unsigned int)maple_dma_buffer + 0x400U;
+#endif
 	irq_tramp_entry[0] = (unsigned int)irq_entry;
 
 	/* Masked: an interrupt must not find half a patch. The trampoline and its
@@ -197,8 +222,9 @@ void irq_hook_check(void)
 	g_irq_vbr = vbr;
 	g_irq_nop_entry = nops;
 	rx_iml = 0;
+	rx_ext = bb_is_bba() ? EXT_BBA : EXT_LAN;
 	g_irq_rx_evt = 0;
-	if (nops && WITH_BBA)
+	if (nops && bb_async_capable())
 	{
 		/* IML2 (IRL 13, INTEVT 0x3a0), IML4 (IRL 11, 0x360), IML6 (IRL 9,
 		 * 0x320) -- KOS asic.c: "691x -> irq 13 ... 693x -> irq 9". The
@@ -267,21 +293,21 @@ void irq_tick(void)
 		 * rx_settle() clears the bit when it finishes the frame. */
 		read_mark = t0 - (IRQ_READ_PERIOD << 4);
 	}
-	if (g_irq_evt_last == g_irq_rx_evt && ((SB_IST(1) & EXT_BBA) || (SB_IST(0) & ours)))
+	if (g_irq_evt_last == g_irq_rx_evt && ((SB_IST(1) & rx_ext) || (SB_IST(0) & ours)))
 	{
 		/* Swallowed only when the chip -- or the DMA -- was pending and
 		 * nothing of the title's is: an entry we did not cause always
 		 * reaches the title, or a source of its own would re-enter here
 		 * forever (9q). */
-		if (SB_IST(1) & EXT_BBA)
+		if (SB_IST(1) & rx_ext)
 		{
-			rtl_irq_ack();
+			rx_irq_ack();
 		}
 		SB_ISTNRM = ours;		/* w1c: our DMA's line falls, whatever else this tick does */
 		g_irq_rx++;
 		read_mark = t0 - (IRQ_READ_PERIOD << 4);	/* look at the read now */
 		g_irq_swallow = !((SB_IST(0) & rx_iml[0] & ~ours)
-				  | (SB_IST(1) & rx_iml[1] & ~EXT_BBA)
+				  | (SB_IST(1) & rx_iml[1] & ~rx_ext)
 				  | (SB_IST(2) & rx_iml[2]));
 	}
 

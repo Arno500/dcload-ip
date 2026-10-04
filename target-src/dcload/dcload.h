@@ -15,6 +15,11 @@
 // Valid values are 1 or 2 ONLY.
 #define DCLOAD_PMCR 1
 
+/* A resident loader (Makefile DCLOAD_RESIDENT): no screen, no DHCP. */
+#ifndef DCLOAD_RESIDENT
+#define DCLOAD_RESIDENT 0
+#endif
+
 // Background color
 // In RGB0555 format
 // BBA default blue is 0x0010

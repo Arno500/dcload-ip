@@ -1,5 +1,9 @@
 WHAT'S NEW IN 2.0.4
 
+* The core: `DCLOAD_LAYOUT=core` keeps the whole resident loader under 0x8c00c000
+  (nothing in high RAM); resident variants have no screen and no DHCP; the LAN
+  Adapter keeps the BBA's loop contract and takes part in asynchronous reads;
+  VERS reports the build (§4.18, §4.19).
 * Loader variants: `make loaders` also builds one relocatable image per
   network driver (BBA, LAN Adapter), kind of title (Katana, KOS, Windows CE)
   and CD-DA or not, each leaving out what its case never runs (§4.18).

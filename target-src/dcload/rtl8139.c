@@ -1375,18 +1375,6 @@ static int rtl_bb_rx()
 	return processed;
 }
 
-volatile int drain_iters = 0;
-
-/* The fine deadline -- see adapter.h. Zero unless a caller has armed it. */
-volatile unsigned int fine_deadline_ticks = 0;
-volatile unsigned int fine_deadline_start = 0;
-unsigned int g_fine_timeouts = 0;
-/* Times the performance counter read lower than it had before. Non-zero means
- * the clock cannot be trusted for deadlines on this machine. */
-unsigned int g_pmcr_backwards = 0;
-/* Poll iterations spent with nothing received, at the last timeout. */
-unsigned int g_idle_polls_max = 0;
-
 /*
  * RX ring forensics. Pure counters -- no network I/O, so sampling them cannot
  * perturb what they measure (a write(1,...) trace here would be a transmit

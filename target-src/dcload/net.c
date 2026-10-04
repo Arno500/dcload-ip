@@ -232,12 +232,14 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		&& (ntohs(udp->src) == DHCP_DEST_PORT)
 		&& (udp_pkt_data->op == DHCP_OP_BOOTREPLY), 0)) // DHCP ACK or DHCP OFFER
 	{
+#if !DCLOAD_RESIDENT
 		if(!handle_dhcp_reply(ether->src, udp_pkt_data, udp_data_length)) // -8 because udp->length includes 8-byte udp header
 		{ // -1 is true in C
 			// If we got a DHCP packet that belongs to some other machine, e.g. some machine requires a broadcasted address instead of a unicasted one,
 			// don't escape the loop since we didn't get the packet we needed.
 			escape_loop = 1;
 		}
+#endif /* a resident loader runs no DHCP: such a datagram is dropped */
 	}
 	else
 	{
