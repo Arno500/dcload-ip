@@ -99,7 +99,7 @@ GROUPS = [
     ("Interrupt hook (irq.c) -- AGENTS.md 4.15", [
         "g_irq_hooked", "g_irq_nop_entry", "g_irq_vbr", "g_irq_rehooks",
         "g_irq_refused", "g_irq_refused_vbr",
-        "g_irq_entries", "g_irq_ticks", "g_irq_tick_max", "g_irq_tick_sum", "g_irq_evt_last", "g_irq_rx", "g_irq_rx_evt",
+        "g_irq_entries", "g_irq_ticks", "g_irq_tick_max", "g_irq_tick_sum", "g_irq_evt_last", "g_irq_rx", "g_irq_rx_stray", "g_irq_rx_evt",
         "g_ga_posts", "g_ga_irq_done", "g_ga_xlat_miss", "g_ga_sync", "g_ga_wakes",
     ]),
     ("G2 DMA (g2dma.c, rtl8139.c) -- AGENTS.md 4.16", [

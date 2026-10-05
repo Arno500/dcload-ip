@@ -342,6 +342,12 @@ boot.
 `[dcload_base, end)` and `[_hiram_start, _hiram_end)`, compared in P1. The Maple
 DMA buffer is deliberately not in the list: it is written only while a `MAPL`
 command runs, never under a title.
+A read refused for this is failed to the title and never reaches the host:
+`g_gd_self_refused` counts them and `_lo`/`_hi` keep the last range, defined
+beside `g_gd_sp_min` so that the host's stack watch reads them in the same
+request and adds the range to the title's learned memory map (Shenmue II's
+"corrupted data", 2026-10-05: 382 sectors aimed through a loader at
+`0x8c7d0000`).
 
 **Invariants, each paid for:**
 
@@ -944,9 +950,15 @@ interrupt enters at `VBR+0x600`; the loader patches the title's live table so
   whose masks the title left at zero, else IML6, **shared**. The tick
   acknowledges the chip (`rtl_irq_ack()`), and `irq_entry` swallows the
   interrupt (`g_irq_swallow`) unless something of the title's is pending on that
-  level. **Only an entry with the chip's bit pending is ever swallowed** —
-  swallowing a title's own interrupt froze Crazy Taxi. `g_irq_rx`,
-  `g_irq_rx_evt`, `g_irq_iml[9]` (the title's masks).
+  level. **An entry with something of the title's pending on that level always
+  reaches the title** — swallowing a title's own interrupt froze Crazy Taxi.
+  **Everything else on our level is swallowed, including a stray entry** whose
+  cause was gone when the tick looked (our bit cleared between the line's rise
+  and the CPU taking it: `g_irq_rx_stray`). Passed on, a stray reached a level
+  the title has no handler for, and Shenmue II's kernel sends any unknown event
+  to its debug monitor (`jsr 0xac004000`), which waits forever for a host:
+  black screen before the menu (2026-10-05, event `0x3a0` in its saved
+  context). `g_irq_rx`, `g_irq_rx_evt`, `g_irq_iml[9]` (the title's masks).
 - Counters: `g_irq_hooked`, `g_irq_vbr`, `g_irq_entries`, `g_irq_ticks`,
   `g_irq_tick_max`, `g_irq_tick_sum` (the CPU the hook takes), `g_irq_evt_last`.
 
@@ -1181,6 +1193,21 @@ title leaves to the system is `0x8c004000..0x8c00c000` (it paints
   `HIGH_BUSY_BLOCKS` of the top 64 blocks; `--loader-core` forces it,
   `--no-loader-core` forbids it. It chainloads like any other:
   CD loader → universal at `0x8ce00000` → the core.
+- **The shadow.** Some titles run their own boot code in the hole before
+  anything else: Shenmue II's 1ST_READ copies `0x8c010100..0x8c014000` to
+  `0xac004000` and jumps there (a drive check on the GD-ROM registers, its buffer
+  at `0x8c007800`, its tables at `0x8c00f400..0x8c00fa40`), over the core: the
+  first GD call then ran the title's code (2026-10-05, "does not boot at all").
+  That code is done before the title's first call to a BIOS vector, and nothing
+  of the core runs until then. So the host writes `core_shadow` (`.data`, 0 =
+  none) with the high base the title would have had, free until that call;
+  `cmd_execute` copies the core there last thing before `go()` and points
+  `0xbc`/`0xc0`/`0xe0` at the copy's `core_tramp_*` (`cdfs_redir.s`). The first
+  call, masked, copies the core back (hole excepted, through P1 with every line
+  purged), invalidates the I-cache from P2, points the vectors at the core's
+  own entries and jumps to the real one; `ct_done` turns a stale vector read
+  into a plain jump. A title that writes the hole AFTER its first BIOS call is
+  still out of reach.
 - `IP.BIN`: the host writes only `min(2048, hole room)` bytes of the header; the
   full bootstrap mode needs a high loader. Titles that read constants past
   `0x8c008200` (Sonic Adventure loads up to `0x8c008208`) want `DCLOAD_IPBIN_HOLE_END`

@@ -3,7 +3,9 @@ WHAT'S NEW IN 2.0.4
 * The core: `DCLOAD_LAYOUT=core` keeps the whole resident loader under 0x8c00c000
   (nothing in high RAM); resident variants have no screen and no DHCP; the LAN
   Adapter keeps the BBA's loop contract and takes part in asynchronous reads;
-  VERS reports the build (§4.18, §4.19).
+  VERS reports the build (§4.18, §4.19). A core keeps a copy of itself in
+  high RAM until the title's first BIOS call, for titles whose boot code runs
+  at 0x8c004000 (Shenmue II).
 * Loader variants: `make loaders` also builds one relocatable image per
   network driver (BBA, LAN Adapter), kind of title (Katana, KOS, Windows CE)
   and CD-DA or not, each leaving out what its case never runs (§4.18).
@@ -20,6 +22,9 @@ WHAT'S NEW IN 2.0.4
   moves disc reads and feeds CD-DA while the title runs.
 * The BBA's RX frames and the CD-DA rings are moved by G2 DMA while a title
   runs, leaving the CPU to the title.
+* The interrupt hook swallows a stray entry on the BBA's level (its cause gone
+  before the CPU took it) instead of passing it to a title that has no handler
+  there: Shenmue II entered its debug monitor, black screen (§4.15).
 * dcload can be relocated: the host builds on a single relocatable image
   (`make loaders`) and chainloads it to the base each title needs, away from
   the RAM the title uses.

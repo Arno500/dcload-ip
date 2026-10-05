@@ -841,6 +841,11 @@ extern char dcload_base[];
 extern char end[];
 extern char _hiram_start[], _hiram_end[];
 
+/* Defined beside g_gd_sp_min: the host reads them in the same request. */
+extern unsigned int g_gd_self_refused;
+extern unsigned int g_gd_self_refused_lo;
+extern unsigned int g_gd_self_refused_hi;
+
 static int overlaps_dcload(unsigned int addr, unsigned int size)
 {
 	unsigned int a;
@@ -865,8 +870,15 @@ static int overlaps_dcload(unsigned int addr, unsigned int size)
 		return 0;
 	}
 
-	return (a < (unsigned int)end && e > (unsigned int)dcload_base)
-	    || (a < (unsigned int)_hiram_end && e > (unsigned int)_hiram_start);
+	if ((a < (unsigned int)end && e > (unsigned int)dcload_base)
+	    || (a < (unsigned int)_hiram_end && e > (unsigned int)_hiram_start))
+	{
+		g_gd_self_refused++;
+		g_gd_self_refused_lo = addr;
+		g_gd_self_refused_hi = addr + size;
+		return 1;
+	}
+	return 0;
 }
 
 static void write_hex8(unsigned int value)
@@ -2706,6 +2718,16 @@ static unsigned int gd_last_sp;
  */
 unsigned int g_gd_sp_min = 0xffffffffU;
 unsigned int g_gd_sp_in_image = 0;
+/* Disc reads refused because they would land on the loader (overlaps_dcload()),
+ * and the last such range as the title asked it. The title is told FAILED and
+ * the host never sees the request, so this is the only trace: Shenmue II showed
+ * "corrupted data" over one (2026-10-05, 382 sectors through a loader at
+ * 0x8c7d0000). Kept beside the two above, which the host's stack watch reads
+ * every ten seconds: it reads these in the same request and adds the range to
+ * the title's learned memory map. */
+unsigned int g_gd_self_refused = 0;
+unsigned int g_gd_self_refused_lo = 0;
+unsigned int g_gd_self_refused_hi = 0;
 
 static void gd_note_caller(unsigned int pr)
 {
@@ -2788,17 +2810,61 @@ static void gd_note_caller(unsigned int pr)
 #ifndef GD_SERVICE_ITERS
 #define GD_SERVICE_ITERS 256
 #endif
+/* GD_SERVICE_PERIOD_TICKS (Pck/4 ticks, 0 = every call): at most one look in
+ * that long, a 1 ms window with reception on, as the hook's idle listen does
+ * (ga_listen). For a build without the hook, whose loader is otherwise deaf
+ * while a title only polls GetDrvStat (Shenmue II's disc-swap screen,
+ * 2026-10-05: two million calls, no read, DISC never heard). */
+#ifndef GD_SERVICE_PERIOD_TICKS
+#define GD_SERVICE_PERIOD_TICKS 0
+#endif
+/*
+ * drain_iters and the fine deadline are single: whoever runs bb->loop() sets
+ * them and clears them on its way out, so a second loop nested inside the
+ * first leaves the outer one with no bound, and it never returns. Shenmue II
+ * froze twice before its menu that way (2026-10-05, PC in rtl_bb_loop, both
+ * bounds 0): this window interrupted by a title's handler whose GetDrvStat ran
+ * cdda_service()'s idle listen, then that listen interrupted by a GetDrvStat
+ * running this window. So the window runs masked, as the hook's listen runs
+ * under SR.BL, and stays out while any loop or CD-DA service is under way, as
+ * the hook does (irq.c: cdda_busy). Probably Sonic Adventure's death above as
+ * well; not re-measured.
+ */
 static void gd_service_net(void)
 {
-	if (gd_lock())
+	unsigned int sr;
+
+#if GD_SERVICE_PERIOD_TICKS
+	static unsigned int svc_mark;
+
+	if (clk_since(svc_mark) < GD_SERVICE_PERIOD_TICKS)
 	{
-		return; /* a transfer owns the wire -- stay off it */
+		return;
+	}
+#endif
+	__asm__ volatile ("stc sr,%0" : "=r" (sr) : : "memory");
+	gd_imask_set(0xf0U);
+	if (cdda_busy || drain_iters || fine_deadline_ticks || gd_lock())
+	{
+		gd_imask_set(sr & 0xf0U);
+		return; /* someone owns the wire -- stay off it */
 	}
 	gd_unlock();
 
+#if GD_SERVICE_PERIOD_TICKS
+	svc_mark = clk_now();
+	bb->start();
+	fine_deadline_start = clk_now();
+	fine_deadline_ticks = 12500U;	/* 1 ms */
+#endif
 	drain_iters = GD_SERVICE_ITERS;
 	bb->loop(0);
 	drain_iters = 0;
+#if GD_SERVICE_PERIOD_TICKS
+	fine_deadline_ticks = 0;
+	timeout_loop = 0;
+#endif
+	gd_imask_set(sr & 0xf0U);
 }
 #else
 #define gd_service_net() do { } while (0)

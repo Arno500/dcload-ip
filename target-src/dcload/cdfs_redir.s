@@ -660,3 +660,160 @@ gd_lock_byte:
 	.long 0
 gd_server_live:
 	.long 0
+
+.ifdef DCLOAD_LAYOUT_CORE
+!
+! THE CORE'S SHADOW (AGENTS.md 4.19). Some titles run their own boot code in
+! the system hole before anything else: Shenmue II's 1ST_READ copies 16 KB of
+! itself to 0xac004000 and jumps there (a drive check that talks to the GD-ROM
+! registers directly), over the core. That code is finished before the title's
+! first call to a BIOS vector, and the core is not needed until then.
+!
+! So, when the host names a SHADOW (core_shadow, high RAM the title leaves
+! alone until it calls the GD driver), cmd_execute copies the whole core there
+! and points the three vectors at the shadow's copy of the entries below. The
+! first call, whichever vector, copies the core back from the shadow (the
+! IP.BIN header between the two halves excepted), invalidates the instruction
+! cache, points the vectors at the core's own entries and goes on to the real
+! entry. Nothing of the core has run between EXEC and that call, so the copy
+! taken at EXEC is the state to resume from.
+!
+! Runs IN THE SHADOW: position independent (mova, bsr, pc-relative literals;
+! only the core's own addresses, which never move, are absolute). r0-r3 and T
+! are the caller's to lose (the C convention every vector caller follows);
+! r4-r7, PR and SR reach the real entry as they came. Masked while the core is
+! rewritten. Stores through P1 and purges every line: the title may be running
+! the operand cache in copy-back mode, and a line it held over the hole would
+! otherwise be written back over the restored core later.
+!
+.section .text
+.global _core_tramp_bc
+.global _core_tramp_c0
+.global _core_tramp_e0
+.align 2
+_core_tramp_bc:
+	bra	core_tramp
+	mov	#0, r1
+_core_tramp_c0:
+	bra	core_tramp
+	mov	#4, r1
+_core_tramp_e0:
+	bra	core_tramp
+	mov	#8, r1
+core_tramp:
+	sts.l	pr, @-r15
+	mova	ct_targets, r0
+	mov.l	@(r0,r1), r1
+	mov.l	r1, @-r15		! the real entry
+	stc	sr, r0
+	mov.l	r0, @-r15		! the caller's SR
+	or	#0xf0, r0
+	ldc	r0, sr
+	mova	ct_done, r0
+	mov.l	@r0, r1
+	tst	r1, r1
+	bf	ct_go			! a stale vector read: the core is back already
+	mov	#1, r1
+	mov.l	r1, @r0
+	mova	ct_anchor, r0
+	mov.l	@r0, r1			! where ct_anchor was linked (in the core)
+	sub	r1, r0			! r0 = shadow - core
+	mov.l	ct_base_k, r2
+	mov.l	ct_hole_lo_k, r3
+	bsr	ct_copy
+	nop
+	mov.l	ct_hole_hi_k, r2
+	mov.l	ct_end_k, r3
+	bsr	ct_copy
+	nop
+	mova	ct_icinv, r0		! the I-cache is invalidated from P2
+	mov.l	ct_p2clr_k, r1
+	and	r1, r0
+	mov.l	ct_p2_k, r1
+	or	r1, r0
+	jsr	@r0
+	nop
+	mova	ct_targets, r0		! the vectors: the core's own entries now
+	mov.l	ct_vec_k, r2
+	mov.l	@r0, r1
+	mov.l	r1, @r2
+	ocbp	@r2
+	mov.l	@(4,r0), r1
+	mov.l	r1, @(4,r2)
+	mov	r2, r3
+	add	#4, r3
+	ocbp	@r3
+	mov.l	@(8,r0), r1
+	mov.l	r1, @(36,r2)
+	add	#32, r3
+	ocbp	@r3
+ct_go:
+	mov.l	@r15+, r0
+	ldc	r0, sr
+	mov.l	@r15+, r1
+	lds.l	@r15+, pr
+	jmp	@r1
+	nop
+
+! [r2, r3) <- [r2 + r0, r3 + r0), then every line of it purged. r1 scratch.
+ct_copy:
+	mov.l	r2, @-r15
+1:	mov.l	@(r0,r2), r1
+	mov.l	r1, @r2
+	add	#4, r2
+	cmp/hs	r3, r2
+	bf	1b
+	mov.l	@r15+, r2
+2:	ocbp	@r2
+	add	#32, r2
+	cmp/hs	r3, r2
+	bf	2b
+	rts
+	nop
+
+.align 2
+ct_icinv:
+	mov.l	ct_ccr_k, r1
+	mov.l	@r1, r0
+	mov.l	ct_ici_k, r2
+	or	r2, r0
+	mov.l	r0, @r1
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	rts
+	nop
+
+.align 2
+ct_targets:
+	.long	cdfs_redir
+	.long	cdfs_redir_c0
+	.long	sysvec_redir
+ct_done:
+	.long	0
+ct_anchor:
+	.long	ct_anchor
+ct_base_k:
+	.long	_dcload_base
+ct_hole_lo_k:
+	.long	__ipbin_hole_start
+ct_hole_hi_k:
+	.long	__ipbin_hole_end
+ct_end_k:
+	.long	_end
+ct_p2clr_k:
+	.long	0x1fffffff
+ct_p2_k:
+	.long	0xa0000000
+ct_vec_k:
+	.long	0x8c0000bc
+ct_ccr_k:
+	.long	0xff00001c
+ct_ici_k:
+	.long	0x00000800
+.endif

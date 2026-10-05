@@ -82,6 +82,7 @@ volatile unsigned int g_irq_tick_max;		/* longest irq_tick, Pck/4 ticks (clk_sin
 volatile unsigned int g_irq_tick_sum;		/* all of them: the CPU the tick takes */
 volatile unsigned int g_irq_evt_last;		/* INTEVT of the last tick */
 volatile unsigned int g_irq_rx;			/* BBA RX interrupts taken (Katana) */
+volatile unsigned int g_irq_rx_stray;		/* entries on our level with nothing pending: swallowed */
 volatile unsigned int g_irq_swallow;		/* irq_hook.S: rte, the title never sees it */
 volatile unsigned int g_irq_rx_evt;		/* INTEVT the BBA is routed to, 0 = none */
 volatile unsigned int g_irq_iml[9];		/* the title's IML2/4/6 NRM,EXT,ERR at install */
@@ -293,19 +294,32 @@ void irq_tick(void)
 		 * rx_settle() clears the bit when it finishes the frame. */
 		read_mark = t0 - (IRQ_READ_PERIOD << 4);
 	}
-	if (g_irq_evt_last == g_irq_rx_evt && ((SB_IST(1) & rx_ext) || (SB_IST(0) & ours)))
+	if (g_irq_evt_last == g_irq_rx_evt)
 	{
-		/* Swallowed only when the chip -- or the DMA -- was pending and
-		 * nothing of the title's is: an entry we did not cause always
-		 * reaches the title, or a source of its own would re-enter here
-		 * forever (9q). */
-		if (SB_IST(1) & rx_ext)
+		if ((SB_IST(1) & rx_ext) || (SB_IST(0) & ours))
 		{
-			rx_irq_ack();
+			if (SB_IST(1) & rx_ext)
+			{
+				rx_irq_ack();
+			}
+			SB_ISTNRM = ours;	/* w1c: our DMA's line falls, whatever else this tick does */
+			g_irq_rx++;
+			read_mark = t0 - (IRQ_READ_PERIOD << 4);	/* look at the read now */
 		}
-		SB_ISTNRM = ours;		/* w1c: our DMA's line falls, whatever else this tick does */
-		g_irq_rx++;
-		read_mark = t0 - (IRQ_READ_PERIOD << 4);	/* look at the read now */
+		else
+		{
+			g_irq_rx_stray++;
+		}
+		/* Swallowed whenever nothing of the title's is pending on our level:
+		 * an entry of the title's always reaches it, or its source would
+		 * re-enter here forever (9q). That includes a STRAY entry, whose
+		 * cause was already gone when the tick looked -- our bit cleared
+		 * between the line's rise and the CPU taking it (rx_settle(), a
+		 * drain outside the tick, a w1c still in the write buffer at rte).
+		 * Passed on, it reached a level the title has no handler for:
+		 * Shenmue II's kernel sends any such event to its debug monitor
+		 * (jsr 0xac004000), which waits forever for a host -- black screen
+		 * before the menu (2026-10-05, event 0x3a0 in its saved context). */
 		g_irq_swallow = !((SB_IST(0) & rx_iml[0] & ~ours)
 				  | (SB_IST(1) & rx_iml[1] & ~rx_ext)
 				  | (SB_IST(2) & rx_iml[2]));

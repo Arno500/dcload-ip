@@ -231,6 +231,10 @@ CFLAGS += -DDCLOAD_ZERO_GAME_RAM=$(DCLOAD_ZERO_GAME_RAM)
 # exactly like a dead loader. See the comment above gd_service_net().
 GD_SERVICE_EVERY_SYSCALL ?= 0
 CFLAGS += -DGD_SERVICE_EVERY_SYSCALL=$(GD_SERVICE_EVERY_SYSCALL)
+# With it: at most one 1 ms listen in this many Pck/4 ticks (625000 = 50 ms).
+ifneq ($(GD_SERVICE_PERIOD_TICKS),)
+CFLAGS += -DGD_SERVICE_PERIOD_TICKS=$(GD_SERVICE_PERIOD_TICKS)
+endif
 
 # Hand the launched title SR with IMASK=15 instead of IMASK=0. A DIAGNOSTIC:
 # the vector table we hand a title acknowledges nothing, so an interrupt still

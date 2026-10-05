@@ -28,6 +28,34 @@ unsigned int tool_version = 0;
 
 static unsigned int cached_dest = 0;
 
+#ifdef DCLOAD_LAYOUT_CORE
+/*
+ * THE CORE'S SHADOW (AGENTS.md 4.19, cdfs_redir.s core_tramp_*): high RAM the
+ * title leaves alone until its first call to a BIOS vector, written here by the
+ * host before upload (0 = none). At EXEC the whole core is copied there and the
+ * vectors point at the copy's entries; the first call copies the core back, for
+ * a title whose boot code runs over the system hole (Shenmue II's 1ST_READ).
+ */
+__attribute__((aligned(4))) volatile unsigned int core_shadow = 0;
+
+static void core_shadow_arm(void)
+{
+	extern char dcload_base[], end[];
+	extern char core_tramp_bc[], core_tramp_c0[], core_tramp_e0[];
+	unsigned int base = (unsigned int)dcload_base;
+	unsigned int shadow = (core_shadow & 0x1fffffff) | 0x80000000;
+	unsigned int off = shadow - base;
+	volatile unsigned int *vec = (volatile unsigned int *)0xac0000bc;
+
+	/* Last: everything the title is to find is already in the image. Through
+	 * P2, because go() invalidates the operand cache without writing it back. */
+	memcpy((void *)(shadow | 0xa0000000), dcload_base, end - dcload_base);
+	vec[0] = (unsigned int)core_tramp_bc + off;
+	vec[1] = (unsigned int)core_tramp_c0 + off;
+	vec[9] = (unsigned int)core_tramp_e0 + off;
+}
+#endif
+
 /*
  * Transfer accounting, for the one read Sonic Adventure never completes.
  * dcload survives that read (it merely times out), so unlike every earlier
@@ -270,6 +298,12 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 		 * cmd_reboot() -- that goes back into this loader, which wants
 		 * the machine exactly as it is. */
 		setup_machine();
+#endif
+#ifdef DCLOAD_LAYOUT_CORE
+		if ((cmd_size >> 1) && core_shadow)
+		{
+			core_shadow_arm();
+		}
 #endif
 //		CacheBlockPurge((void*)0x0c004000, 1536);
 		asm volatile ("nop\n\t" : : : "memory"); // memory barrier for GCC
