@@ -94,38 +94,7 @@ DCLOAD_GUEST_VBR = 0x8c00f400
 
 DCLOAD_IS_LOW := $(shell [ $$(( $(DCLOAD_BASE) )) -lt $$(( 0x8c010000 )) ] && echo 1 || echo 0)
 
-# The CORE layout (AGENTS.md 4.19, dcload-core.x.in): the whole resident loader
-# in the system hole 0x8c004000..0x8c00c000, with a gap for the IP.BIN header,
-# nothing in high RAM. Pinned at 0x8c004000 (the host uploads it as it is, it
-# is never relocated) and for Katana titles. `make DCLOAD_LAYOUT=core`.
-DCLOAD_LAYOUT ?=
-ifeq ($(DCLOAD_LAYOUT),core)
-  ifneq ($(DCLOAD_BASE),0x8c004000)
-    $(error DCLOAD_LAYOUT=core is pinned at DCLOAD_BASE=0x8c004000)
-  endif
-  DCLOAD_OS ?= katana
-  ifneq ($(DCLOAD_OS),katana)
-    $(error DCLOAD_LAYOUT=core serves Katana titles only: DCLOAD_OS=katana)
-  endif
-  DCLOAD_RESIDENT ?= 1
-  WITH_CDDA ?= 0
-  WITH_DISC_SWAP ?= 1
-  WITH_MARK_CMD ?= 0
-  DCLOAD_STACK ?= $(DCLOAD_GUEST_VBR)
-  DCLOAD_MAPLE ?= 0x8c00c000
-  DCLOAD_HIRAM ?= $(DCLOAD_MAPLE)
-  DCLOAD_CORE_LIMIT ?= 0x8c00c000
-  DCLOAD_IPBIN_HOLE_END ?= 0x8c008200
-  CORE_IRQ_STACK ?= 0x400
-  CORE_XCHG_STACK ?= 0x600
-  DCLOAD_LAYOUT_ID = 2
-  CFLAGS += -DDCLOAD_LAYOUT_CORE=1 -DGD_STAGE_SECTORS=1 -DGD_STAGE_BIG_SECTORS=0 \
-            -Wa,--defsym,DCLOAD_LAYOUT_CORE=1
-endif
-
-ifeq ($(DCLOAD_LAYOUT),core)
-  # (stack, Maple and the limits are set above)
-else ifeq ($(DCLOAD_IS_LOW),1)
+ifeq ($(DCLOAD_IS_LOW),1)
   DCLOAD_STACK ?= $(DCLOAD_GUEST_VBR)
   DCLOAD_HIRAM ?= 0x8cfe9000
   DCLOAD_MAPLE ?= 0x8cfe8000
@@ -352,7 +321,7 @@ WITH_WINCE  := $(if $(filter all wince,$(DCLOAD_OS)),1,0)
 CFLAGS += -DWITH_KATANA=$(WITH_KATANA) -DWITH_KOS=$(WITH_KOS) -DWITH_WINCE=$(WITH_WINCE)
 # What VERS reports about this build (commands.c, cmd_version).
 DCLOAD_OS_ID := $(if $(filter katana,$(DCLOAD_OS)),1,$(if $(filter kos,$(DCLOAD_OS)),2,$(if $(filter wince,$(DCLOAD_OS)),3,0)))
-DCLOAD_LAYOUT_ID ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
+DCLOAD_LAYOUT_ID := $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
 CFLAGS += -DDCLOAD_OS_ID=$(DCLOAD_OS_ID) -DDCLOAD_LAYOUT_ID=$(DCLOAD_LAYOUT_ID)
 
 # Serve the MAPL command (host-to-DC Maple passthrough) and the driver behind
@@ -613,15 +582,9 @@ all: dcload.bin exception.bin
 # ORIGIN is what has to move. dcload.x.in is the source; dcload.x is build
 # output and is gitignored. Run through the C preprocessor with -P (no line
 # markers, which ld would reject).
-ifeq ($(DCLOAD_LAYOUT),core)
-DCLOAD_X_IN = dcload-core.x.in
-else
-DCLOAD_X_IN = dcload.x.in
-endif
-dcload.x: $(DCLOAD_X_IN) Makefile ../../Makefile.cfg
+dcload.x: dcload.x.in Makefile ../../Makefile.cfg
 	$(CC) -E -P -x c -DDCLOAD_BASE=$(DCLOAD_BASE) -DDCLOAD_STACK=$(DCLOAD_STACK) \
 	      -DDCLOAD_HIRAM=$(DCLOAD_HIRAM) -DDCLOAD_MAPLE=$(DCLOAD_MAPLE) \
-	      $(if $(filter core,$(DCLOAD_LAYOUT)),-DDCLOAD_CORE_LIMIT=$(DCLOAD_CORE_LIMIT) -DDCLOAD_IPBIN_HOLE_END=$(DCLOAD_IPBIN_HOLE_END) -DCORE_IRQ_STACK=$(CORE_IRQ_STACK) -DCORE_XCHG_STACK=$(CORE_XCHG_STACK)) \
 	      $< -o $@
 
 # DCLOAD_EMIT_RELOCS=1 keeps the relocations in the ELF (`ld -q`), which is what
@@ -699,23 +662,9 @@ LOADER_DIR   = loaders
 # every address in it, in either layout family. This one is SCRATCH_BASE on the
 # host side, so an unrelocated copy still lands somewhere sane.
 LOADER_RELOC_BASE = 0x8ce00000
-# The variants `make loaders` builds next to the universal image: every
-# combination of these, CD-DA or not. Empty either list to skip them.
-LOADER_DRIVERS = bba lan
-LOADER_OSES    = katana kos wince
-# The CORE loaders (AGENTS.md 4.19), one per driver: pinned at 0x8c004000, so
-# linked natively, with no relocations to keep and nothing for the host to move.
-LOADER_CORE_DRIVERS = bba lan
-
-# One pinned image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
-define pinned_loader
-$(MAKE) --no-print-directory clean >/dev/null || exit 1; \
-$(MAKE) --no-print-directory DCLOAD_LAYOUT=core $(2) dcload exception.bin >/dev/null || exit 1; \
-$(OBJCOPY) --add-section .guestvbr=exception.bin \
-           --set-section-flags .guestvbr=alloc,load,contents,readonly \
-           --change-section-address .guestvbr=$(DCLOAD_GUEST_VBR) \
-           dcload $(LOADER_DIR)/$(1) || exit 1
-endef
+# The resident image's flags (AGENTS.md 4.18): no screen, no DHCP, what runs
+# under a title. Any DCLOAD_OS / WITH_* knob may be added here to trim it.
+LOADER_RESIDENT_FLAGS = DCLOAD_RESIDENT=1
 
 # One relocatable image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
 # The relocations are the whole point of it, and objcopy is well within its
@@ -768,22 +717,11 @@ loaders:
 	@# exception a title takes.
 	@echo "[loaders] linking relocatable dcload at $(LOADER_RELOC_BASE)"
 	@$(call reloc_loader,dcload-relocatable.elf,)
-	@# The variants (AGENTS.md 4.18): one per network driver, kind of title and
-	@# CD-DA or not, each the same relocatable image with what it never runs
-	@# left out. The host picks one once it knows the adapter and the title;
-	@# dcload-relocatable.elf above serves everything and stays the fallback.
-	@for drv in $(LOADER_DRIVERS); do for os in $(LOADER_OSES); do for cd in 1 0; do \
-	  name=dcload-$$drv-$$os-$$( [ $$cd = 1 ] && echo cdda || echo nocdda ).elf; \
-	  flags="DCLOAD_RESIDENT=1 DCLOAD_OS=$$os WITH_CDDA=$$cd $$( [ $$drv = bba ] && echo WITH_LAN_ADAPTER=0 || echo WITH_BBA=0 )"; \
-	  echo "[loaders] linking $$name ($$flags)"; \
-	  $(call reloc_loader,$$name,$$flags); \
-	done; done; done
-	@for drv in $(LOADER_CORE_DRIVERS); do \
-	  name=dcload-core-$$drv-katana.elf; \
-	  flags="$$( [ $$drv = bba ] && echo WITH_LAN_ADAPTER=0 || echo WITH_BBA=0 )"; \
-	  echo "[loaders] linking $$name (DCLOAD_LAYOUT=core $$flags)"; \
-	  $(call pinned_loader,$$name,$$flags); \
-	done
+	@# The RESIDENT image (AGENTS.md 4.18): the same relocatable loader without
+	@# the screen and DHCP, which is what runs under a title. The host chainloads
+	@# it as the title's loader and uses dcload-relocatable.elf for the hops.
+	@echo "[loaders] linking dcload-resident.elf ($(LOADER_RESIDENT_FLAGS))"
+	@$(call reloc_loader,dcload-resident.elf,$(LOADER_RESIDENT_FLAGS))
 	@$(MAKE) --no-print-directory clean >/dev/null && $(MAKE) --no-print-directory all >/dev/null
 	@echo "[loaders] built:" && ls -l $(LOADER_DIR)
 

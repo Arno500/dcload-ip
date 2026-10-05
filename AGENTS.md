@@ -191,9 +191,8 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `WITH_LAN_ADAPTER` | `1` | HIT-0300 driver; 0 = BBA only | ~2 KB |
 | `WITH_BBA` | `1` | HIT-0400 driver (`rtl8139.c`); 0 = LAN Adapter only (no RX DMA) | ~4 KB |
 | `GA_LAN` | `1` | the LAN Adapter takes part in asynchronous reads, the idle listen and the RX interrupt (EXT bit 2); 0 = synchronous reads, the A/B (§4.18) | -- |
-| `DCLOAD_RESIDENT` | `0` (`1` for every variant and the core) | no screen, no DHCP; the host supplies the address (§4.18) | ~5.8 KB |
-| `DCLOAD_LAYOUT` | LOW/HIGH by base | `core`: the whole loader in the system hole, pinned at 0x8c004000 (§4.19) | -- |
-| `DCLOAD_OS` | `all` | `katana`, `kos` or `wince`: leave out what that kind of title never runs (§4.18); sets `WITH_KATANA`/`WITH_KOS`/`WITH_WINCE` and the defaults of `WITH_IRQ_HOOK`, `GD_ASYNC_KATANA`, `IRQ_IDLE_LISTEN`, `RTL_RX_DMA` | up to ~4 KB |
+| `DCLOAD_RESIDENT` | `0` (`1` for `dcload-resident.elf`) | no screen, no DHCP; the host supplies the address (§4.18) | ~5.8 KB |
+| `DCLOAD_OS` | `all` | `katana`, `kos` or `wince`: leave out what that kind of title never runs (§4.18, hand builds only); sets `WITH_KATANA`/`WITH_KOS`/`WITH_WINCE` and the defaults of `WITH_IRQ_HOOK`, `GD_ASYNC_KATANA`, `IRQ_IDLE_LISTEN`, `RTL_RX_DMA` | up to ~4 KB |
 | `WITH_MAPLE` | `1` | serve `MAPL` | ~650 B |
 | `WITH_PMCR_CMD` | `0` | serve `PMCR` (`perfctr.c` stays); no host sends it | ~800 B |
 | `WITH_GD_SPINDOWN` | `0` | stop the real drive at boot (§4.14) | 160 B |
@@ -615,7 +614,7 @@ loader there before uploading the title. Things this must not break:
 `loaders/dcload-relocatable.elf` at `0x8ce00000` with `DCLOAD_EMIT_RELOCS=1`
 (`LOADER_BASES` is empty; list bases there to get pre-linked ELFs back). It
 does not deploy: copy the ELF to the host's `loaders/` and prove the copy by
-md5 (§14.19). It also links the twelve variants of §4.18 next to it. **One set is kept there**; an A/B is a build into a directory of
+md5 (§14.19). It also links `dcload-resident.elf` next to it (§4.18). **One set is kept there**; an A/B is a build into a directory of
 its own, passed with `--loader-dir` — a flycast set needs
 `DREAMCAST_IP=192.168.1.130 CDDA_TICKS_X8192=580480` (§3.5, §4.13). The host
 relocates the image to any base in either family:
@@ -1101,13 +1100,30 @@ isoldr's `HAVE_MULTI_DISC`.
   after `GD_STAGE_BIG_SECTORS` went from 4 to 3 (default in `cdfs_syscalls.c`;
   only Windows CE's staged reads use it).
 
-### 4.18 Loader variants
+### 4.18 The resident image, and trimming a build
 
-`make loaders` builds, next to the universal `dcload-relocatable.elf`, one
-relocatable image per network driver × kind of title × CD-DA:
-`dcload-{bba,lan}-{katana,kos,wince}-{cdda,nocdda}.elf` (`LOADER_DRIVERS`,
-`LOADER_OSES`). Each leaves out what its case never runs, so that a loader can
-fit where the universal one does not (§4.6). `MAPL` is kept in all of them.
+`make loaders` builds, next to the universal `dcload-relocatable.elf`, one more
+relocatable image, `dcload-resident.elf` (`LOADER_RESIDENT_FLAGS`,
+`DCLOAD_RESIDENT=1`): the same loader without its screen and DHCP. **It is what
+a title runs on**; the universal image, which shows a screen and can take a
+DHCP lease, does every hop. Both serve every kind of title, both adapters and
+CD-DA. The resident image is ~5.8 KB smaller (`_end` base+`0x8940`, `.gdstage`
+ending 6848 B under `_stack`, against 1056 B for the universal one, 2026-10-05):
+that room is where features that run under a title go.
+
+**Resident** (`DCLOAD_RESIDENT=1`): no `video.o`, every display call a stub
+(`dcload.c` `#else` block; crt0's jump table for `exception.S` still resolves),
+no DHCP (`set_ip_dhcp()` is empty, `net.c` drops DHCP replies). The address
+comes from the host: it writes `our_ip` and `dcload_syscall_port` into the
+image's `.data` after relocation and before upload (`variants::patch_resident`),
+or from the BBA's warm start.
+
+**Trimming by hand.** `DCLOAD_OS`, `WITH_BBA`, `WITH_LAN_ADAPTER` and
+`WITH_CDDA` leave out what a case never runs; add them to
+`LOADER_RESIDENT_FLAGS` or build into an A/B directory. Nothing ships trimmed
+(until 2026-10-05 `make loaders` built twelve such variants and the host picked
+one per title; withdrawn: a HIGH loader takes the same 64 KB whatever its size).
+`MAPL` is kept in all of them.
 
 | `DCLOAD_OS` | Left out |
 | --- | --- |
@@ -1115,14 +1131,12 @@ fit where the universal one does not (§4.6). `MAPL` is kept in all of them.
 | `kos` | the interrupt hook (KOS's table is never recognised), CE paths |
 | `wince` | the Katana entry, the RX interrupt and RX DMA, KOS paths, file syscalls |
 
-- `bba` = `WITH_LAN_ADAPTER=0`, `lan` = `WITH_BBA=0`.
 - **Windows CE keeps the hook, not the RX interrupt**: `rx_iml` is only armed for
   the Katana entry (`irq.c`), so under CE the tick runs on CE's own timer
-  interrupts and every frame is read by CPU. The `wince` variant reproduces
-  that; routing the RX line under CE would be new behaviour.
-- `all` builds byte for byte as before the variants where nothing else changed:
+  interrupts and every frame is read by CPU.
+- `all` builds byte for byte as before these guards where nothing else changed:
   the object order is kept in `DCLOBJECTS` on purpose. Check `dcload.bin` and
-  `dcload-relocatable.elf` against the previous build after touching these guards.
+  `dcload-relocatable.elf` against the previous build after touching them.
 
 **The LAN Adapter keeps the BBA's loop contract** (`la_bb_loop`): `drain_iters`,
 the fine deadline (`fine_deadline_*`, `g_fine_timeouts`), the idle-poll limit
@@ -1138,83 +1152,21 @@ the tick (`la_irq_ack`). There is no RX DMA on it (the data port is one byte a G
 access): **a chunk costs milliseconds of CPU inside the tick, with SR.BL set.
 Not measured on hardware.**
 
-**Resident variants** (`DCLOAD_RESIDENT=1`, what `make loaders` builds for
-every variant; the CD's build and the universal image keep their screen and
-DHCP): no `video.o`, every display call a stub (`dcload.c` `#else` block;
-crt0's jump table for `exception.S` still resolves), no DHCP (`set_ip_dhcp()` is
-empty, `net.c` drops DHCP replies). The address comes from the host: it writes
-`our_ip` and `dcload_syscall_port` into the image's `.data` after relocation and
-before upload (`variants::patch_resident`), or from the BBA's warm start. A
-resident BBA katana image is 23056 B against the universal 40860.
-
 **VERS's third field** (`cmd_version`): the variant word, `0xA5` in the top byte,
-bits 0-3 layout (0 LOW, 1 HIGH, 2 CORE), 4-7 kind of title (0 all, 1 Katana, 2 KOS,
+bits 0-3 layout (0 LOW, 1 HIGH; 2 was the core), 4-7 kind of title (0 all, 1 Katana, 2 KOS,
 3 CE), then CD-DA, BBA, LAN, MARK, DISC, resident. The host reads it
 (`VariantWord`) and the adapter from the reply's `address` field.
 
-Image sizes (`_end - base`, 2026-10-04, resident): `bba-katana` 29092 with CD-DA /
-23056 without; `bba-kos` 27632 / 21280; `bba-wince` 28784 / 22636; `lan-katana`
-26940 / 20780; `lan-kos` 26440 / 20088; `lan-wince` 27160 / 21000. All relocate
-to `0x8c004000`, `0x8ce00000`, `0x8cee0000`, `0x8cfe0000`; `.hiram` stays 9.2-11.8 KB.
+### 4.19 The core (withdrawn 2026-10-05)
 
-### 4.19 The core: the whole loader in the system hole
-
-A title that uses all of high RAM overwrites any loader up there: Shenmue II
-after a disc swap writes 0x8cf00000-0x8d000000 (the loader at `0x8cf60000`
-and at `0x8cf90000` were both found zeroed, 2026-10-04). The only ground a Katana
-title leaves to the system is `0x8c004000..0x8c00c000` (it paints
-`0x8c00c000..0x8c00f400` "SEGA"), minus the IP.BIN header it reads back at
-`0x8c008000` and `0x8c008100`. `DCLOAD_LAYOUT=core` (`dcload-core.x.in`) puts the
-**whole resident loader there and nothing in high RAM**:
-
-| Range | Before EXEC | Under the title |
-| --- | --- | --- |
-| `0x8c004000..0x8c008000` | `.text_lo`: crt0 (magic +4, trampoline +8, table +0..0x20), `cdfs_redir`, `cdfs_syscalls`, the drivers, `commands`, `net` | same |
-| `0x8c008000..0x8c008200` | the IP.BIN header, written by the host | `0x8c008100`: the current disc's, by `gd_bios_check_disc` (1 sector, 0x100 bytes copied) |
-| hole end..`_end` (≤ `DCLOAD_CORE_LIMIT`, 0x8c00c000) | the rest of the code, `.rodata`, `.data`, `.bss`, `.hiram` (packet buffers, `ga_xpa`, a 1-sector `gd_stage`), `.corestk` | same, and the hook stack (1 KB) and exchange stack (1.5 KB) are live |
-| `0x8c00c000..0x8c00c800` | the Maple DMA buffer (`MAPL`, refused once the title runs) | the title's |
-| `0x8c00c800..0x8c00f400` | the loader's main-loop stack | the title's |
-
-- Pinned at `0x8c004000`: linked natively, uploaded as it is, never relocated
-  (`relocate()` refuses another base when `_dcload_layout == 2`). Katana only,
-  `WITH_CDDA=0`, `WITH_DISC_SWAP=1`, `WITH_MARK_CMD=0`, `GD_STAGE_SECTORS=1`,
-  `GD_STAGE_BIG_SECTORS=0` (zero-length `gd_stage_big`), resident.
-- `_end` is the top of everything resident, so crt0's BSS clearing covers `.hiram`
-  and the stacks and never the hole (all `.data` is above it: link assert).
-  `cdfs_redir.s` (`.ifdef DCLOAD_LAYOUT_CORE`) and `irq.c` use `_xchg_stack_top` /
-  `_irq_stack_top`, not the Maple page.
-- Measured 2026-10-04: BBA core `_end = 0x8c00b960` (about 1.7 KB under the limit),
-  LAN core `0x8c00b7a0`. **Sonic Adventure's stack (SP down to `0x8c00b91c`) does
-  not clear it: that title stays HIGH.** Snow Surfers (SP `0x8c00e460`), Shenmue II
-  and Crazy Taxi 2 (stacks in high RAM) do.
-- The host chooses it only on evidence (`variants::core_verdict`): a recorded
-  stack depth that clears the core, a startup that does not paint it, a Katana
-  title with no audio (no CD-DA in the core), and a learned map that uses
-  `HIGH_BUSY_BLOCKS` of the top 64 blocks; `--loader-core` forces it,
-  `--no-loader-core` forbids it. It chainloads like any other:
-  CD loader → universal at `0x8ce00000` → the core.
-- **The shadow.** Some titles run their own boot code in the hole before
-  anything else: Shenmue II's 1ST_READ copies `0x8c010100..0x8c014000` to
-  `0xac004000` and jumps there (a drive check on the GD-ROM registers, its buffer
-  at `0x8c007800`, its tables at `0x8c00f400..0x8c00fa40`), over the core: the
-  first GD call then ran the title's code (2026-10-05, "does not boot at all").
-  That code is done before the title's first call to a BIOS vector, and nothing
-  of the core runs until then. So the host writes `core_shadow` (`.data`, 0 =
-  none) with the high base the title would have had, free until that call;
-  `cmd_execute` copies the core there last thing before `go()` and points
-  `0xbc`/`0xc0`/`0xe0` at the copy's `core_tramp_*` (`cdfs_redir.s`). The first
-  call, masked, copies the core back (hole excepted, through P1 with every line
-  purged), invalidates the I-cache from P2, points the vectors at the core's
-  own entries and jumps to the real one; `ct_done` turns a stale vector read
-  into a plain jump. A title that writes the hole AFTER its first BIOS call is
-  still out of reach.
-- `IP.BIN`: the host writes only `min(2048, hole room)` bytes of the header; the
-  full bootstrap mode needs a high loader. Titles that read constants past
-  `0x8c008200` (Sonic Adventure loads up to `0x8c008208`) want `DCLOAD_IPBIN_HOLE_END`
-  raised.
-- **Not measured on hardware or under flycast.** Open risks: the stacks'
-  high-water marks (read `_irq_stack_lo.._xchg_stack_top` for the first non-zero
-  word), a title writing `0x8c008200..0x8c00c000`, and the LAN async path.
+`DCLOAD_LAYOUT=core` put the whole resident loader in the system hole
+(`0x8c004000..0x8c00c000`) for titles that fill high RAM, with a shadow copy in
+high RAM until the title's first BIOS call. Withdrawn, never having run a
+title: the hole is not the system's to give. Shenmue II keeps its resident
+kernel and debug monitor there (`0x8c004000..`, its VBR handlers at
+`0x8c004c60`, its tables up to `0x8c00fa40`), and the title it was built for
+runs with a HIGH loader taken out of its own heap (host AGENTS.md §5, HLib
+heap). In git history (`9170c7f`, `7c4e064`) if a title ever needs it.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
@@ -1641,13 +1593,12 @@ is redeployed with any change here (§4.11, §14.19).
   linked base, then the cable (0 VGA, 2 RGB, 3 composite), then the variant word
   (§4.18). Append new fields at the end; older loaders send fewer. The reply's
   `address` is `installed_adapter` (octal 0300 LAN / 0400 BBA).
-- **Variants and the core** (§4.18, §4.19): the host picks
-  `dcload-{bba,lan}-{katana,kos,wince}-{cdda,nocdda}.elf` or
-  `dcload-core-{bba,lan}-katana.elf` from the adapter, the kind of title and the
-  disc's audio, and falls back to `dcload-relocatable.elf`; it reads a loader's
-  footprint from its own ELF (`variants::footprint_from_elf`, symbols `end`,
-  `stack`, `maple_dma_buffer`, `dcload_layout`, `_ipbin_hole_*`). Renaming or
-  dropping one of those breaks it. Hops always use the universal image.
+- **The resident image** (§4.18): the host chainloads `dcload-resident.elf` as
+  the title's loader (a disc image, a high base) and writes `our_ip` and
+  `dcload_syscall_port` into it (`variants::patch_resident`); every hop is
+  `dcload-relocatable.elf`. When VERS's variant word says `resident`, the host
+  reads symbols from the resident file. Renaming those two symbols, or the
+  file, breaks it.
 - **Layout**: `loaders::layout()`, `live_footprint()`, `HIRAM_RESERVED`
   (`0x3000`), `LOADER_SPAN` (`0x10000`) mirror the Makefile layout (§4.11). The
   relocator assumes only `R_SH_DIR32`, linker-symbol addresses, and `.guestvbr`

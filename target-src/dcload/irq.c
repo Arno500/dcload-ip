@@ -189,14 +189,7 @@ void irq_hook_check(void)
 	/* The Maple page's first KB: the part of the MAPL receive buffer no title
 	 * ever makes us use, below gd_on_loader_stack()'s stack at the page top.
 	 * They must not be one stack: see 9b of docs/wince-investigation.md. */
-	#ifdef DCLOAD_LAYOUT_CORE
-	{
-		extern char irq_stack_top[];	/* dcload-core.x.in */
-		irq_tramp_stack[0] = (unsigned int)irq_stack_top;
-	}
-#else
 	irq_tramp_stack[0] = (unsigned int)maple_dma_buffer + 0x400U;
-#endif
 	irq_tramp_entry[0] = (unsigned int)irq_entry;
 
 	/* Masked: an interrupt must not find half a patch. The trampoline and its

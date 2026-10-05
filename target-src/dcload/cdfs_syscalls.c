@@ -1221,9 +1221,9 @@ static int ReadSectors(unsigned int dest, unsigned int lba, unsigned int count)
  * open or the drive is "checking" (§4.17), as the BIOS answers.
  *
  * ONE SECTOR, THROUGH gd_stage, AND ONLY THE HEADER COPIED: it used to read 7
- * sectors straight to 0x8c008100, 0x8c008100..0x8c00b900 -- which a core
- * loader (AGENTS.md 4.19) has under its code. The header is all the title reads
- * back (the system ID, the product, the area flags).
+ * sectors straight to 0x8c008100, 0x8c008100..0x8c00b900 -- the system hole,
+ * where Shenmue II keeps code and data of its own. The header is all the title
+ * reads back (the system ID, the product, the area flags).
  */
 #define IP_BIN_CURRENT_ADDR 0x8c008100U
 #define IP_BIN_CURRENT_BYTES 0x100U
