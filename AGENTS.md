@@ -172,6 +172,7 @@ Compiler flags disable everything that could move code behind your back:
 | `commands.c/.h` | the command dispatcher and the LoadBinary window (`bin_info`). |
 | `exception.S` | exception display **and** the VBR table handed to the title. |
 | `irq.c/.h`, `irq_hook.S` | the interrupt hook in a title's own vector table (§4.15, `WITH_IRQ_HOOK`). |
+| `ra.c/.h` | RetroAchievements: samples the host's table of RAM ranges at each vblank (§4.20, `WITH_RCHEEVOS`). |
 
 ### 4.3 Build flags
 
@@ -200,6 +201,7 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `GD_ASYNC_KATANA` | `1` | the hook in Katana titles too, and their disc reads through the asynchronous engine (§4.5); needs `WITH_IRQ_HOOK` | ~150 B |
 | `GA_KATANA_READS` | `1` | with `GD_ASYNC_KATANA`, 0 keeps the hook (CD-DA from the tick, idle listen) but serves Katana reads synchronously | -- |
 | `WITH_MARK_CMD` | `1` HIGH, `0` LOW | serve `MARK` (§8) | 432 B |
+| `WITH_RCHEEVOS` | `0` (`1` in `LOADER_RESIDENT_FLAGS`) | the RetroAchievements sampler, `ra.c` (§4.20); needs `WITH_IRQ_HOOK` and the HIGH layout; `RA_WORDS` (1024, a cap: the room decides) / `RA_RANGES` (384) / `RA_CHAINS` (64) size it; its buffers are borrowed from dead RAM | ~5.3 KB |
 | `WITH_DISC_SWAP` | `1` HIGH, `0` LOW | serve `DISC`: the host swaps the served image, the lid opens and closes (§4.17) | ~520 B |
 | `IRQ_IDLE_LISTEN` | `1` HIGH, `0` LOW | the hook's tick listens to the network (≤ 1 ms every 50 ms) when nothing else owns it, so `--diag`, the stack watch and `MARK` are answered while a title does not read its disc | ~220 B |
 | `RTL_RX_DMA` | `1` HIGH, `0` LOW | the BBA's RX frames by G2 DMA from the tick (§4.16); 0 = every frame by CPU | ~150 B |
@@ -379,9 +381,18 @@ request and adds the range to the title's learned memory map (Shenmue II's
    (inside one syscall) never were: the title disturbs TMU2 between two looks
    (how is still to be read off `g_gaf_tmu2`, `GA_FAIL_PROBE`). The loader neither
    programs nor reads TMU2. KOS clears this counter once in its init, before
-   any read; `g_pmcr_backwards` counts a later restart. **flycast reads 0
-   from it without the local `sh4_mmr.cpp` patch** (§11): every deadline is
-   then dead there.
+   any read; `g_pmcr_backwards` counts a later restart. **Windows CE takes the
+   counter** (2026-10-08): a graphics module of Sega Rally 2's `0WINCEOS.BIN`
+   writes PMCR1 = `0xe004` / PMCR2 = `0xe001` (cleared, counting cache events),
+   again at each call. On it no period of the tick elapsed (no idle listen:
+   `--diag` and the host's keepalive heard nothing while the title did not
+   read, `g_irq_tick_sum` frozen) and no read deadline could fire.
+   `clk_check()` (every tick, every ReqCmd) sees PMCR1's mode leave `0x23` and
+   moves the clock to TMU2 for good (CE uses TMU0/TMU1 only); `g_clk_tmu2` is
+   the PMCR1 found, bit 31 set, and must stay 0 under Katana and KOS titles.
+   The seconds timeout (`PMCR_Read`) stays on the counter. **flycast reads 0
+   from PMCR without the local `sh4_mmr.cpp` patch** (§11): the clock is then
+   TMU2 there for every title.
 
 **The GD lock's C sections run masked.** `gd_take()` raises IMASK to 15
 before taking the lock and `gd_give()` gives the caller's IMASK back (only
@@ -867,8 +878,13 @@ own GD driver.
 second bootstrap (`--boot-ipbin`).
 
 **Memory.** CE's kernel takes `0x8c143000..0x8cef0000`, its driver globals
-`0x8cef0000..0x8d000000`. The host places the loader at `0x8cee0000` (HIGH) and
-lowers `ulRAMEnd` to it. **Nothing in the loader may write outside its own span
+`0x8cef0000..0x8d000000`. The host places the loader at the bottom of the pool
+(`ulRAMFree` rounded up to 64 KB: `0x8c150000` for Sega Rally 2 PAL, HIGH) and
+raises `ulRAMFree` above it. CE hands pages out from the top, so the top must
+stay as an unmodified CE has it: placed at the top (`0x8cee0000`, `ulRAMEnd`
+lowered, until 2026-10-09; the host's `--wince-loader-top`), the loader moved
+everything CE loads down by as much, and Sega Rally 2's achievement set, which
+looks for `RALLY2.EXE` on seven fixed pages, found it 80 KB lower. **Nothing in the loader may write outside its own span
 while a title runs.** Inside the span, three regions are dead while a title runs
 and are reused:
 
@@ -916,6 +932,14 @@ interrupt enters at `VBR+0x600`; the loader patches the title's live table so
     to `VBR+0x100/+0x400/+0x600`): `g_irq_nop_entry` 1, nothing to rebuild.
   - Anything else is refused and counted once per VBR (`g_irq_refused`,
     `g_irq_refused_vbr`); the GD path then works without the hook.
+  - **The 24 bytes under `+0x600` may still hold our own trampoline**: a title
+    that copies its entry again writes from `+0x600` only. Jet Set Radio's
+    `1ST_READ.BIN` (a bootstrap) and the `JET_PAL.BIN` it boots each copy the
+    same Katana entry into one table at `0x8c00f400`; until 2026-10-10 the
+    leftover trampoline failed the "free" test and the hook was refused for
+    the rest of the session (2 interrupts through it, deaf between reads,
+    the host's keepalive ended the session in the SEGA logo). A re-copied
+    table is re-hooked and counted in `g_irq_rehooks`.
 - **Rules the entry keeps, each a reset if broken** (SR.BL is 1 throughout):
   r15 is replaced before any push (a TLB miss under BL resets); FD is cleared
   and FPSCR, FPUL and both FP banks saved; the pair stores need r15 8-aligned
@@ -960,6 +984,11 @@ interrupt enters at `VBR+0x600`; the loader patches the title's live table so
   context). `g_irq_rx`, `g_irq_rx_evt`, `g_irq_iml[9]` (the title's masks).
 - Counters: `g_irq_hooked`, `g_irq_vbr`, `g_irq_entries`, `g_irq_ticks`,
   `g_irq_tick_max`, `g_irq_tick_sum` (the CPU the hook takes), `g_irq_evt_last`.
+- **Where the title is**: `g_irq_pc[32]`, SPC and SSR of the last 16 interrupts
+  (the latest at `[(g_irq_pc_at - 1) & 15]`), read with `dc-counters.py --raw`.
+  A title that stops while its interrupts go on: CE's scheduler with no thread
+  ready (Sega Rally 2, 2026-10-09: `0x8c0123b4`, `0x8c02db34` in US v1.003), or a
+  loop of the title's.
 
 **Status**: CE (hook, CD-DA from the tick, asynchronous reads) measured on the
 console and under flycast; Katana titles with the hook and RX interrupt run on
@@ -1154,7 +1183,7 @@ Not measured on hardware.**
 
 **VERS's third field** (`cmd_version`): the variant word, `0xA5` in the top byte,
 bits 0-3 layout (0 LOW, 1 HIGH; 2 was the core), 4-7 kind of title (0 all, 1 Katana, 2 KOS,
-3 CE), then CD-DA, BBA, LAN, MARK, DISC, resident. The host reads it
+3 CE), then CD-DA, BBA, LAN, MARK, DISC, resident, RetroAchievements (bit 14). The host reads it
 (`VariantWord`) and the adapter from the reply's `address` field.
 
 ### 4.19 The core (withdrawn 2026-10-05)
@@ -1167,6 +1196,177 @@ kernel and debug monitor there (`0x8c004000..`, its VBR handlers at
 `0x8c004c60`, its tables up to `0x8c00fa40`), and the title it was built for
 runs with a HIGH loader taken out of its own heap (host AGENTS.md §5, HLib
 heap). In git history (`9170c7f`, `7c4e064`) if a title ever needs it.
+
+### 4.20 RetroAchievements: the loader samples, the host judges
+
+`ra.c`, `WITH_RCHEEVOS` (resident image only, HIGH layout: the Makefile refuses
+it in the LOW one). **Run on the console under a Katana title**: Sonic Adventure 2
+(2026-10-07) sampled 60 frames a second, lost none, and unlocked its achievements;
+since 2026-10-08 the resident image of the host's own `loaders/` carries it
+(first `33a6c8fa…`, the set SA2 ran on). Not run under flycast or Windows CE: the CE cache overlay is checked
+only against a modelled write-back cache, with the C encoder, against the host's
+decoder on the PC (`scripts/ra-sampler-harness`).
+
+- **`RACT`** (host → DC): `address` = generation (1..). **A table comes in
+  parts**, one datagram each (the loader takes no IP fragment: SA2's first table,
+  a single 1476-byte `RACT`, was fragmented by Windows and never seen, 2026-10-07).
+  Each part's data, big-endian 32-bit: ranges in all, chains in all, first range of
+  the part, its ranges, first chain of the part, its chains; then `{RAM offset,
+  words}` per range, **ascending and apart** over the whole table, then the chain
+  words (below), which come after the last range. A part with both firsts 0 starts
+  a table and turns sampling off (`ra_on`) until it is whole; a part that does not
+  follow the last one received (lost, late, another generation) is ignored, and the
+  host, unanswered, sends the whole table again a second later. **Only the part
+  that completes a table is answered**: `size` 0, or `0xffffffff` for more than
+  `RA_RANGES` (384) ranges, a range over 1023 words, more than `RA_WORDS` (1024)
+  words (ranges' and chains' together), more than `RA_CHAINS` (64) chains, a chain
+  whose parent is not an earlier word, an unaligned, unordered or out-of-RAM range,
+  or a table that fits neither the Katana room nor the CE room (a refusal may
+  answer an earlier part). **Its data is two words, the most words a table may
+  have under a Katana title and under Windows CE** (`ra_max_words()` of each room);
+  the host checks the one that applies, and `ra_attach()` checks it again at the
+  first tick (`g_ra_nofit`). The same table again is a request for a keyframe.
+  Before parts (2026-10-09) the table was limited to one datagram, 160 ranges:
+  Sega Rally 2's set, merged to fit them, took 967 words.
+- **Chains: the loader follows pointers itself.** After the ranges, `RACT` carries
+  the number of chains and, for each, one word `parent index << 22 | shift flag
+  << 21 | offset in words` (signed, 21 bits). A chain is a table word, numbered
+  after the ranges' words, that is **the word at `((word[parent] >> shift) &
+  0xffffff) + offset`**: shift 0 for a 24-bit pointer in the low three bytes of its
+  word (`0xW` at an aligned address), 8 for one in the high three (an address that
+  is 1 mod 4; Shenmue II keeps one there). A parent is an earlier word, a range's
+  or a chain's, so one pass resolves a chain of any depth. Each frame
+  `ra_sample()` reads the ranges' words of a chunk first (and, under CE, puts the
+  dirty cache lines over them), then resolves the chunk's chain words from the
+  parent's value -- in `ra_tmp` if it is in the chunk, else in `prev`, where a word
+  that did not change is what it was. A chain word is then diffed and sent like any
+  other, and under CE `ra_oc_word()` looks for it in the 16 cache entries its
+  address allows. The host works out the same addresses from the same words
+  (`chains.rs`), so nothing about them travels. **Why**: followed by discovery,
+  every value a pointer takes costs the table a word and the console a round trip
+  (SA2's root pointer leads to 37 words); chains keep the table the size it was and
+  lose no frame when a pointer moves. Real sets (2026-10-07): SA2 57 chain words,
+  Shenmue II 2.
+- **The sample**: `ra_tick()`, called by `irq_tick()` on every interrupt before
+  anything else, **whoever owns the network**, because it only reads RAM. It
+  acts when `SB_ISTNRM` bit 3 (vblank-in) is up and at least 8 ms have passed.
+  The tick runs before the title's handler, so the bit is still up. **Reads go
+  through P1**: the title's cache holds its dirty lines, a P2 read would see
+  stale RAM; P1 never takes the TLB miss the tick may not.
+- **Memory**: the previous frame, a window of `RA_CHUNK` (16) words and the batch
+  buffer live in **dead RAM**
+  (`gd_ra_scratch()`, `cdfs_syscalls.c`), laid out by `ra_attach()` on every tick
+  (a different base means the title's MMU came on and everything restarts with a
+  keyframe): under a **Katana title the 6 KB `gd_stage_big`**, which only CE uses;
+  under **Windows CE the loader's own dead stack** between the stage and `_stack`
+  (CE reads into the stage). Only the tables are BSS (~1 KB). Rules: **nothing may
+  touch the scratch before the title runs** (until EXEC the loader's stack
+  overlaps it; `cmd_ract()` only writes the tables, the tick only runs once the
+  hook is in); `GD_RING_TRACE` and `GD_STAGE_BIG_SECTORS` < 3 conflict with it.
+  **The CE room is lent by the host** (2026-10-08): it takes `RA_ROOM` (16 KB
+  since 2026-10-09, 8 KB before) out of CE's RAM right above the loader
+  (`ulRAMFree`, `wince::take`, the same word that keeps CE off the loader's own
+  span; under it with `--wince-loader-top`) and writes that block's P1 address
+  and size in words into `g_ra_ce_room` / `g_ra_ce_room_words` before EXEC;
+  `gd_ra_scratch()` and `gd_ra_ce_words()` then use it, and the `RACT` reply
+  reports 1024 words for CE (744 for Katana). The block is the loader's while the
+  title runs, like its span; nothing touches it before the hook is in. Without it
+  (`--no-ra`, or an older host) **the CE room is what is left under `_stack`**
+  (1184 B with this build): too small for any table since the 384-range tables
+  (2026-10-09; 2400 B and ~280 words before). That room holds
+  the previous frame (1 word per table word), a keyframe's worth of buffer (1.04
+  words) and the window. Every byte the sampler's code or BSS grows by comes out of
+  it, so it has been paid for: the chains took it from ~248 words to ~160, and
+  replacing the cache scan below (and its `ra_pre`, hit list and binary searches)
+  by a per-line lookup took it to ~328, the TMU2 clock fallback (§4.5
+  invariant 4, 288 B) back to ~288, the lent block's two words and code (64 B)
+  to ~280, the 384-range tables (896 B) and the parts (~330 B) to nothing. The
+  host reads the limit from the `RACT`
+  reply; a table the CE room cannot hold is disabled at the first tick
+  (`g_ra_nofit`).
+- **Windows CE and the cache** (`ra_oc_word()`). CE runs with the
+  MMU on and **copy-back** pages, so a word the title wrote can sit in a dirty
+  line of the operand cache that RAM lacks, and -- the cache being indexed by
+  virtual address -- in an entry a read through the physical address (P1) never
+  hits (`docs/wince-investigation.md` §6: a buffer at VPN `0x080df000`, PPN
+  `0x0ce98000`). So under the MMU every word is read from RAM through **P2**
+  (uncached) and, if a **valid and dirty** line of the operand cache holds it, from
+  that line: the line is looked for by its **physical tag** (address array bits
+  28:10, plus the entry's own bits 11:5) in the 4 entries its address bits 11:5
+  allow (`ra_oc_find()`: CE maps 4 KB pages, §9i of `docs/wince-investigation.md`),
+  and the word read from the data array (`0xf4000000` /
+  `0xf5000000`). The last line looked for is remembered, so a range's eight words
+  to a line cost one lookup. Clean lines are ignored (RAM is as good and newer than
+  a stale copy). Skipped, and counted `g_ra_oc_skip`, if CCR.ORA is set (half the
+  array is RAM); nothing to do with the cache off. **Why per line, not a scan**: the
+  first version scanned all 512 entries once into a list of the dirty lines that
+  touch the table: fewer array reads, but 1.3 KB of code, BSS and scratch that were
+  the whole of the CE room. **An address array read is slow, and the tick runs with
+  interrupts blocked**: looking in 16 entries a line (1 KB pages) kept the tick near
+  2 ms at every vblank (`g_ra_tick_max` 1.9 ms, 589 words), and Sega Rally 2 US
+  stopped for good -- every CE thread asleep, the scheduler idle (`g_irq_pc`), at
+  its intro video, its VMU menu or its first screens (2026-10-09). Without the
+  overlay it played, and with 4 entries a line it plays (console, same day: intro,
+  VMU save). Values right on the console: unverified (flycast models no cache).
+- **`RAFR`** (DC → host, **no answer**, like `DC25`): `address` = sequence, `size`
+  = payload bytes. Payload: generation word, record count, then records. A frame
+  is one or more records, each one **window** of at most `RA_WIN` (128) words:
+  header `frame << 16 | 0x8000 key | 0x4000 last | window << 9 | changed`, a
+  bitmap of `RA_WIN_MAP` (4) words, one word per set bit. Only windows with a
+  change are sent, plus the `last` flag on the final record; a frame with no
+  change is one empty record (hit counts run on frames). A keyframe sets every
+  bit of every window: the first frame after a table, after a dropped frame,
+  and every 120 frames. Records are cut into datagrams of at most 1400 B at
+  record boundaries, so a keyframe spans two.
+- **Sent** from the tick's else-chain (`ra_flush_due()` / `ra_flush()`), only
+  when the GD lock is free and no read is on the wire, through `gd_exchange()`
+  like every other transmit under a title, at most two datagrams a tick. Due at
+  6 frames, 50 ms, when what is left cannot take another keyframe, or when a
+  send left records over; for a table near the room's size, which never leaves
+  room for a second keyframe, also when half the buffer is used. **Only a keyframe
+  reserves its whole size** (`ra_worst()`); a frame of changes is checked window by
+  window and given up if it outgrows the room (its partly updated `prev` is put
+  right by the keyframe that follows). Reserving a keyframe for every frame starved
+  a 705-word table in the Katana room: the keyframe still being sent left no room
+  for the next frame, which was dropped and asked for another keyframe (harness,
+  2026-10-09). A frame that does not fit while the network is busy (a load) is
+  dropped, `g_ra_dropped`, and the next is a keyframe: the host never sees a delta
+  against a frame it did not get.
+- **Why the host judges**: conditions carry `Delta`, `Prior`, hit counts,
+  `ResetIf`, pointers, floats, measured values; `rcheevos` does all of it on the
+  host and the loader needs none of it.
+- **Sizes come from measurement** (`dcload-ip-rs ra-count`, 2026-10-06, before
+  pointers): Sonic Adventure 2 reads 324 distinct words in 133 ranges, Shenmue II
+  179 in 56. Hence 512 / 160, and 128 words was never enough. Sega Rally 2
+  (2026-10-08): 1775 words in 337 ranges with everything, seven copies of every
+  condition; hence 384 ranges and words bounded by the room (Katana 744, CE with
+  the lent block 1024) rather than a constant.
+- **Cost**: footprint measured, resident `_end` base+`0x8940` → `0x9940` (+4.1 KB),
+  `.gdstage` ends 2752 B under `_stack` (6848 B before); with the clock fallback
+  (2026-10-08) `_end` base+`0x9a48`, 2464 B; with the lent CE block base+`0x9a88`,
+  2400 B; with parts and 384 ranges (2026-10-09) base+`0x9f54`, 1184 B; with the hook's ring of PCs (same day) base+`0xa008`, 992 B; with `DRST` base+`0xa0f0`, 768 B (the universal image: 384 B, the binding HIGH budget). CPU
+  **estimated, not
+  measured**: ~40-100 µs a frame under a Katana title, 0.3-0.6 %; under CE add the
+  per-line cache lookups (above), a worst tick near 300 µs -- `g_ra_tick_max` will
+  say.
+- **Limits**: no vblank, no sample: a title the hook refuses (`g_irq_refused`)
+  and KOS titles are not served. 744 words under a Katana title (`gd_stage_big`),
+  1024 under Windows CE with the lent block, none without. **The CPU is the next
+  wall, not the room**: `g_ra_tick_max` read 1.8 ms under CE on the console
+  (2026-10-08) with Sega Rally 2's achievements, and the per-line cache lookup
+  grows with the table. A set that does not fit is served in steps by the host (host
+  AGENTS.md): its rich presence out of the table and read with `SBIQ` every few
+  seconds instead, then its leaderboards left out. A pointer
+  that is not 24 bits, or sits across two words, or has an offset past ±4 MB, is
+  not a chain: the host leaves those reads to discovery.
+- **Host test**: `scripts/ra-sampler-harness/` compiles `ra.c` for the PC with
+  stubbed hardware headers and a scripted machine (`harness ce` adds the MMU, a
+  write-back operand cache with synonyms, stale clean copies and evictions); the
+  host repo's `ra::loader_c` tests decode what it sends and compare every frame,
+  and fail when the overlay or the dirty-bit test is broken (checked by mutation).
+- Counters: `g_ra_frames`, `g_ra_sent`, `g_ra_dropped`, `g_ra_keys`,
+  `g_ra_tick_max` (Pck/4 ticks), `g_ra_gen`, `g_ra_nofit`, and for CE
+  `g_ra_oc_words`, `g_ra_oc_skip`.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
@@ -1264,6 +1464,9 @@ Target-side `command_t` is `packed, aligned(4)`; host-side only `packed`.
 | `PMCR` | — | performance-counter control (`WITH_PMCR_CMD`, off) |
 | `MARK` | — | paint / check witness words (`WITH_MARK_CMD`) |
 | `DISC` | — | the host swapped the disc image (`WITH_DISC_SWAP`, §4.17) |
+| `DRST` | — | host→DC, answered (`size` 0): the max/min counters start over (`cmd_drst`; the `--diag` panel's `r`). `g_irq_tick_max`, `g_ra_tick_max`, `g_cdda_svc_gap_max`, `g_idle_polls_max` to 0, `g_cdda_room_min` to `0xffffffff`; never `g_gd_sp_min`, the footprint guard (§4.6). Writes words and answers: safe inside a read's wait |
+| `RACT` | — | host→DC, answered: the table of RAM ranges to sample (`WITH_RCHEEVOS`, §4.20) |
+| `RAFR` | — | DC→host, **no answer**: frames of those ranges (§4.20) |
 | `EXPT` | `CMD_EXCEPTION` | DC-to-host exception dump |
 
 `syscalls.h` (both ends) defines `DC00`–`DC22` (exit, fstat, write, read, open,

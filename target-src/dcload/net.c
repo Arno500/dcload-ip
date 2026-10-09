@@ -6,6 +6,7 @@
 #include "net.h"
 #include "dhcp.h"
 #include "memfuncs.h"
+#include "ra.h"
 
 static void process_broadcast(unsigned char *pkt);
 static void process_icmp(ether_header_t *ether, ip_header_t *ip, icmp_header_t *icmp);
@@ -292,6 +293,14 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 		}
 #endif
 
+#if WITH_RCHEEVOS
+		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_RACT, 4/4)))
+		{
+			cmd_ract(ip, udp, command);
+			pkt_match_id = 0;
+		}
+#endif
+
 #if WITH_DISC_SWAP
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_DISC, 4/4)))
 		{
@@ -299,6 +308,12 @@ static void process_udp(ether_header_t *ether, ip_header_t *ip, udp_header_t *ud
 			pkt_match_id = 0;
 		}
 #endif
+
+		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_DRST, 4/4)))
+		{
+			cmd_drst(ip, udp, command);
+			pkt_match_id = 0;
+		}
 
 		if ((pkt_match_id) && (!memcmp_32bit_eq(&pkt_match_id, CMD_DONEBIN, 4/4)))
 		{

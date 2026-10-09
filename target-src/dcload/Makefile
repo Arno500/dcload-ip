@@ -349,6 +349,19 @@ CFLAGS += -DWITH_MARK_CMD=$(WITH_MARK_CMD)
 WITH_DISC_SWAP ?= $(if $(filter 1,$(DCLOAD_IS_LOW)),0,1)
 CFLAGS += -DWITH_DISC_SWAP=$(WITH_DISC_SWAP)
 
+# RetroAchievements (AGENTS.md 4.20): the tick samples the RAM ranges the host
+# asks for (RACT) and sends what changed (RAFR). Needs the hook. Off in the
+# universal image (1 KB of margin); the resident image turns it on
+# (LOADER_RESIDENT_FLAGS). Its tables are BSS (~1 KB); its frame memory and
+# batch buffer are borrowed from .gdstage (6 KB at GD_STAGE_BIG_SECTORS 3).
+WITH_RCHEEVOS ?= 0
+CFLAGS += -DWITH_RCHEEVOS=$(WITH_RCHEEVOS)
+# The sampler's buffers live in .gdstage (gd_ra_scratch): in the LOW family that
+# range is a Katana title's own stack.
+ifeq ($(WITH_RCHEEVOS)$(DCLOAD_IS_LOW),11)
+$(error WITH_RCHEEVOS needs the HIGH layout: .gdstage is a title's stack in the LOW one)
+endif
+
 # ---------------------------------------------------------------------------
 # CD-DA (cdda.c). The design is described at the top of cdda.c, the counters
 # and status in AGENTS.md 4.13.
@@ -556,6 +569,9 @@ endif
 ifeq ($(WITH_IRQ_HOOK),1)
   DCLOBJECTS += irq.o irq_hook.o
 endif
+ifeq ($(WITH_RCHEEVOS),1)
+  DCLOBJECTS += ra.o
+endif
 EXCOBJECTS	= exception.o
 
 # The per-source assembly listings (AGENTS.md 6). LTO discards these options
@@ -664,7 +680,7 @@ LOADER_DIR   = loaders
 LOADER_RELOC_BASE = 0x8ce00000
 # The resident image's flags (AGENTS.md 4.18): no screen, no DHCP, what runs
 # under a title. Any DCLOAD_OS / WITH_* knob may be added here to trim it.
-LOADER_RESIDENT_FLAGS = DCLOAD_RESIDENT=1
+LOADER_RESIDENT_FLAGS = DCLOAD_RESIDENT=1 WITH_RCHEEVOS=1
 
 # One relocatable image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
 # The relocations are the whole point of it, and objcopy is well within its

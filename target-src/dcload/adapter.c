@@ -3,6 +3,7 @@
 #if WITH_LAN_ADAPTER
 #include "lan_adapter.h"
 #endif
+#include "perfctr.h"
 
 // Loop escape flag, used by all drivers.
 volatile unsigned char escape_loop = 0;
@@ -31,6 +32,47 @@ unsigned int g_fine_timeouts = 0;
 unsigned int g_pmcr_backwards = 0;
 // Poll iterations spent with nothing received, at the last timeout.
 unsigned int g_idle_polls_max = 0;
+
+// The loader's clock (adapter.h): performance counter 1, or TMU2 once a title
+// has taken the counter. TMU registers as longs from TOCR (0xffd80000).
+#define CLK_PMCTR1L (*(volatile unsigned int *)0xff100008)
+#define CLK_PMCR1 (*(volatile unsigned short *)PMCR1_CTRL_REG)
+#define CLK_TMU ((volatile unsigned int *)0xffd80000)
+#define CLK_TCNT2 (CLK_TMU[0x24 / 4])
+unsigned int g_clk_tmu2 = 0;
+
+unsigned int clk_now(void)
+{
+	if (g_clk_tmu2)
+	{
+		/* Down at Pck/4 from 0xffffffff: negated and << 4, it is the counter's
+		 * unit, and wraps at the same 2^32 (every 21.4 s). */
+		return ~CLK_TCNT2 << 4;
+	}
+	return CLK_PMCTR1L;
+}
+
+unsigned int clk_since(unsigned int start)
+{
+	return (clk_now() - start) >> 4;
+}
+
+void clk_check(void)
+{
+	/* The mode and the clock select read back; PMEN/PMST are not relied on. */
+	unsigned int pmcr = CLK_PMCR1;
+	volatile unsigned int *tmu = CLK_TMU;
+
+	if (g_clk_tmu2 || (pmcr & 0x013fU) == PMCR_ELAPSED_TIME_MODE)
+	{
+		return;
+	}
+	((volatile unsigned short *)tmu)[0x28 / 2] = 0;	/* TCR2: Pck/4, no interrupt */
+	tmu[0x20 / 4] = 0xffffffffU;			/* TCOR2 */
+	tmu[0x24 / 4] = 0xffffffffU;			/* TCNT2 */
+	((volatile unsigned char *)tmu)[4] |= 4U;	/* TSTR: start TMU2 */
+	g_clk_tmu2 = pmcr | 0x80000000U;
+}
 
 // Packet receive buffer. HIRAM_BUF keeps its 1536 bytes out of the loader
 // image, where they would otherwise sit directly in the path of a title's

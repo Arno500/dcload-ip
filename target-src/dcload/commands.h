@@ -23,6 +23,9 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 #define CMD_PMCR 		 "PMCR" /* Performance counter packet */
 #define CMD_MARK     "MARK" /* paint or check witness words in free RAM */
 #define CMD_DISC     "DISC" /* host swapped the disc image: open the lid, close it */
+#define CMD_RACT     "RACT" /* host -> DC: the table of RAM ranges RetroAchievements watches */
+#define CMD_RAFR     "RAFR" /* DC -> host: frames of those ranges, unacknowledged */
+#define CMD_DRST     "DRST" /* host -> DC: start the max/min counters over */
 
 #define COMMAND_LEN  12
 
@@ -42,6 +45,9 @@ typedef struct __attribute__ ((packed, aligned(4))) {
 #endif
 #ifndef WITH_DISC_SWAP
 #define WITH_DISC_SWAP 1
+#endif
+#ifndef WITH_RCHEEVOS
+#define WITH_RCHEEVOS 0
 #endif
 
 extern unsigned int tool_ip;
@@ -112,5 +118,6 @@ void cmd_mark(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #if WITH_DISC_SWAP
 void cmd_disc(ip_header_t * ip, udp_header_t * udp, command_t * command);
 #endif
+void cmd_drst(ip_header_t * ip, udp_header_t * udp, command_t * command);
 
 #endif

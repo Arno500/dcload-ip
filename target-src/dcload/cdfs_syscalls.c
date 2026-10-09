@@ -769,7 +769,7 @@ HIRAM_BUF static unsigned int gd_stage[GD_STAGE_SECTORS * 512]
 #ifndef GD_STAGE_BIG_SECTORS
 #define GD_STAGE_BIG_SECTORS 3
 #endif
-static unsigned int gd_stage_big[GD_STAGE_BIG_SECTORS * 512]
+unsigned int gd_stage_big[GD_STAGE_BIG_SECTORS * 512]
 	__attribute__((section(".gdstage"), aligned(32)));
 
 /* The title runs with address translation on (MMUCR.AT): Windows CE. */
@@ -780,6 +780,70 @@ static int gd_mmu_on(void)
 		return 0;	/* a variant that never serves CE: its paths fold away */
 	}
 	return *(volatile unsigned int *)0xff000010U & 1U;
+}
+
+/*
+ * THE RETROACHIEVEMENTS SAMPLER BORROWS DEAD RAM (ra.c, AGENTS.md 4.20), which
+ * the resident image could not otherwise spare. Under a Katana title (no MMU)
+ * that is the whole stage, 6 KB. Under Windows CE the stage is the read buffer,
+ * so it gets what lies between the stage and `_stack` instead: the loader's
+ * main-loop stack, dead once the title runs (GD syscalls run on the title's
+ * stack, the network exchange on the Maple page). *ce is 1 under the MMU.
+ * `words` is the size in 32-bit words; the base is 32-byte aligned.
+ *
+ * Nothing may touch it before the title runs: until EXEC the loader's own stack
+ * is in there.
+ */
+/* The linker script's `_stack`; the C name would get another underscore. */
+extern char loader_stack_top[] __asm__("_stack");
+
+/* The two rooms, in words, whatever the title is: ra.c tells the host both. */
+unsigned int gd_ra_katana_words(void)
+{
+	return GD_STAGE_BIG_SECTORS * 512;
+}
+
+#if WITH_RCHEEVOS
+/*
+ * Under Windows CE the host can give more: it ends CE's RAM a few KB under the
+ * loader (`ulRAMEnd`, as it does for the loader's own span) and writes that
+ * block's P1 address and size in words here before EXEC. 0 = not given: the
+ * dead stack above is all there is. The dead stack held ~328 words of table;
+ * Sega Rally 2's achievements alone need ~420 (2026-10-08).
+ */
+unsigned int g_ra_ce_room;
+unsigned int g_ra_ce_room_words;
+#endif
+
+unsigned int gd_ra_ce_words(void)
+{
+#if WITH_RCHEEVOS
+	if (g_ra_ce_room)
+	{
+		return g_ra_ce_room_words;
+	}
+#endif
+	return (unsigned int)((unsigned int *)loader_stack_top
+			      - (gd_stage_big + GD_STAGE_BIG_SECTORS * 512));
+}
+
+unsigned int *gd_ra_scratch(unsigned int *words, int *ce)
+{
+	if (!gd_mmu_on())
+	{
+		*ce = 0;
+		*words = gd_ra_katana_words();
+		return gd_stage_big;
+	}
+	*ce = 1;
+	*words = gd_ra_ce_words();
+#if WITH_RCHEEVOS
+	if (g_ra_ce_room)
+	{
+		return (unsigned int *)g_ra_ce_room;
+	}
+#endif
+	return gd_stage_big + GD_STAGE_BIG_SECTORS * 512;
 }
 
 /*
@@ -2910,6 +2974,7 @@ int gdGdcReqCmd(int cmd, int *param)
 	int n;
 
 	g_gd_idx_counts[0]++;
+	clk_check();	/* the hook's tick does too; without a hook only this (adapter.h) */
 	gd_service_net();
 	gd_note_caller((unsigned int)__builtin_return_address(0));
 	if (GD_ASYNC_KATANA || gd_mmu_on())

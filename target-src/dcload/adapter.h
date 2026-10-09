@@ -129,23 +129,36 @@ extern volatile int drain_iters;
  *
  * KOS clears this counter once, in its init (perf_cntr_timer_enable()), before
  * a title can read its disc; g_pmcr_backwards counts any later restart.
+ *
+ * WINDOWS CE TAKES IT (2026-10-08). A graphics module of Sega Rally 2's
+ * 0WINCEOS.BIN (file offset 0xc9158, beside "VIEW_PERF") writes PMCR1 = 0xe004
+ * and PMCR2 = 0xe001 -- both counters cleared and set to count cache events --
+ * and writes them again each time it is called. The counter then counted
+ * operand cache misses: every period of the hook's tick stopped elapsing (no
+ * idle listen, so --diag and the host's keepalive heard nothing while the
+ * title did not read), the tick no longer looked at a read on the wire, and
+ * no read deadline could fire; g_irq_tick_sum stopped growing. clk_check()
+ * (from the tick and from ReqCmd) sees the counter's mode change and moves
+ * the clock to TMU2 for good: CE's kernel touches TMU0 and TMU1 only, and
+ * the loader timed CE on TMU2 until 2026-10-03. A Katana or KOS title keeps
+ * the counter (TMU2 is theirs, see above). The interval running across the
+ * switch is measured wrong once.
  */
 #ifdef BUS_RATIO_COUNTER
 #error "clk_since() assumes the performance counter counts CPU cycles (200 MHz)"
 #endif
-#define CLK_COUNT (*(volatile unsigned int *)0xff100008)	/* PMCTR1L */
 
-/* A start mark for clk_since(). */
-static inline unsigned int clk_now(void)
-{
-	return CLK_COUNT;
-}
+/* A start mark for clk_since(): the counter in CPU cycles, or TMU2 (Pck/4,
+ * counting down) negated and scaled to the same unit (adapter.c). */
+unsigned int clk_now(void);
 
 /* Pck/4 ticks since `start` (from clk_now()). */
-static inline unsigned int clk_since(unsigned int start)
-{
-	return (CLK_COUNT - start) >> 4;
-}
+unsigned int clk_since(unsigned int start);
+
+/* Move the clock to TMU2 if a title reprogrammed performance counter 1. */
+void clk_check(void);
+/* PMCR1 as it was found taken, bit 31 set; 0 while the clock is the counter. */
+extern unsigned int g_clk_tmu2;
 
 /* When non-zero, bb->loop() gives up this many ticks (clk_since()) after
  * `fine_deadline_start` was latched, exactly as the seconds deadline does:

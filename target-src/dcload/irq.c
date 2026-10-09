@@ -20,8 +20,10 @@
  *     `mov.l r0,@-r15 ; mov.l @(disp,pc),r0 ; jmp @r0 ; mov.l r1,@-r15` to
  *     VBR+0x100/+0x400/+0x600 (Crazy Taxi, 2026-09-28; isoldr's katana_entry
  *     relies on the same nops) -- where nothing needs rebuilding.
- * Under them, the trampoline's 24 bytes must be free: zero, or nop padding
- * (our own exception.bin, which Katana titles adopt as their VBR). Anything
+ * Under them, the trampoline's 24 bytes must be free: zero, nop padding
+ * (our own exception.bin, which Katana titles adopt as their VBR), or the
+ * trampoline an earlier installation left there under a re-copied entry
+ * (Jet Set Radio's two programs share one table). Anything
  * else is left alone and counted once per VBR (g_irq_refused,
  * g_irq_refused_vbr): the GD path then works as it did without a hook.
  *
@@ -36,6 +38,7 @@
 #include "cdda.h"
 #include "rtl8139.h"
 #include "g2dma.h"
+#include "ra.h"
 
 #if WITH_IRQ_HOOK
 
@@ -86,6 +89,11 @@ volatile unsigned int g_irq_rx_stray;		/* entries on our level with nothing pend
 volatile unsigned int g_irq_swallow;		/* irq_hook.S: rte, the title never sees it */
 volatile unsigned int g_irq_rx_evt;		/* INTEVT the BBA is routed to, 0 = none */
 volatile unsigned int g_irq_iml[9];		/* the title's IML2/4/6 NRM,EXT,ERR at install */
+/* Where the title was at its last 16 interrupts: SPC, SSR pairs, the latest at
+ * [(g_irq_pc_at - 1) & 15]. For a title that stops while its interrupts go on:
+ * CE's idle loop, or a loop of the title's (Sega Rally 2, 2026-10-09). */
+volatile unsigned int g_irq_pc[32];
+volatile unsigned int g_irq_pc_at;
 
 /*
  * THE BBA'S RX INTERRUPT (2026-09-28, docs/wince-investigation.md 9o-9p).
@@ -165,7 +173,12 @@ void irq_hook_check(void)
 		return;
 	}
 
-	for (i = 0; i < TRAMP_FREE && (!t[i] || t[i] == SH_NOP); i++)
+	/* Free, or still our own trampoline: a title that copies its entry to
+	 * +0x600 again writes only from there, and leaves ours above it (Jet Set
+	 * Radio, 2026-10-09: its 1ST_READ.BIN copies one entry, the JET_PAL.BIN it
+	 * boots copies the same again over the hooked table, and the hook was
+	 * refused for its own leftovers until the end of the session). */
+	for (i = 0; i < TRAMP_FREE && (!t[i] || t[i] == SH_NOP || t[i] == irq_tramp[i]); i++)
 	{
 	}
 	/* Each entry only in a build that serves its kind (DCLOAD_OS, Makefile). */
@@ -266,18 +279,32 @@ void irq_tick(void)
 #endif
 	/* Marks are raw counts of the loader's clock (adapter.h); an interval is
 	 * (t0 - mark) >> 4, in Pck/4 ticks like the periods. */
-	unsigned int t0 = clk_now();
+	unsigned int t0;
 	unsigned int dt;
 	/* The end bit of our RX DMA while a frame is on it, else 0: any other G2
 	 * DMA end is the title's, to be neither cleared nor swallowed. */
 	unsigned int ours = rtl_rx_dma_bit();
 
+	/* Windows CE takes the performance counter whenever it likes: with it
+	 * counting cache misses no period here ever elapsed (adapter.h). */
+	clk_check();
+	t0 = clk_now();
+
 	g_irq_ticks++;
 	g_irq_evt_last = INTEVT;
+	{
+		unsigned int spc, ssr, i = (g_irq_pc_at++ & 15U) << 1;
+
+		__asm__ volatile ("stc spc,%0" : "=r" (spc));
+		__asm__ volatile ("stc ssr,%0" : "=r" (ssr));
+		g_irq_pc[i] = spc;
+		g_irq_pc[i + 1] = ssr;
+	}
 	/* The whole tick: it reads the BBA while the title's own G2 DMA may be
 	 * moving its sound (g2dma_hold(); Sonic Adventure 2, 2026-09-30). */
 	g2dma_hold();
 	g_rx_dma_tick = (rx_iml != 0);	/* rtl8139.c: a frame may be DMA'd, nothing waits */
+	ra_tick(t0);	/* RetroAchievements: reads RAM only, whatever owns the network */
 	if (rx_iml && (SB_IST(0) & ours))
 	{
 		/* The end of our DMA usually arrives on the TITLE's level: Katana titles
@@ -332,6 +359,13 @@ void irq_tick(void)
 		/* PHASE 3: a disc read is on the wire; it has the network until
 		 * its verdict, and CD-DA declines meanwhile (g_gd_in_transfer). */
 	}
+#if WITH_RCHEEVOS
+	/* A batch of frames is due: one datagram, no answer to wait for. */
+	else if (ra_flush_due(t0))
+	{
+		ra_flush();
+	}
+#endif
 #if IRQ_IDLE_LISTEN
 	/* Before CD-DA: when the title's interrupts come more than 5 ms apart
 	 * (VBlank only), every tick finds CD-DA due and a listen placed after it

@@ -49,6 +49,13 @@ int gd_async_busy(void);
  * it. Non-zero if it did (cdfs_syscalls.c, IRQ_IDLE_LISTEN). */
 int gd_idle_listen(void);
 
+/* Dead RAM lent to the RetroAchievements sampler (ra.c): the big GD stage
+ * without an MMU, the loader's own dead stack under Windows CE (*ce = 1), which
+ * reads into the stage. `words` = its size in 32-bit words. */
+unsigned int *gd_ra_scratch(unsigned int *words, int *ce);
+unsigned int gd_ra_katana_words(void);	/* the two rooms, whatever the title is */
+unsigned int gd_ra_ce_words(void);
+
 /* DISC from the host (commands.c, WITH_DISC_SWAP): 0 accepted, 1 busy (a
  * command is in flight), -1 refused. gdGdcGetDrvStat plays the lid. */
 int gd_disc_request(unsigned int generation);

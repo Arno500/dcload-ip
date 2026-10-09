@@ -752,7 +752,8 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	 * constants only, so it needs no relocation:
 	 *   bits 0-3  layout   0 LOW, 1 HIGH (2 was the withdrawn core)
 	 *   bits 4-7  title kind: 0 all, 1 Katana, 2 KOS, 3 Windows CE
-	 *   bit 8 CD-DA, 9 BBA driver, 10 LAN driver, 11 MARK, 12 DISC, 13 resident
+	 *   bit 8 CD-DA, 9 BBA driver, 10 LAN driver, 11 MARK, 12 DISC, 13 resident,
+	 *   14 RetroAchievements sampler
 	 *   bits 24-31  0xA5, so an older loader's absence reads as "unknown"
 	 */
 	unsigned int variant_be = htonl(0xA5000000U
@@ -763,7 +764,8 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		| (unsigned int)WITH_LAN_ADAPTER << 10
 		| (unsigned int)WITH_MARK_CMD << 11
 		| (unsigned int)WITH_DISC_SWAP << 12
-		| (unsigned int)DCLOAD_RESIDENT << 13);
+		| (unsigned int)DCLOAD_RESIDENT << 13
+		| (unsigned int)WITH_RCHEEVOS << 14);
 	memcpy(response->data + datalength, &variant_be, 4);
 	datalength += 4;
 
@@ -1005,6 +1007,47 @@ void cmd_disc(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
 }
 #endif /* WITH_DISC_SWAP */
+
+/*
+ * DRST: the host's diagnostics panel starts its extremes over (dcload-ip-rs
+ * `diag-reset`). Only the counters that keep the worst a measurement has seen:
+ * never g_gd_sp_min, the footprint guard the host's stack watch learns the
+ * title's memory from (AGENTS.md 4.6). Writes words and answers, nothing else,
+ * so it may run inside a read's wait, like DISC. Reply: DRST, size 0.
+ */
+#if WITH_IRQ_HOOK
+extern volatile unsigned int g_irq_tick_max;
+#endif
+#if WITH_CDDA
+extern unsigned int g_cdda_room_min, g_cdda_svc_gap_max;
+#endif
+#if WITH_RCHEEVOS
+extern unsigned int g_ra_tick_max;
+#endif
+
+void cmd_drst(ip_header_t * ip, udp_header_t * udp, command_t * command)
+{
+	command_t * response = (command_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN + UDP_H_LEN);
+
+	g_idle_polls_max = 0;
+#if WITH_IRQ_HOOK
+	g_irq_tick_max = 0;
+#endif
+#if WITH_CDDA
+	g_cdda_room_min = 0xffffffffU;
+	g_cdda_svc_gap_max = 0;
+#endif
+#if WITH_RCHEEVOS
+	g_ra_tick_max = 0;
+#endif
+
+	memcpy(response, command, COMMAND_LEN);
+	response->size = 0;
+
+	make_ip(ntohl(ip->src), ntohl(ip->dest), UDP_H_LEN + COMMAND_LEN, IP_UDP_PROTOCOL, (ip_header_t *)(pkt_buf + ETHER_H_LEN), ip->packet_id);
+	make_udp(ntohs(udp->src), ntohs(udp->dest), COMMAND_LEN, (ip_header_t *)(pkt_buf + ETHER_H_LEN), (udp_header_t *)(pkt_buf + ETHER_H_LEN + IP_H_LEN));
+	bb->tx(pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + COMMAND_LEN);
+}
 
 #if WITH_PMCR_CMD
 // The 6 performance counter control functions are:
