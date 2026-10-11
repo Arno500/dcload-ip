@@ -296,10 +296,16 @@ model. The driver a title is written against is a **coroutine**, so:
   Unmodelled commands are force-completed, never failed (a title that gets
   FAILED for a routine command tends to give up).
 - **Streams** (`data_stream()`): PIO pieces are chained through the title's
-  `SetPioCallback` callback, called from the server. **DMA pieces after the
-  first need the G1 DMA-end interrupt, which nothing raises**: a DMA stream
-  completes only if its first piece is the whole of it (Windows CE is steered
-  to PIO by the host, §4.15). `GETTOC2` does not model low/high density areas.
+  `SetPioCallback` callback, called from the server. DMA pieces are chained
+  only by a title that polls `CheckDmaTrans` (Pro Pinball Trilogy's Ginsu
+  loader, once a frame): **the G1 DMA-end interrupt is never raised**, so a
+  title that waits on it gets only its first piece (Windows CE is steered to
+  PIO by the host, §4.15). **A zero-byte piece ends the stream**: Ginsu streams
+  `ceil(size / 2048)` sectors but sizes its pieces from the file's size rounded
+  to 32 bytes, then asks for 0 bytes every frame until the stream completes;
+  accepted as a no-op until 2026-10-11, that froze the title before its menu
+  whenever a file stopped inside its last sector. `GETTOC2` does not model
+  low/high density areas.
 
 **Judging a chunk.** The host sends the LoadBinary, the parts and the
 ReturnValue without waiting for an echo or a DoneBinary probe (`send_sectors`,
@@ -663,6 +669,16 @@ reproducible under flycast.
 comparison constant in the title (found by content), so the probe finds nothing
 and the title takes its no-expansion-device path. On by default;
 `--no-gaps-guard` disables it.
+
+**A title can also carry its own BBA driver** (Unreal Tournament PAL, online
+play, 2026-10-11). Its probe never looks for `"GAPS"`: it writes the key
+`0x5a14a501` to the control register `0xa1001418` and takes a read-back of 1
+for an adapter; its init then clears the adapter's 32 KB of SRAM through
+`0xa1840000` (our RX ring) and resets the chip. The loader went deaf right
+after the title's first directory reads, at any base. The same guard
+(`gaps_control_patches`) points every loaded literal naming that register, with
+a `0x5a14a50x` key literal near it, at the key word itself through P2: the
+driver writes its own image, reads back the key, and finds no adapter.
 
 A DC-side recovery does not work: after a full cold re-init `rtl_bb_tx()` never
 returned. Lesson: when every instrument goes quiet at once and the title is

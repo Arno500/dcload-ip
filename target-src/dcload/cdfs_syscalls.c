@@ -2208,10 +2208,12 @@ static void data_transfer(void)
  * is called here, from the server, while more is owed (isoldr does the same,
  * loader/syscalls.c data_transfer_pio_stream). Windows CE's callback just
  * requests the next piece, so a whole stream is served inside the ExecServer
- * that finds the first one. For DMA, the title's G1 DMA-end interrupt, which
- * nothing here raises: a DMA stream finishes only if its first piece is all
- * of it. Windows CE chains DMA pieces from that interrupt (wsegacd.dll), and
- * the host steers it to PIO instead (dcload-ip-rs, dispatch.rs).
+ * that finds the first one. For DMA, either the title's G1 DMA-end interrupt,
+ * which nothing here raises, or a title that polls CheckDmaTrans: Windows CE
+ * chains DMA pieces from that interrupt (wsegacd.dll), and the host steers it
+ * to PIO instead (dcload-ip-rs, dispatch.rs); Pro Pinball Trilogy's loader
+ * (Ginsu) polls once a frame and asks for the next piece itself, 75 sectors
+ * at a time. A zero-byte piece ends a stream (gd_piece_request()).
  *
  * Until 2026-09-27 these commands were force-completed with nothing
  * delivered, which is how CE came to stop after its first executable header.
@@ -3311,6 +3313,23 @@ static int gd_piece_request(int gd_chn, unsigned int *buf)
 	    || (buf[1] > _GDS.requested))
 	{
 		return -1;
+	}
+	/*
+	 * A PIECE OF NOTHING ENDS THE STREAM (2026-10-11). Pro Pinball Trilogy's
+	 * loader (Ginsu) streams ceil(size / 2048) sectors but sizes its pieces
+	 * from the file's size rounded to 32 bytes, so a file that stops inside
+	 * its last sector leaves bytes owed. It then asks, every frame, for the
+	 * zero bytes it still wants; accepted as a piece, that was nothing pending
+	 * and nothing owed less, and the title waited on the stream forever (black
+	 * screen before its menu, ReqDmaTrans and CheckDmaTrans once a frame).
+	 * The rest of the last sector is not written: it is past what the title
+	 * asked for, and maybe past its buffer. The server completes the stream
+	 * at its next turn.
+	 */
+	if (!buf[1])
+	{
+		_GDS.requested = 0;
+		return 0;
 	}
 	gd_piece_addr = buf[0];
 	gd_piece_size = buf[1];
