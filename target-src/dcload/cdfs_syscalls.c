@@ -1825,6 +1825,32 @@ int gd_idle_listen(void)
 }
 #endif
 
+#if WITH_VNIC
+static void ga_vnic_drain(void)
+{
+	extern volatile unsigned int g_rx_dma_tick;
+
+	/* By CPU, as ga_listen(): nothing of ours is on the wire. One poll takes
+	 * every frame the ring holds; the second ends the loop. */
+	g_rx_dma_tick = 0;
+	drain_iters = 2;
+	bb->loop(0);
+	drain_iters = 0;
+}
+
+/* From the tick, for the title's network (vnic.c): take what the ring holds,
+ * whoever it is for. Non-zero if it ran. */
+int gd_vnic_drain(void)
+{
+	if (ga_state != GA_IDLE || g_gd_in_transfer)
+	{
+		return 0;
+	}
+	ga_run(ga_vnic_drain);
+	return 1;
+}
+#endif
+
 /* A chunk is on the wire (irq.c paces its looks at it). */
 int gd_async_busy(void)
 {

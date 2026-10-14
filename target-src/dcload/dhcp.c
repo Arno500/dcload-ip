@@ -131,7 +131,11 @@ static void build_send_dhcp_packet(unsigned char kind)
 	// Make the packet data
 	kos_net_dhcp_fill_options(bb->mac, (dhcp_pkt_t*)dhcp_out_pkt, kind);
 
-	if(kind == DHCP_MSG_DHCPDISCOVER)
+	if((kind == DHCP_MSG_DHCPDISCOVER)
+#if NET_CFG_INFORM
+		|| (kind == DHCP_MSG_DHCPINFORM) /* broadcast, like a DISCOVER */
+#endif
+		)
 	{
 		bb->start(); // Accept broadcast packets and physical match packets (definitely need these!
 		// It's already run by rtl_init in bb_init, but it doesn't do anything to have it here just in case for future DHCP renewal purposes)
@@ -159,6 +163,17 @@ static void build_send_dhcp_packet(unsigned char kind)
 	make_ip(dhcp_out_ip, our_ip, UDP_H_LEN + DHCP_PKT_LEN, IP_UDP_PROTOCOL, dhcp_ip_header, 0); // IP header: dest & src IP addr, header length (hardcoded), packet length excluding ethernet header (IP header size hardcoded), IP protocol type, IP packet ID
 	make_udp(DHCP_DEST_PORT, DHCP_SOURCE_PORT, DHCP_PKT_LEN, dhcp_ip_header, dhcp_udp_header);
 	bb->tx(dhcp_pkt_buf, ETHER_H_LEN + IP_H_LEN + UDP_H_LEN + DHCP_PKT_LEN);
+}
+
+// The netmask, router and DNS server an ACK names (adapter.h)
+static void dhcp_take_net_cfg(dhcp_pkt_t *pkt_data, unsigned short len)
+{
+	g_net_cfg[0] = kos_net_dhcp_get_32bit(pkt_data, DHCP_OPTION_SUBNET_MASK, len);
+	g_net_cfg[1] = kos_net_dhcp_get_32bit(pkt_data, DHCP_OPTION_ROUTER, len);
+	g_net_cfg[2] = kos_net_dhcp_get_32bit(pkt_data, DHCP_OPTION_DOMAIN_NAME_SERVER, len);
+#if NET_CFG_INFORM
+	g_net_cfg_known = 1;	/* a lease's ACK: nothing to ask for */
+#endif
 }
 
 // Steps 2 & 4 are handled here, and this is called from net.c
@@ -225,7 +240,8 @@ int handle_dhcp_reply(unsigned char *routersrcmac, dhcp_pkt_t* pkt_data, unsigne
 	else if(msg_type == DHCP_MSG_DHCPACK) // DHCP ACK is 342 bytes
 	{
 		// Verify that IP address matches and we're all done with this handshake!
-		if( (pkt_data->xid == dhcpoffer_xid) && ((dhcp_renewal == 1) || (ntohl(pkt_data->yiaddr) == dhcpoffer_ip_from_pkt)) )
+		// (Its xid is the one we sent: tested on entry, dhcp_my_xid.)
+		if( (dhcp_renewal == 1) || (ntohl(pkt_data->yiaddr) == dhcpoffer_ip_from_pkt) )
 		{
 			//
 			// Ideally there would be an ARP done here to ensure that the provided IP address is not already taken
@@ -243,6 +259,8 @@ int handle_dhcp_reply(unsigned char *routersrcmac, dhcp_pkt_t* pkt_data, unsigne
 			// Get the lease time from ACK
 			// dhcp_lease_time is usable in little endian
 			dhcp_lease_time = kos_net_dhcp_get_32bit(pkt_data, DHCP_OPTION_IP_LEASE_TIME, len);
+			// And the network it describes, for a network title (adapter.h)
+			dhcp_take_net_cfg(pkt_data, len);
 			// Set PMCR for calculating renewal
 			// Reset 48-bit perfcounter to 0; renewal is calculated by elapsed time
 			// BUS_RATIO_COUNTER is set in dcload.h
@@ -377,6 +395,30 @@ int dhcp_renew(unsigned int *dhcp_ip_address_buffer)
 	}
 }
 
+#if NET_CFG_INFORM
+/*
+ * Ask for the network of an address we already hold (RFC 2131 s3.4): a
+ * DHCPINFORM from that address, which the server answers with an ACK carrying
+ * the options and no lease, so the address never changes under the host.
+ * The ACK takes the renewal's path in handle_dhcp_reply(), which accepts an
+ * ACK for an address it did not offer. One try, a 2 s timeout; a server that
+ * does not answer leaves g_net_cfg at 0 and the host guesses (AGENTS.md
+ * 4.21). Run once a session: what this finds, or not, is handed on.
+ */
+void dhcp_inform(void)
+{
+	dhcp_renewal = 1;
+	timeout_loop = 2;
+	build_send_dhcp_packet(DHCP_MSG_DHCPINFORM);
+	bb->loop(0);
+	timeout_loop = 0;
+	dhcp_renewal = 0;
+	/* No lease is held: never let a stray lease time start a renewal to a
+	 * server and router this instance never learned. */
+	dhcp_lease_time = 0;
+}
+#endif
+
 // The following functions are adapted from KOS, so they need to be licensed properly
 
 //==============================================================================
@@ -428,11 +470,21 @@ static int kos_net_dhcp_fill_options(unsigned char *bbmac, dhcp_pkt_t *req, uint
 		req->htype = DHCP_HTYPE_10MB_ETHERNET;
 		req->hlen = DHCP_HLEN_ETHERNET;
 
-		if(msgtype == DHCP_MSG_DHCPDISCOVER)
+		if((msgtype == DHCP_MSG_DHCPDISCOVER)
+#if NET_CFG_INFORM
+			|| (msgtype == DHCP_MSG_DHCPINFORM)
+#endif
+			)
 		{
 			/* Fill in the initial DHCPDISCOVER packet */
 	    //req->hops = 0;
 	    req->xid = htonl(get_some_time(DCLOAD_PMCR) ^ 0xDEADBEEF);
+#if NET_CFG_INFORM
+			if(msgtype == DHCP_MSG_DHCPINFORM)
+			{
+				req->ciaddr = htonl(our_ip); // the address we hold, and no option 50
+			}
+#endif
 	    //req->secs = 0;
 	    //req->flags = 0; // 0x0000 want unicast response, 0x8000 want broadcast response
 	    //req->ciaddr = 0;

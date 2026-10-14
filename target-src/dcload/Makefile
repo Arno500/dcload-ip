@@ -362,6 +362,16 @@ ifeq ($(WITH_RCHEEVOS)$(DCLOAD_IS_LOW),11)
 $(error WITH_RCHEEVOS needs the HIGH layout: .gdstage is a title's stack in the LOW one)
 endif
 
+# The title's own Ethernet driver served by the loader (vnic.c, AGENTS.md 4.21):
+# the host points a network title's ETD entry points at _vnic_etd, and the
+# loader shares its adapter with it. Needs the hook (the tick sends and drains
+# for the title). Only in the network resident image (LOADER_NET_FLAGS below).
+WITH_VNIC ?= 0
+CFLAGS += -DWITH_VNIC=$(WITH_VNIC)
+ifeq ($(WITH_VNIC)$(WITH_IRQ_HOOK),10)
+$(error WITH_VNIC needs WITH_IRQ_HOOK: the tick is what sends and receives for the title)
+endif
+
 # ---------------------------------------------------------------------------
 # CD-DA (cdda.c). The design is described at the top of cdda.c, the counters
 # and status in AGENTS.md 4.13.
@@ -572,6 +582,13 @@ endif
 ifeq ($(WITH_RCHEEVOS),1)
   DCLOBJECTS += ra.o
 endif
+ifeq ($(WITH_VNIC),1)
+  DCLOBJECTS += vnic.o vnic_entry.o
+  # Nothing in the loader calls it: the host writes its address into the
+  # title. A root for --gc-sections, which would otherwise drop it.
+  LDEXTRA += -Wl,--require-defined=_vnic_etd -Wl,--require-defined=_vnic_pso \
+             -Wl,--require-defined=_g_vnic_late_entry
+endif
 EXCOBJECTS	= exception.o
 
 # The per-source assembly listings (AGENTS.md 6). LTO discards these options
@@ -681,6 +698,13 @@ LOADER_RELOC_BASE = 0x8ce00000
 # The resident image's flags (AGENTS.md 4.18): no screen, no DHCP, what runs
 # under a title. Any DCLOAD_OS / WITH_* knob may be added here to trim it.
 LOADER_RESIDENT_FLAGS = DCLOAD_RESIDENT=1 WITH_RCHEEVOS=1
+# The resident image for a title that plays on the network (AGENTS.md 4.21):
+# the same, plus the title's ETD driver served by the loader. Katana only (ETD
+# is a Katana library), which is also what makes room for it: the resident
+# image has 768 B left under its .gdstage, vnic.c needs ~1 KB, and leaving out
+# the CE and KOS paths frees ~4 KB. The host serves it only to a title whose
+# ETD driver it recognised (dcload-ip-rs src/vnic.rs).
+LOADER_NET_FLAGS = $(LOADER_RESIDENT_FLAGS) WITH_VNIC=1 DCLOAD_OS=katana
 
 # One relocatable image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
 # The relocations are the whole point of it, and objcopy is well within its
@@ -738,6 +762,8 @@ loaders:
 	@# it as the title's loader and uses dcload-relocatable.elf for the hops.
 	@echo "[loaders] linking dcload-resident.elf ($(LOADER_RESIDENT_FLAGS))"
 	@$(call reloc_loader,dcload-resident.elf,$(LOADER_RESIDENT_FLAGS))
+	@echo "[loaders] linking dcload-resident-net.elf ($(LOADER_NET_FLAGS))"
+	@$(call reloc_loader,dcload-resident-net.elf,$(LOADER_NET_FLAGS))
 	@$(MAKE) --no-print-directory clean >/dev/null && $(MAKE) --no-print-directory all >/dev/null
 	@echo "[loaders] built:" && ls -l $(LOADER_DIR)
 

@@ -106,6 +106,11 @@ int adapter_detect() {
 	return 0;
 }
 
+unsigned int g_net_cfg[3];
+#if NET_CFG_INFORM
+unsigned char g_net_cfg_known;
+#endif
+
 void adapter_handoff_save(unsigned int ip)
 {
 #if WITH_BBA

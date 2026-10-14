@@ -73,6 +73,23 @@ void adapter_handoff_save(unsigned int ip);
 extern unsigned char g_warm_start;
 extern unsigned int g_warm_ip;
 
+/* The network the DHCP lease described: netmask, router, DNS server, each as
+ * the number a.b.c.d (like our_ip), 0 when unknown. Set by the instance that
+ * took the lease and handed on with the address (rtl_handoff_save()); the host
+ * reads it to tell a network title its settings (vnic.c, AGENTS.md 4.21). */
+extern unsigned int g_net_cfg[3];
+/* A HIGH image that is not resident -- the one doing the hops -- asks the
+ * DHCP server for that network (DHCPINFORM, dhcp_inform()) when it holds an
+ * address without it: the CD's dcload is older than the carry, whether it
+ * left the adapter for a warm start or not (2.0.3 does not: a cold start
+ * then takes its address from the host's packets, with no lease). */
+#define NET_CFG_INFORM ((DCLOAD_LAYOUT_ID == 1) && !DCLOAD_RESIDENT)
+#if NET_CFG_INFORM
+/* 1 once the network is known (handed on with its check, or from a lease's
+ * ACK) or was asked for; set_ip_dhcp() asks while it is 0. */
+extern unsigned char g_net_cfg_known;
+#endif
+
 // The configured adapter, to be used in all other funcs.
 extern adapter_t * bb;
 extern adapter_t adapter_la;

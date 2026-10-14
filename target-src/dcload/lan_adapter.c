@@ -16,6 +16,7 @@
 #include "memfuncs.h"
 #include "g2dma.h"
 #include "perfctr.h"
+#include "vnic.h"
 
 // Here's a datasheet for the FUJITSU MB86967 chip:
 // https://pdf1.alldatasheet.com/datasheet-pdf/view/61702/FUJITSU/MB86967.html
@@ -404,6 +405,12 @@ void la_bb_stop(void)
 	g2dma_quiesce();
 	DEBUG("bb_stop entered\r\n");
 
+	/* Reception stays on while the title's own network is (vnic.c). */
+	if (vnic_keeps_rx())
+	{
+		return;
+	}
+
 	if (bb_started != 2) {
 		DEBUG("bb_stop exited, state != 2\r\n");
 		return;
@@ -656,7 +663,11 @@ static int la_bb_rx(void)
 
 		/* Submit it for processing */
 		//process_pkt(current_pkt);
-		process_pkt(copyback_current_pkt);
+		/* The title's network takes what is not ours (vnic.c). */
+		if (!vnic_rx(copyback_current_pkt, len))
+		{
+			process_pkt(copyback_current_pkt);
+		}
 
 // For stats
 //		total_pkts_rx++;

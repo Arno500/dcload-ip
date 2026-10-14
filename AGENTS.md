@@ -203,6 +203,7 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `WITH_MARK_CMD` | `1` HIGH, `0` LOW | serve `MARK` (§8) | 432 B |
 | `WITH_RCHEEVOS` | `0` (`1` in `LOADER_RESIDENT_FLAGS`) | the RetroAchievements sampler, `ra.c` (§4.20); needs `WITH_IRQ_HOOK` and the HIGH layout; `RA_WORDS` (1024, a cap: the room decides) / `RA_RANGES` (384) / `RA_CHAINS` (64) size it; its buffers are borrowed from dead RAM | ~5.3 KB |
 | `WITH_DISC_SWAP` | `1` HIGH, `0` LOW | serve `DISC`: the host swaps the served image, the lid opens and closes (§4.17) | ~520 B |
+| `WITH_VNIC` | `0` (`1` in `LOADER_NET_FLAGS`) | serve a network title's ETD Ethernet driver and share the adapter with it (§4.21); needs `WITH_IRQ_HOOK` | ~1 KB |
 | `IRQ_IDLE_LISTEN` | `1` HIGH, `0` LOW | the hook's tick listens to the network (≤ 1 ms every 50 ms) when nothing else owns it, so `--diag`, the stack watch and `MARK` are answered while a title does not read its disc | ~220 B |
 | `RTL_RX_DMA` | `1` HIGH, `0` LOW | the BBA's RX frames by G2 DMA from the tick (§4.16); 0 = every frame by CPU | ~150 B |
 | `GD_STAGE_BIG_SECTORS` | `3` (`2` with the bench or `GA_FAIL_PROBE`) | size of `.gdstage` (§4.15) | 2 KB a sector |
@@ -563,8 +564,29 @@ link-change events. So:
 - **The IP travels in the adapter's SRAM**, at GAPS offset `0x5000` (magic
   `'DCWS'` + IP + complement), written by `rtl_handoff_save()` just before
   `go()` and read into `g_warm_ip`. RAM cannot carry it (1st_read zero-fills,
-  crt0 zeroes BSS). The DHCP lease is not carried. The screen shows
-  `(Warm Start)`.
+  crt0 zeroes BSS). The screen shows `(Warm Start)`. The DHCP lease itself is
+  not carried, but what it said of the network is (2026-10-12): `g_net_cfg`
+  (netmask, router, DNS, from the ACK, `dhcp.c`) follows the address in the
+  same block, words 3-5 and their check in word 6, so every hop hands it on and
+  the host can read it from the title's loader (§4.21). **A CD older than
+  the carry** leaves an address without its network. 2.0.3 does not even
+  leave the chip for a warm start: the universal image starts it cold and
+  takes its address from the host's first packets (`cmd_loadbin()`), so
+  `set_ip_dhcp()` never runs a DHCP exchange. Either way, the universal
+  image (HIGH, not resident: `NET_CFG_INFORM`, `adapter.h`) sends one
+  DHCPINFORM from that address (`dhcp_inform()`, RFC 2131 §3.4, 2 s).
+  `set_ip_dhcp()` sends it from the main loop with the link up, while
+  `g_net_cfg_known` is 0; a valid check or a lease's ACK sets that flag. The
+  network is learnt without a new lease, and the address never changes under
+  the host. The ACK takes the renewal's path in `handle_dhcp_reply()`; one
+  that arrives after the wait is still taken (its `yiaddr` 0 matches the
+  offer that never came). Until 2026-10-12 the INFORM was sent only after a
+  warm start, so behind a 2.0.3 CD it never left. The host goes through this
+  image on the way to the title's loader (`loaders::plan`, `0x8ce00000`
+  first). A server that ignores INFORM leaves zeros, handed on with a valid
+  check, so no later hop asks again. Cost: the universal image's `.gdstage`
+  ends 64 B under `_stack`, with §4.10's broadcast path; this is the binding
+  HIGH budget.
 - BBA only for the IP: the LAN Adapter has nowhere to carry it, so a resident LAN
   loader is told its address by the host (§4.18). The LAN Adapter does adopt a chip
   dcload left configured (`la_warm_usable()`: chip type, `DLCR6_FLAGS`, bank 2,
@@ -586,6 +608,15 @@ A rejected reply returns -1 so the wait continues. `g_dhcp_replies` /
 `g_dhcp_not_ours` show whether this happens (readable with `SBIN` during the
 DHCP wait). A NAK restarts `dhcp_go()` recursively, bounded by
 `DHCP_NAK_NEST_MAX = 5`.
+
+3. **Broadcast replies** (`process_pkt()`, 2026-10-12): a server may broadcast
+   its OFFER and ACK whatever the client's flag says. Until then a broadcast
+   went to `process_broadcast()`, ARP only, so behind such a router the
+   universal image sent DISCOVER after DISCOVER and stayed on "Waiting for
+   IP". Where DHCP runs (not resident), a broadcast now takes the unicast
+   path, `process_mine()`, which passes ARP on and takes only 67 -> 68 as
+   DHCP. One call fewer: this paid for itself (the universal image's
+   `.gdstage` ends 64 B under `_stack` with the cold-start INFORM of §4.9).
 
 ### 4.11 The base is per-game, and the host moves the loader
 
@@ -679,6 +710,10 @@ after the title's first directory reads, at any base. The same guard
 (`gaps_control_patches`) points every loaded literal naming that register, with
 a `0x5a14a50x` key literal near it, at the key word itself through P2: the
 driver writes its own image, reads back the key, and finds no adapter.
+**Both rules apply only to a title served a disc image, and never to a dcload**
+(`is_dcload_image`: the VERS string `"dcload-ip <version> using "`): pushed as
+a bare program, a new loader had its own GAPS bring-up patched out and sat at
+"idle..." with the NIC off.
 
 A DC-side recovery does not work: after a full cold re-init `rtl_bb_tx()` never
 returned. Lesson: when every instrument goes quiet at once and the title is
@@ -1199,8 +1234,10 @@ Not measured on hardware.**
 
 **VERS's third field** (`cmd_version`): the variant word, `0xA5` in the top byte,
 bits 0-3 layout (0 LOW, 1 HIGH; 2 was the core), 4-7 kind of title (0 all, 1 Katana, 2 KOS,
-3 CE), then CD-DA, BBA, LAN, MARK, DISC, resident, RetroAchievements (bit 14). The host reads it
-(`VariantWord`) and the adapter from the reply's `address` field.
+3 CE), then CD-DA, BBA, LAN, MARK, DISC, resident, RetroAchievements (bit 14), the
+title's own network (bit 15, §4.21). The host reads it (`VariantWord`) and the adapter
+from the reply's `address` field; bit 15 tells it the running resident image is
+`dcload-resident-net.elf`, whose symbols it must read.
 
 ### 4.19 The core (withdrawn 2026-10-05)
 
@@ -1383,6 +1420,172 @@ decoder on the PC (`scripts/ra-sampler-harness`).
 - Counters: `g_ra_frames`, `g_ra_sent`, `g_ra_dropped`, `g_ra_keys`,
   `g_ra_tick_max` (Pck/4 ticks), `g_ra_gen`, `g_ra_nofit`, and for CE
   `g_ra_oc_words`, `g_ra_oc_skip`.
+
+### 4.21 A network title shares the adapter: its ETD driver is the loader
+
+`vnic.c`, `vnic_entry.S`, `WITH_VNIC` (2026-10-11). **Not run on hardware or
+under flycast yet.** The header of `vnic.c` is the design description.
+
+- **Why.** A title that plays online carries Sega's ETD library, a whole
+  RTL8139 driver. Unreal Tournament PAL's init (`0x8c1c4a74`) powers the GAPS
+  bridge down and up, clears the adapter's SRAM (the loader's RX ring) and
+  resets the chip: the loader was deaf after the title's first directory reads.
+  The host's GAPS guard (`gaps_control_patches`) gives it no adapter instead,
+  which is its offline path.
+- **One owner.** Two drivers cannot share an RTL8139 (one CAPR, four TX
+  descriptors taken in turn). The loader keeps the chip; the host writes a stub
+  over each ETD entry point (`mov.l @(1,PC),r1 ; jmp @r1 ; mov #index,r0 ;
+  [nop] ; .long _vnic_etd`, `dcload-ip-rs src/dispatch/vnic.rs`) and tells the
+  loader where the driver keeps its four callbacks and their contexts
+  (`g_vnic_slot`, written before EXEC). The four setters are not replaced: the
+  loader reads the words they write.
+- **The contract** (`vnic_call()`, indices in this order): `ETD_Init` 0,
+  `ETD_Stop` 1 (ETD switched the bridge off here: never again), `ETD_GetEthAddr`
+  2, `ETD_SetCtlPrm` 3 (accepted, not applied), the link poll 4 (always up,
+  state 4 = 100 Mbit full, calls the link callback), `ETD_CtlXmit` 5 (the
+  title's traffic on/off), `ETD_SetRecvBuf` 6, `ETD_SetSendBuf` 7 (one frame;
+  -6 while one waits). Return values are ETD's. A frame is delivered as ETD's
+  interrupt handler did: `RX(ctx, len, 0)`, the title answers
+  `SetRecvBuf(buf)` (0 = drop), the bytes are copied, `RX(ctx, 0, buf)`: the
+  title finds the frame by that address (until 2026-10-12 the loader passed the
+  length there, and every received frame was lost, ARP replies included). A sent
+  frame's buffer goes back with `TX(ctx, buf)`, from which the title sends its
+  next. The title's callbacks only move a buffer between two lists under its
+  own lock (IMASK 15 through `0x8c1c6082`, SR.BL left alone): callable from the
+  tick and from inside a GD wait, as from an interrupt.
+- **Whose frame.** The loader's: UDP to `our_ip` and `dcload_syscall_port`,
+  ICMP echo to `our_ip`. ARP: both. The rest: the title's (its address may be
+  ours if its DHCP is answered for our MAC; DHCP is the title's, the resident
+  image has none). Sorted in `rtl_bb_rx()` / `la_bb_rx`, before `process_pkt()`,
+  which builds the loader's answers in place.
+- **When.** While the title's driver is on: `bb->stop()` leaves reception on
+  (every exchange used to end with it off), `irq_rx_arm(0)` keeps the chip's RX
+  interrupt routed, and `vnic_tick()` -- in the tick's else-chain right after
+  the GD lock test, before the disc read, so a title's frame goes out between
+  two chunks -- sends what `SetSendBuf` queued (through `gd_exchange()` and
+  `pkt_buf`, up to 4 a tick) and drains the ring (`gd_vnic_drain()`) when the
+  RX interrupt came, or every 5 ms. A read on the wire drains it itself. Nothing
+  in `vnic_call()` touches the adapter: it runs on the title's stack, with its
+  G2 DMA possibly running; the first tick after `CtlXmit(1)` starts reception.
+- **The other API: Phantasy Star Online** (v2.011 PAL, 2026-10-11). The same
+  driver core without ETD's names, behind a table of seven functions its network
+  layer fills from one literal pool by device (init, info, open, close, send,
+  terminate, getmac; the modem's otherwise). The host points the four that touch
+  the chip (init, send, terminate, getmac) and the two literals naming its link
+  test at `_vnic_pso + 4 * n` (`bra _vnic_etd ; mov #8+n,r0`, indices 8-12);
+  open/close/info stay the title's. `open` keeps one callback per frame type
+  (ARP, IP) in two words (`g_vnic_slot` 0-1, also their contexts: the title
+  passes the word as the handle). Delivery: `cb(h, 0, len)` returns the buffer
+  (0 = drop), copy, `cb(h, 1, len)`. Other frame types are dropped. Its `send`
+  is synchronous (no TX callback): the frame is copied into `vnic_txcopy`
+  (1514 B of BSS) and -1 ("queue full") answered while one waits.
+- **Late patches: Phantasy Star Online Ver.2.** Its 1ST_READ.BIN is a bootstrap:
+  IWASHI.SEA decrypts DP_ADDRESS.JPN (PSO's subtractive generator, words of the
+  result replaced from IWASHI's table at KATSUO's offsets), decompresses it
+  (PRS) to 0x8c010000, and KATSUO.SEA enters it through 0x8c01002c. The driver
+  (v2.011's, moved by 0x5cb40) exists only in RAM. The host decodes the program
+  itself (`dispatch::pso_v2_decode`), writes the words into `g_vnic_late`
+  (count, the entry word, address/value pairs) before EXEC, and serves
+  KATSUO.SEA with the literal it jumps through pointed at `g_vnic_late_entry`
+  (a guard word, put in the read's own bytes). `_vnic_late` writes the words,
+  gives every register back and jumps where KATSUO would have
+  (`g_vnic_late_done` counts what it wrote). The decoded program's syMalloc heap
+  runs `0x8c5c6880..0x8d000000`: the host places the loader by it too
+  (`0x8cfe0000`, its constants name the last 64 KB) and its end, a word of the
+  decoded program (`0x8c030820`), is lowered as one more late pair. With the
+  expansion probe's word and the two serial-number checks (`jsr` to the
+  PRIME.PRS module answered 1, `dispatch::pso_serial_check_patches`) that is 10,
+  all that `VNIC_LATE_MAX` holds.
+- **The entry.** `_vnic_etd` keeps MACH/MACL (the Hitachi compiler's callers
+  may keep them live) and passes the index as a fourth argument. `vnic.c` must
+  stay free of FPU instructions (GCC spills to FP registers under pressure, and
+  this runs with the title's FPSCR): check `vnic.asm` after a change.
+- **Its own image.** `vnic.c` costs ~1 KB, and the resident image had 768 B
+  under its `.gdstage`: `make loaders` builds `dcload-resident-net.elf`
+  (`LOADER_NET_FLAGS`: the resident flags, `WITH_VNIC=1`, `DCLOAD_OS=katana`,
+  which leaves out the CE and KOS paths -- ETD is a Katana library). `_end`
+  base+`0x9f40`, `.gdstage` ending 1216 B under `_stack` (2026-10-11, with
+  PSO's API and the late patches; 3200 B with ETD alone). The universal and the
+  plain resident images are byte for byte what they were. `_vnic_etd`,
+  `_vnic_pso` and `g_vnic_late_entry` are `--gc-sections` roots
+  (`--require-defined`): nothing in the loader names them.
+- **Host.** Recognises ETD only exactly: the error strings its pools name, the
+  first instructions of every entry point and setter at their offsets from
+  `ETD_Init` (Unreal Tournament PAL's version). Anything else keeps the GAPS
+  guard. Decided from the disc's boot binary before the loader is placed (the
+  network image is chosen then), patched after upload, guarded against reloads.
+  `--no-vnic` gives the title no adapter, as before.
+- **The title must see the slot, alive** (2026-10-12). The Katana library's
+  expansion probe (UT `0x8c020338`, the same in both PSO) records every slot
+  answering `"GAPS"` and switches it off as §4.12 describes; with the GAPS
+  guard left out, Unreal Tournament powered the bridge down before its first
+  disc read and went back to the BIOS menu when `gdFsInit` failed. For a network
+  title the host keeps the probe and turns every `bsr` to its two switch-off
+  functions into a `nop` instead (`gaps_power_down_patches`: the function
+  loading `0x5a00a500` and adding 0x18, the one called just before it adding
+  0x14; 12 calls in UT).
+- **The adapter's settings in flash** (2026-10-12). A title uses the adapter
+  only if partition 2 of the flash holds block `0xE0` (the BBA's IP settings,
+  KOS `dc/flashrom.h`); UT reads blocks `0x80..0xEB` and otherwise offers only
+  the modem. `vnic_flash_arm()` (at EXEC, with `cdfs_redir_enable()`) takes the
+  flashrom vector `0x8c0000b8` when the host filled `g_vnic_isp` (address,
+  netmask, gateway, two DNS, as numbers a.b.c.d): `_vnic_flash` passes a read to
+  the BIOS and lays over it a `0xE0` block (method 3, static, the console's own
+  address) in the first free block, and that block's bitmap bit cleared, so the
+  block library takes it as the newest. Nothing is written: a title's write
+  (r7 2, answered with the length) or delete (r7 3, answered 0) is answered as
+  done and never reaches the BIOS (2026-10-12, asked so that saving Unreal
+  Tournament NTSC's LAN settings leaves the flash alone). The Katana flash
+  library works from its RAM copy and checks only the return values; a re-read
+  in the same session sees the flash as it was (the SRAM's ~6.5 KB free cannot
+  shadow a 16 KB partition). **Unreal Tournament NTSC** keeps its own copy
+  of these settings in blocks `0x60..0x69` (ten times 60 bytes, the
+  `0xE0..0xE9` layout: address +8, netmask +12, DNS +20/+24, gateway +28),
+  read at boot with the Katana flash library (`UTDC.BIN` `0x8c08d960`); missing,
+  they read as `0xFF` and it clears them (empty LAN fields). So the overlay
+  lays eleven blocks in the first free ones, which must follow each other:
+  `0xE0`, `0x60` with `0xE0`'s data, `0x61..0x69` as zeros; each is made on the
+  fly (`vf_byte`), only the CRCs kept. Cost: `.gdstage` ends 64 B under
+  `_stack` in the network image (2026-10-12). The method value is KOS's reading, **not yet checked
+  against a title**. Read on the console (2026-10-12): Unreal Tournament PAL
+  copies the partition into the Katana flash library's cache and finds the
+  block there; it then sees the adapter (its probe calls `ETD_Init`), but its
+  main menu offers no Network entry: the build constant `0x8c219510` (1 in
+  the PAL build, never written) hides it, and the DCLAN interface is only
+  opened from that menu. Host:
+  `--net-mask`, `--net-gateway`, `--net-dns`, each else from the lease the
+  loader carries (`g_net_cfg`, §4.9: from the CD's lease, or asked again by
+  the universal image behind an older CD), else 255.255.255.0, the subnet's .1 and the gateway;
+  `--no-flash-isp`. Cost: `_end` base+`0xa3c0`, `.gdstage` ending 64 B under
+  `_stack` (with UT NTSC's blocks).
+- **One block reaches the flash** (2026-10-14, user's request: PSO Ver.2's
+  serial number and access key, block 7, otherwise asked every session).
+  `g_vnic_flash_keep` (from the host; 0 = none) names a block ID; a write
+  (`vnic_flash_write()`) of exactly one 64-byte block of that ID, in partition
+  2's data area, is written by the BIOS **to the first free slot of the real
+  flash** (`vf_blk_at`, the overlay's first slot, which hides it for the rest
+  of the session), then its bitmap bit (the byte read back, less that bit:
+  a write may only clear bits; checked on the PC against a model of the
+  BIOS that refuses anything else, 2026-10-14); the next
+  one to the next slot, at most `VF_BLOCKS` a session (`g_vnic_flash_kept`).
+  Not where the title asked: the Katana library writes its bitmap first, then
+  the block in the slot after the last it sees, which is after the overlay --
+  the real flash would get a hole of eleven blank "used" or "free" slots. The
+  title's bitmap writes and every delete still go nowhere. The used blocks of
+  the real flash stay one run from the start, so the next session's overlay
+  goes after them and the library finds block 7 there. Paid for by making
+  `vnic.c` smaller, no feature removed (`vnic_call`'s cases share their
+  tails, one C entry for flash reads and writes, one pass over the overlay's
+  bytes and one over the bitmap's bits): `.gdstage` ends **exactly at
+  `_stack`, 0 B left** in the network image. **Not yet run on the console.**
+- **Limits.** A title's frame waits for the next interrupt (~1 ms under a
+  Katana title, a frame at worst). No multicast (`RT_MAR0` is 0). `SetCtlPrm`'s
+  filters and modes are ignored. ETD's statistics (`GetEthXinf`) and `Diag` are
+  not served (Unreal Tournament calls `Diag` only from inside `ETD_Init`).
+  Recognised: Unreal Tournament PAL (ETD), Phantasy Star Online v2.011 PAL and
+  Ver.2 PAL (PSO's API); any other version keeps the GAPS guard.
+- Counters: `g_vnic_rx`, `g_vnic_rx_drop` (no callback, or the title refused
+  the buffer), `g_vnic_tx`, `g_vnic_tx_fail`, `g_vnic_on`, `g_vnic_late_done`.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 

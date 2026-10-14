@@ -48,6 +48,9 @@ int gd_async_busy(void);
 /* From the tick: listen to the network for up to 1 ms if nothing else owns
  * it. Non-zero if it did (cdfs_syscalls.c, IRQ_IDLE_LISTEN). */
 int gd_idle_listen(void);
+/* From the tick: drain the RX ring for the title's network (vnic.c). Non-zero
+ * if it did. */
+int gd_vnic_drain(void);
 
 /* Dead RAM lent to the RetroAchievements sampler (ra.c): the big GD stage
  * without an MMU, the loader's own dead stack under Windows CE (*ce = 1), which

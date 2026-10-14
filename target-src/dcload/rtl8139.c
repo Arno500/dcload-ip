@@ -16,6 +16,7 @@
 #include "commands.h"
 #include "irq.h"
 #include "perfctr.h"
+#include "vnic.h"
 
 // TEMP
 //#define LOOP_TIMING
@@ -579,6 +580,18 @@ static void rtl_warm_adopt(void)
 		&& (mem32[RTL_HANDOFF_OFF/4 + 1] == ~mem32[RTL_HANDOFF_OFF/4 + 2]))
 	{
 		g_warm_ip = mem32[RTL_HANDOFF_OFF/4 + 1];
+		/* And the lease's network, after it (2026-10-12), checked the same
+		 * way: an older instance left whatever the SRAM held there. */
+		if (mem32[RTL_HANDOFF_OFF/4 + 6] == ~(mem32[RTL_HANDOFF_OFF/4 + 3]
+			^ mem32[RTL_HANDOFF_OFF/4 + 4] ^ mem32[RTL_HANDOFF_OFF/4 + 5]))
+		{
+			g_net_cfg[0] = mem32[RTL_HANDOFF_OFF/4 + 3];
+			g_net_cfg[1] = mem32[RTL_HANDOFF_OFF/4 + 4];
+			g_net_cfg[2] = mem32[RTL_HANDOFF_OFF/4 + 5];
+#if NET_CFG_INFORM
+			g_net_cfg_known = 1;
+#endif
+		}
 	}
 
 	/*
@@ -610,7 +623,9 @@ static void rtl_warm_adopt(void)
  * Leave our address where the next instance can find it (see the handoff
  * comment at the top of this file). Called just before a program is started,
  * because that is the only moment another dcload can be about to take over.
- * Writing it costs three longwords and means nothing to a game.
+ * Writing it costs seven longwords -- the address and its complement, then the
+ * lease's netmask, router and DNS server and their check (g_net_cfg) -- and
+ * means nothing to a game.
  */
 void rtl_handoff_save(unsigned int ip)
 {
@@ -627,6 +642,10 @@ void rtl_handoff_save(unsigned int ip)
 
 	mem32[RTL_HANDOFF_OFF/4 + 1] = ip;
 	mem32[RTL_HANDOFF_OFF/4 + 2] = ~ip;
+	mem32[RTL_HANDOFF_OFF/4 + 3] = g_net_cfg[0];
+	mem32[RTL_HANDOFF_OFF/4 + 4] = g_net_cfg[1];
+	mem32[RTL_HANDOFF_OFF/4 + 5] = g_net_cfg[2];
+	mem32[RTL_HANDOFF_OFF/4 + 6] = ~(g_net_cfg[0] ^ g_net_cfg[1] ^ g_net_cfg[2]);
 	mem32[RTL_HANDOFF_OFF/4] = RTL_HANDOFF_MAGIC; /* magic last: it validates the pair */
 }
 
@@ -790,6 +809,12 @@ void rtl_bb_start(void)
 void rtl_bb_stop(void)
 {
 	rx_settle(1);
+	/* Every exchange ends with reception off -- except while the title's own
+	 * network is on (vnic.c), whose frames arrive whenever they like. */
+	if (vnic_keeps_rx())
+	{
+		return;
+	}
 	nic32[RT_RXCONFIG/4] &= 0xfffffff5;
 }
 
@@ -1322,7 +1347,11 @@ static int rtl_bb_rx()
 #endif
 
 			//process_pkt(current_pkt);
-			process_pkt(to_p1(current_pkt));
+			/* The title's network takes what is not ours (vnic.c). */
+			if (!vnic_rx(to_p1(current_pkt), pkt_size))
+			{
+				process_pkt(to_p1(current_pkt));
+			}
 
 // Process time end
 #ifdef PKT_PROCESS_TIMING

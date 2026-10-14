@@ -427,15 +427,26 @@ void process_pkt(unsigned char *pkt)
 		return;
 
 	// Destination ethernet header is the first thing in the packet, so it's always aligned to 2 bytes
-	if (!memcmp_16bit_eq(ether_header->dest, bb->mac, 6/2))
+	/* A DHCP server may broadcast its OFFER and ACK whatever the client's
+	 * flag says (2026-10-12, a home router: DISCOVER after DISCOVER, its
+	 * OFFERs never taken). So where DHCP runs, a broadcast takes the
+	 * unicast way: process_mine() sends ARP on to process_broadcast(), and
+	 * process_udp() takes only 67 -> 68 as DHCP. */
+	if (!memcmp_16bit_eq(ether_header->dest, bb->mac, 6/2)
+#if !DCLOAD_RESIDENT
+	    || !memcmp_16bit_eq(ether_header->dest, broadcast, 6/2)
+#endif
+	   )
 	{
 		process_mine(pkt);
 		return;
 	}
 
+#if DCLOAD_RESIDENT
 	if (!memcmp_16bit_eq(ether_header->dest, broadcast, 6/2))
 	{
 		process_broadcast(pkt);
 		return;
 	}
+#endif
 }

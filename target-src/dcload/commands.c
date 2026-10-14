@@ -16,6 +16,7 @@
 #include "perfctr.h"
 #include "memfuncs.h"
 #include "g2dma.h"
+#include "vnic.h"
 #if WITH_CDDA
 #include "cdda.h"
 #endif
@@ -245,6 +246,8 @@ void cmd_execute(ether_header_t * ether, ip_header_t * ip, udp_header_t * udp, c
 		if (cmd_size>>1)
 		{
 			cdfs_redir_enable();
+			/* A network title's adapter settings in flash (vnic.c). */
+			vnic_flash_arm();
 		}
 
 		/* If what we are starting turns out to be another dcload, this is the
@@ -753,7 +756,7 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 	 *   bits 0-3  layout   0 LOW, 1 HIGH (2 was the withdrawn core)
 	 *   bits 4-7  title kind: 0 all, 1 Katana, 2 KOS, 3 Windows CE
 	 *   bit 8 CD-DA, 9 BBA driver, 10 LAN driver, 11 MARK, 12 DISC, 13 resident,
-	 *   14 RetroAchievements sampler
+	 *   14 RetroAchievements sampler, 15 the title's own network (vnic.c)
 	 *   bits 24-31  0xA5, so an older loader's absence reads as "unknown"
 	 */
 	unsigned int variant_be = htonl(0xA5000000U
@@ -765,7 +768,8 @@ void cmd_version(ip_header_t * ip, udp_header_t * udp, command_t * command)
 		| (unsigned int)WITH_MARK_CMD << 11
 		| (unsigned int)WITH_DISC_SWAP << 12
 		| (unsigned int)DCLOAD_RESIDENT << 13
-		| (unsigned int)WITH_RCHEEVOS << 14);
+		| (unsigned int)WITH_RCHEEVOS << 14
+		| (unsigned int)WITH_VNIC << 15);
 	memcpy(response->data + datalength, &variant_be, 4);
 	datalength += 4;
 

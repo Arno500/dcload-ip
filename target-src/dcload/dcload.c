@@ -762,6 +762,16 @@ void set_ip_dhcp(void)
 
 		disp_status("idle..."); // Staying consistent with DCLOAD conventions
 	}
+#if NET_CFG_INFORM
+	/* An address without its network (adapter.h): ask once, from the main
+	 * loop with the link up, whichever way the address came -- inherited, or
+	 * taken from the host's packets after a cold start (a 2.0.3 CD). */
+	else if (!g_net_cfg_known && (our_ip != 0xffffffff))
+	{
+		g_net_cfg_known = 1;
+		dhcp_inform();
+	}
+#endif
 
 	// dcload-ip can now keep on going as normal.
 }

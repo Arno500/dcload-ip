@@ -39,6 +39,7 @@
 #include "rtl8139.h"
 #include "g2dma.h"
 #include "ra.h"
+#include "vnic.h"
 
 #if WITH_IRQ_HOOK
 
@@ -138,6 +139,12 @@ void irq_rx_arm(unsigned int on)
 	{
 		unsigned int dma = (on == 2U) ? rtl_rx_dma_bit() : 0U;
 
+		/* With nothing of ours on the wire, the title's own network still
+		 * wants its frames as they come (vnic.c). */
+		if (on == 0U && vnic_keeps_rx())
+		{
+			on = 1U;
+		}
 		rx_iml[0] &= ~rx_armed_dma;
 		rx_armed_dma = dma & ~rx_iml[0];
 		rx_iml[0] |= rx_armed_dma;
@@ -350,6 +357,13 @@ void irq_tick(void)
 		/* The GD path owns the network -- or CD-DA does: a Katana title's
 		 * GetDrvStat services it before taking the lock. */
 	}
+#if WITH_VNIC
+	/* Before the disc read: the title's frame goes out between two chunks,
+	 * and a load is seconds of chunks back to back. */
+	else if (vnic_tick(t0))
+	{
+	}
+#endif
 	else if (((t0 - read_mark) >> 4) < IRQ_READ_PERIOD && gd_async_busy())
 	{
 		/* A read is on the wire and was looked at a moment ago. */
