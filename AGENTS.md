@@ -2,8 +2,9 @@
 
 > The operating manual for AI coding agents working in this repository. It
 > describes **the code that is present**; a measurement is kept only where it
-> justifies a non-obvious choice. Investigation logs live in `docs/` (§17); the
-> long narrative this file carried until 2026-10-03 is in its git history.
+> justifies a non-obvious choice, and a date only where it dates a measurement.
+> Investigation logs live in `docs/` (§17); earlier, longer versions of this
+> file are in its git history.
 >
 > If this document conflicts with the code, the code wins. Section numbers are
 > cited from source comments and from the Rust host ("AGENTS.md 4.6"), so keep
@@ -99,7 +100,7 @@ source /opt/toolchains/dc/kos/environ.sh
 make                          # host tool + dcload + 1st_read + examples
 sudo make install             # dc-tool-ip → $(TOOLINSTALLDIR)
 make -C target-src/dcload     # incremental sub-builds (also host-src/tool, target-src/1st_read)
-make -C target-src/dcload loaders          # the relocatable loader for the Rust host (§4.11)
+make -C target-src/dcload loaders          # the relocatable loaders for the Rust host (§4.11)
 make -C target-src/dcload config DCLOAD_BASE=…   # print the resulting layout
 make clean                    # objects, maps, *.asm
 make distclean                # also *.bin and loaders/
@@ -156,23 +157,24 @@ Compiler flags disable everything that could move code behind your back:
 | `video.s` / `video.h` | on-screen text (uses the BIOS font through `0x8c0000b4`). |
 | `packet.c/.h`, `bswap.h` | packet builder/parser, byte order, the Internet checksum (`csum_sum16()`). |
 | `net.c/.h` | ARP/ICMP/UDP glue, `announce_presence()`. |
-| `adapter.c/.h` | adapter interface (`bb`), the loader's clock (`clk_now()`/`clk_since()`, §4.5) and the fine deadline, `bb_irq_hold()`. |
+| `adapter.c/.h` | adapter interface (`bb`), the loader's clock (`clk_now()`/`clk_since()`/`clk_check()`, §4.5) and the fine deadline, `bb_irq_hold()`. |
 | `hiram.h` | `HIRAM_BUF`: put a large buffer in `.hiram` instead of BSS. |
 | `rtl8139.c/.h` | BBA driver, RX ring (§4.8), warm start (§4.9), RX by G2 DMA (§4.16). |
 | `lan_adapter.c/.h` | LAN Adapter driver (`WITH_LAN_ADAPTER`). |
-| `dhcp.c/.h` | DHCP client (§4.10). |
-| `perfctr.c/.h` | SH4 performance counters; counter 1 times the DHCP lease and adapter timeouts. |
+| `dhcp.c/.h` | DHCP client and DHCPINFORM (§4.9, §4.10). |
+| `perfctr.c/.h` | SH4 performance counters; counter 1 is the loader's clock and times the DHCP lease and adapter timeouts. |
 | `memfuncs.c/.h`, `memcpy.S`, `memcmp.c` | aligned mem* fast paths (§8 on segments). |
 | `maple.c/.h` | Maple bus driver; its DMA buffer is outside the image (§4.4). |
 | `cdda.c/.h` | CD-DA playback (§4.13). The header of `cdda.c` is the design description. |
 | `g2dma.c/.h` | the four G2 DMA channels by polling, `g2dma_quiesce()`, `g2dma_hold()`, `g2dma_pick()` (§4.16). Built with `WITH_CDDA`. |
 | `g2bench.c` | `G2DMA_BENCH=1` only (§4.16). |
-| `cdfs.h`, `cdfs_redir.s`, `cdfs_syscalls.c` | GD-ROM emulation (§4.5), asynchronous reads, the boot-time drive spin-down (§4.14). Both carry explanatory headers. |
+| `cdfs.h`, `cdfs_redir.s`, `cdfs_syscalls.c` | GD-ROM emulation (§4.5), asynchronous reads, the disc swap (§4.17), the boot-time drive spin-down (§4.14). Both carry explanatory headers. |
 | `syscalls.c/.h` | host syscalls `DC00`–`DC25` (§8). |
 | `commands.c/.h` | the command dispatcher and the LoadBinary window (`bin_info`). |
 | `exception.S` | exception display **and** the VBR table handed to the title. |
 | `irq.c/.h`, `irq_hook.S` | the interrupt hook in a title's own vector table (§4.15, `WITH_IRQ_HOOK`). |
 | `ra.c/.h` | RetroAchievements: samples the host's table of RAM ranges at each vblank (§4.20, `WITH_RCHEEVOS`). |
+| `vnic.c`, `vnic_entry.S` | a network title's Ethernet driver served by the loader, the virtual flash (§4.21, `WITH_VNIC`). |
 
 ### 4.3 Build flags
 
@@ -191,9 +193,9 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `WITH_CDDA` | `1` | CD-DA engine (§4.13) and `g2dma.c` | ~5.2 KB |
 | `WITH_LAN_ADAPTER` | `1` | HIT-0300 driver; 0 = BBA only | ~2 KB |
 | `WITH_BBA` | `1` | HIT-0400 driver (`rtl8139.c`); 0 = LAN Adapter only (no RX DMA) | ~4 KB |
-| `GA_LAN` | `1` | the LAN Adapter takes part in asynchronous reads, the idle listen and the RX interrupt (EXT bit 2); 0 = synchronous reads, the A/B (§4.18) | -- |
-| `DCLOAD_RESIDENT` | `0` (`1` for `dcload-resident.elf`) | no screen, no DHCP; the host supplies the address (§4.18) | ~5.8 KB |
-| `DCLOAD_OS` | `all` | `katana`, `kos` or `wince`: leave out what that kind of title never runs (§4.18, hand builds only); sets `WITH_KATANA`/`WITH_KOS`/`WITH_WINCE` and the defaults of `WITH_IRQ_HOOK`, `GD_ASYNC_KATANA`, `IRQ_IDLE_LISTEN`, `RTL_RX_DMA` | up to ~4 KB |
+| `GA_LAN` | `1` | the LAN Adapter takes part in asynchronous reads, the idle listen and the RX interrupt (EXT bit 2); 0 = synchronous reads (§4.18) | -- |
+| `DCLOAD_RESIDENT` | `0` (`1` in `LOADER_RESIDENT_FLAGS`) | no screen, no DHCP; the host supplies the address (§4.18) | ~5.8 KB |
+| `DCLOAD_OS` | `all` | `katana`, `kos` or `wince`: leave out what that kind of title never runs (§4.18); sets `WITH_KATANA`/`WITH_KOS`/`WITH_WINCE` and the defaults of `WITH_IRQ_HOOK`, `GD_ASYNC_KATANA`, `IRQ_IDLE_LISTEN`, `RTL_RX_DMA` | up to ~4 KB |
 | `WITH_MAPLE` | `1` | serve `MAPL` | ~650 B |
 | `WITH_PMCR_CMD` | `0` | serve `PMCR` (`perfctr.c` stays); no host sends it | ~800 B |
 | `WITH_GD_SPINDOWN` | `0` | stop the real drive at boot (§4.14) | 160 B |
@@ -201,9 +203,10 @@ approximate changes of `_end`, measured when each flag was introduced.
 | `GD_ASYNC_KATANA` | `1` | the hook in Katana titles too, and their disc reads through the asynchronous engine (§4.5); needs `WITH_IRQ_HOOK` | ~150 B |
 | `GA_KATANA_READS` | `1` | with `GD_ASYNC_KATANA`, 0 keeps the hook (CD-DA from the tick, idle listen) but serves Katana reads synchronously | -- |
 | `WITH_MARK_CMD` | `1` HIGH, `0` LOW | serve `MARK` (§8) | 432 B |
-| `WITH_RCHEEVOS` | `0` (`1` in `LOADER_RESIDENT_FLAGS`) | the RetroAchievements sampler, `ra.c` (§4.20); needs `WITH_IRQ_HOOK` and the HIGH layout; `RA_WORDS` (1024, a cap: the room decides) / `RA_RANGES` (384) / `RA_CHAINS` (64) size it; its buffers are borrowed from dead RAM | ~5.3 KB |
-| `WITH_DISC_SWAP` | `1` HIGH, `0` LOW | serve `DISC`: the host swaps the served image, the lid opens and closes (§4.17) | ~520 B |
-| `WITH_VNIC` | `0` (`1` in `LOADER_NET_FLAGS`) | serve a network title's ETD Ethernet driver and share the adapter with it (§4.21); needs `WITH_IRQ_HOOK` | ~1 KB |
+| `WITH_RCHEEVOS` | `0` (`1` in `LOADER_RESIDENT_FLAGS`) | the RetroAchievements sampler (§4.20); needs `WITH_IRQ_HOOK` and the HIGH layout; `RA_WORDS` (1024, a cap: the room decides) / `RA_RANGES` (384) / `RA_CHAINS` (64) size it | ~5.3 KB |
+| `WITH_DISC_SWAP` | `1` HIGH, `0` LOW | serve `DISC` (§4.17) | ~520 B |
+| `GD_DMAEND_SLOT` | `0` (`1` in `LOADER_RESIDENT_FLAGS`, `0` in the network image) | do a title's G1 DMA-end handler after each DMA stream piece, from the word the host names (§4.5) | 88 B |
+| `WITH_VNIC` | `0` (`1` in `LOADER_NET_FLAGS`) | serve a network title's Ethernet driver (§4.21); needs `WITH_IRQ_HOOK` | ~1 KB |
 | `IRQ_IDLE_LISTEN` | `1` HIGH, `0` LOW | the hook's tick listens to the network (≤ 1 ms every 50 ms) when nothing else owns it, so `--diag`, the stack watch and `MARK` are answered while a title does not read its disc | ~220 B |
 | `RTL_RX_DMA` | `1` HIGH, `0` LOW | the BBA's RX frames by G2 DMA from the tick (§4.16); 0 = every frame by CPU | ~150 B |
 | `GD_STAGE_BIG_SECTORS` | `3` (`2` with the bench or `GA_FAIL_PROBE`) | size of `.gdstage` (§4.15) | 2 KB a sector |
@@ -215,13 +218,14 @@ approximate changes of `_end`, measured when each flag was introduced.
 | Flag | What it does |
 | --- | --- |
 | `GD_TRACE` | Trace GD requests to the host console. Each event is a UDP round trip, which perturbs timing enough to stop a title booting. |
-| `GD_SERVICE_EVERY_SYSCALL` | Poll the network at the top of ReqCmd/GetCmdStat/GetDrvStat. **Sonic Adventure dies with it** (mechanism unknown). |
+| `GD_SERVICE_EVERY_SYSCALL` | Poll the network at the top of ReqCmd/GetCmdStat/GetDrvStat. **Sonic Adventure died with it** before its window was masked (§14.20); not re-measured. |
+| `GA_FAIL_PROBE` | Extra counters on the asynchronous path and the GD lock (§4.5). |
 | `GUEST_TICK` (+`_PERIOD`, `_WATCHDOG`, `_BLOCK`) | TMU0 sampler of the guest PC, block at `0x8cff8000` (survives a reset + CD reboot); read with `scripts/dc-ticks.py`. |
 | `ISOLDR_HANDOFF` = `ISOLDR_SR` + `ISOLDR_REGS` + `ISOLDR_SETUP_MACHINE` | isoldr's machine state at launch. **`ISOLDR_REGS` breaks Sonic Adventure**; the other two were never judged alone. |
 | `GUEST_CACHES_ON` | Hand the title CCR `0x0909` instead of `0x0808`. |
 | `GUEST_IRQ_MASKED` | Hand SR with IMASK=15. Diagnostic only (go.S). |
 | `DCLOAD_CLEAR_IPBIN`, `DCLOAD_ZERO_GAME_RAM` | Clear the IP.BIN region / the title's RAM at start-up, as a real boot would. Faithfulness only. |
-| `G2DMA_BENCH` | At boot, measure which G2 DMA channels reach the BBA's SRAM and the AICA, with a torture round; results in `g_bench[]` and on screen. ~1.2 KB: never in a shipped set. |
+| `G2DMA_BENCH` | At boot, measure which G2 DMA channels reach the BBA's SRAM and the AICA; results in `g_bench[]` and on screen. ~1.2 KB: never in a shipped set. |
 | `DCLOAD_EMIT_RELOCS` | `ld -q`: keep relocations (used by `make loaders`). Loaded bytes unchanged. |
 
 In `rtl8139.c`: `RTL_WARM_START` (1) — adopt a BBA a previous dcload brought
@@ -238,7 +242,7 @@ a build variable because it is per-game (§4.11). Defaults (LOW layout):
 | Address | What |
 | --- | --- |
 | `0x8c004000` | dcload's base. `+4` = `0xdeadbeef` magic, `+8` = syscall trampoline pointer (the example-program ABI). |
-| `0x8c00d5e0` | `_end` with default flags (2026-10-03). Code and BSS are all below it. Over the `0x8c00c000` bound (§4.6). |
+| `0x8c00db00` | `_end` with default flags (2026-10-16). Code and BSS are all below it. Over the `0x8c00c000` bound (§4.6). |
 | `_end`..`_stack` | the loader's stack; also `.gdstage` (NOLOAD, `GD_STAGE_BIG_SECTORS` × 2 KB), used only under a Windows CE title (§4.15). |
 | `0x8c00f400` | `_stack` (LOW layout), **the VBR handed to the title**, the link address of `exception`, and the BIOS VBR. Only `_stack` moves with the base. |
 | `0x8c010000` | the title's load address; `exception.bin` ends just before it. |
@@ -272,24 +276,23 @@ model. The driver a title is written against is a **coroutine**, so:
 - **Asynchronous reads** (`data_transfer_async()`, the `ga_*` functions): the
   read is posted, the title runs, and **the hook's tick** (§4.15) collects each
   chunk and posts the next. Used under Windows CE with the hook in, and under
-  Katana titles with `GD_ASYNC_KATANA` (BBA only), for every read — one
-  sector included since 2026-10-03: served synchronously, it read the BBA
-  through G2 with the title's interrupts on and its G2 DMA running, and
-  Shenmue II froze twice right after one (deaf loader, AICA looping its
-  ring). With the MMU off the destination is physical and the host writes it
-  directly, `GA_PHYS_SECTORS` (6) a chunk — what the RX ring holds undrained;
-  a virtual destination is staged and copied (§4.15). A chunk is done with its
+  Katana titles with `GD_ASYNC_KATANA` (BBA, or the LAN Adapter with `GA_LAN`)
+  for **every** read, one sector included: served synchronously, a one-sector
+  read used G2 with the title's interrupts on and its G2 DMA running, and
+  Shenmue II froze right after one (deaf loader, AICA looping its ring). With
+  the MMU off the destination is physical and the host writes it directly,
+  `GA_PHYS_SECTORS` (6) a chunk — what the RX ring holds undrained; a virtual
+  destination is staged and copied (§4.15). A chunk is done with its
   ReturnValue, not merely a whole window. Counters: `g_ga_posts`,
   `g_ga_irq_done` (chunks the tick finished), `g_ga_xlat_miss`, `g_ga_sync`,
   `g_ga_wakes`.
 - **KOS titles** (`g_gd_kos`, set by the host before `EXEC`, §16): a read
   starts without the first yield, as isoldr does for KOS (KOS sleeps on
   PROCESSING until its G1 DMA-end or vblank handler).
-- **Every read retries**; without the hook, one-sector reads take
-  `data_transfer_emu_async()`: isoldr's single shot for one sector told the title FAILED on one
-  lost frame — EIO under KOS, "Data Read Error -26" in Shenmue II
-  (`g_cdfs_read_fails` 1, `g_cdfs_read_retries` 0). Only the disabled
-  `GD_EMU_ASYNC == 0` / `GD_BULK_SECTORS` cases still read in one shot.
+- **Every read retries.** Without the hook, one-sector reads take
+  `data_transfer_emu_async()` too: isoldr's single shot told the title FAILED
+  on one lost frame (EIO under KOS, "Data Read Error -26" in Shenmue II). Only
+  the disabled `GD_EMU_ASYNC == 0` / `GD_BULK_SECTORS` cases read in one shot.
 - `gdGdcGetCmdStat` reports progress (`COMPLETED` consumed once, then `IDLE`;
   `req_count` never 0 or 1). `gdGdcGetDrvStat` reports PLAYING while a read or
   CD-DA is live and calls `cdda_service()` **before** taking the GD lock.
@@ -301,12 +304,18 @@ model. The driver a title is written against is a **coroutine**, so:
   only by a title that polls `CheckDmaTrans` (Pro Pinball Trilogy's Ginsu
   loader, once a frame): **the G1 DMA-end interrupt is never raised**, so a
   title that waits on it gets only its first piece (Windows CE is steered to
-  PIO by the host, §4.15). **A zero-byte piece ends the stream**: Ginsu streams
-  `ceil(size / 2048)` sectors but sizes its pieces from the file's size rounded
-  to 32 bytes, then asks for 0 bytes every frame until the stream completes;
-  accepted as a no-op until 2026-10-11, that froze the title before its menu
-  whenever a file stopped inside its last sector. `GETTOC2` does not model
-  low/high density areas.
+  PIO by the host, §4.15). **Unless the host names its handler's word**
+  (`GD_DMAEND_SLOT`, resident image): NBA 2K2's `VCCD` asks one sector a
+  piece, leaves its continuation in a word of its own, and its GD DMA-end
+  handler takes and clears that word and calls `G1DmaEnd(word, 0)`. The host
+  finds the handler by content (`dispatch::gd_dma_end_slot`) and writes the
+  word's P1 address and the argument into `g_gd_dmaend_slot` /
+  `g_gd_dmaend_param` before `EXEC`; after each DMA piece the server does the
+  same, interrupts masked (`gd_dma_end()`, `g_gd_dmaend_calls`). **A zero-byte piece ends the stream**: Ginsu sizes
+  its pieces from the file's size rounded to 32 bytes, then asks for 0 bytes
+  every frame until the stream completes; taken as a no-op, that froze the
+  title whenever a file stopped inside its last sector. `GETTOC2` does not
+  model low/high density areas.
 
 **Judging a chunk.** The host sends the LoadBinary, the parts and the
 ReturnValue without waiting for an echo or a DoneBinary probe (`send_sectors`,
@@ -340,22 +349,23 @@ get through any of them to the real drive:
 | --- | --- | --- |
 | vector `0xac0000bc` (misc group in front, `r6 == -1`) | Katana titles | `cdfs_redir_enable()` |
 | vector `0xac0000c0` (the driver alone) | Windows CE's `COREDLL.DLL` | `cdfs_redir_enable()`, saved and restored with `0xbc` |
-| the driver body `0x8c0010f0` itself | Windows CE's GD driver (literals in `0WINCEOS.BIN`, called with `r6 = 0`, `r7` = index) | **the host** rewrites the literals to `_gd_bios_entry` (`dispatch::gd_body_patches`), as isoldr's `gdc_syscall_patch()` does |
+| the driver body `0x8c0010f0` itself | Windows CE's GD driver (literals in `0WINCEOS.BIN`, called with `r6 = 0`, `r7` = index); NBA 2K2's `VCCD` layer (13 literals in each `MAIN*.BIN` its Ginsu boot runs) | **the host** rewrites the literals to `_gd_bios_entry` (`dispatch::gd_body_patches`), as isoldr's `gdc_syscall_patch()` does |
 
-The third is patched from the host rather than by overwriting the BIOS's copy
+The host patches the third in the boot binary at upload and, under a Ginsu
+boot, in the programs Ginsu reads, as they are served. It is patched from the
+host rather than by overwriting the BIOS's copy
 of the driver, because `gd_spin_down_drive()` needs the real driver at the next
-boot.
+boot. `cdfs_redir_enable()` also takes the system vector `0x8c0000e0` (§4.17)
+and, for a network title, the flashrom vector (§4.21).
 
 **What a disc read may not land on** is derived from the linker:
 `[dcload_base, end)` and `[_hiram_start, _hiram_end)`, compared in P1. The Maple
 DMA buffer is deliberately not in the list: it is written only while a `MAPL`
-command runs, never under a title.
-A read refused for this is failed to the title and never reaches the host:
-`g_gd_self_refused` counts them and `_lo`/`_hi` keep the last range, defined
-beside `g_gd_sp_min` so that the host's stack watch reads them in the same
-request and adds the range to the title's learned memory map (Shenmue II's
-"corrupted data", 2026-10-05: 382 sectors aimed through a loader at
-`0x8c7d0000`).
+command runs, never under a title. A read refused for this is failed to the
+title and never reaches the host: `g_gd_self_refused` counts them and
+`_lo`/`_hi` keep the last range, defined beside `g_gd_sp_min` so that the
+host's stack watch reads them in the same request and adds the range to the
+title's learned memory map.
 
 **Invariants, each paid for:**
 
@@ -378,28 +388,28 @@ request and adds the range to the title's learned memory map (Shenmue II's
    `RTL_IDLE_POLL_LIMIT` only counts polls with no frame, and both are disarmed
    when `timeout_loop` is cleared under a wait. Arm, call, then clear — never
    clear someone else's.
-   **The clock is performance counter 1, never a TMU** (`clk_now()`,
-   `clk_since()`, `adapter.h`): started by `main()` counting CPU cycles,
-   `>> 4` = Pck/4 ticks, so every `*_TICKS` constant and every millisecond the
-   host prints keep their unit; it wraps every 21.4 s. A title owns its TMUs:
-   KOS reloads TMU2 every second. Under Sonic Adventure 2, measured on TMU2,
-   asynchronous reads were judged 250 ms late one frame after their request —
-   re-asked every 16.7 ms, the ADX music starved — while synchronous reads
-   (inside one syscall) never were: the title disturbs TMU2 between two looks
-   (how is still to be read off `g_gaf_tmu2`, `GA_FAIL_PROBE`). The loader neither
-   programs nor reads TMU2. KOS clears this counter once in its init, before
-   any read; `g_pmcr_backwards` counts a later restart. **Windows CE takes the
-   counter** (2026-10-08): a graphics module of Sega Rally 2's `0WINCEOS.BIN`
-   writes PMCR1 = `0xe004` / PMCR2 = `0xe001` (cleared, counting cache events),
-   again at each call. On it no period of the tick elapsed (no idle listen:
-   `--diag` and the host's keepalive heard nothing while the title did not
-   read, `g_irq_tick_sum` frozen) and no read deadline could fire.
-   `clk_check()` (every tick, every ReqCmd) sees PMCR1's mode leave `0x23` and
-   moves the clock to TMU2 for good (CE uses TMU0/TMU1 only); `g_clk_tmu2` is
-   the PMCR1 found, bit 31 set, and must stay 0 under Katana and KOS titles.
-   The seconds timeout (`PMCR_Read`) stays on the counter. **flycast reads 0
-   from PMCR without the local `sh4_mmr.cpp` patch** (§11): the clock is then
-   TMU2 there for every title.
+
+**The loader's clock** (`clk_now()`, `clk_since()`, `clk_check()`,
+`adapter.h`, whose header is the full account) is **performance counter 1**,
+started by `main()` counting CPU cycles; `>> 4` = Pck/4 ticks, so every
+`*_TICKS` constant and every millisecond the host prints keep their unit. It
+wraps every 21.4 s. The loader does not keep time on a TMU because a title owns
+its TMUs: KOS reloads TMU2 every second, Shenmue II stops it for its RTC
+calibration, and under Sonic Adventure 2 asynchronous reads measured on TMU2
+were judged 250 ms late one frame after their request. KOS clears the counter
+once in its init, before any read; `g_pmcr_backwards` counts a later restart.
+
+**Windows CE takes the counter**: a graphics module of Sega Rally 2's
+`0WINCEOS.BIN` writes PMCR1 = `0xe004` / PMCR2 = `0xe001` (cleared, counting
+cache events) at each call, and then no period of the tick elapsed and no read
+deadline could fire. `clk_check()` (every tick, every ReqCmd) sees PMCR1's mode
+leave `0x23` and moves the clock to TMU2 for good. CE's own kernel runs TMU2 as
+a free-running Pck/4 counter (TCOR2 all ones, no interrupt, never stopped;
+`DDHAL.DLL` reads TCNT2), so sharing it is harmless; taking it over restarts
+TCNT2 once. `g_clk_tmu2` is the PMCR1 found, bit 31 set, and must stay 0 under
+Katana and KOS titles. The seconds timeout (`PMCR_Read`) stays on the counter.
+**flycast reads 0 from PMCR without the local `sh4_mmr.cpp` patch** (§11): the
+clock is then TMU2 there for every title.
 
 **The GD lock's C sections run masked.** `gd_take()` raises IMASK to 15
 before taking the lock and `gd_give()` gives the caller's IMASK back (only
@@ -407,8 +417,7 @@ IMASK: T and the rest of SR stay). ReqCmd, GetCmdStat, GetDrvStat and
 ChangeDataType hold it for a few instructions, no network, nothing waited for.
 Unmasked, a title's handler that landed inside one and polled the driver until
 it stopped answering BUSY waited on a holder that could not resume: Shenmue II
-froze before its menu (2026-10-03: GetDrvStat held it 266 ms while the driver
-kept answering BUSY). The server's own hold (`es_enter`) stays interruptible:
+froze before its menu. The server's own hold (`es_enter`) stays interruptible:
 it waits on the network, and BUSY is the BIOS's answer then too. Anything
 added between `gd_take()` and `gd_give()` must stay short and must not wait;
 `gdGdcReset()` and the watchdog release with `gd_release()`, which leaves SR
@@ -417,17 +426,13 @@ alone.
 **Stuck-lock watchdog.** `gd_lock_watchdog()` (from GetDrvStat/GetCmdStat)
 releases the GD lock if it is held while the server is parked,
 `g_gd_lock_gen` has not moved for `GD_LOCK_STUCK_TICKS`, **and no C syscall is
-inside** (`g_gd_lock_owner` 0). Its one recorded release was wrong: the
-Shenmue II hold above, which it handed to the polling handler while the
-interrupted call later released the lock a second time. Leaving such a hold
-(`g_gd_lock_held_long`) froze the title and silenced the loader, whose tick
-needs the lock free. On TMU2, which Shenmue II stops for its RTC calibration,
-the watchdog seldom reached 250 ms: the same freeze, intermittent and deaf
-(2026-10-02). With the mask, `g_gd_lock_held_long` must stay 0.
-`_stuck_owner` / `_stuck_ticks` describe the last of either. `GA_FAIL_PROBE`
-builds add `g_gd_busy_c` (BUSY from a C section: 0), `g_gd_busy_srv`, and the
-last caller told BUSY (`g_gd_busy_pr`, `g_gd_busy_sr`: IMASK > 0 means it
-called from an interrupt).
+inside** (`g_gd_lock_owner` 0). Releasing a hold that a C syscall still had
+(the Shenmue II case above) handed the lock to the polling handler while the
+interrupted call later released it a second time. With the mask,
+`g_gd_lock_held_long` must stay 0. `_stuck_owner` / `_stuck_ticks` describe
+the last of either. `GA_FAIL_PROBE` builds add `g_gd_busy_c` (BUSY from a C
+section: 0), `g_gd_busy_srv`, and the last caller told BUSY (`g_gd_busy_pr`,
+`g_gd_busy_sr`: IMASK > 0 means it called from an interrupt).
 
 **Constants** (`cdfs_syscalls.c`, override with `-D`):
 
@@ -444,7 +449,7 @@ called from an interrupt).
 | `GD_SERVICE_ITERS` | `256` | used by `GD_SERVICE_EVERY_SYSCALL` (§4.3). |
 | `GD_TRACE_CALLER` / `GD_TRACE_DEST_FROM` | `0` / `0xffffffff` | caller PC/SP tracing; expensive. |
 | `GD_LOCK_STUCK_TICKS` | `3125000` | 250 ms, the watchdog threshold. |
-| `GD_STAGE_SECTORS` / `GD_STAGE_BIG_SECTORS` | `3` / `4` | `gd_stage` (`.hiram`) and `gd_stage_big` (`.gdstage`), §4.15. |
+| `GD_STAGE_SECTORS` / `GD_STAGE_BIG_SECTORS` | `3` / `3` | `gd_stage` (`.hiram`) and `gd_stage_big` (`.gdstage`), §4.15. |
 | `GA_PHYS_SECTORS`, `GA_POLL_ITERS`, `GA_XLAT_PAGES` | `6`, `2`, `32` | asynchronous reads: sectors per physical chunk, loop turns per look, 4 KB pages translated ahead (§4.15). |
 
 **Known gaps:**
@@ -452,9 +457,9 @@ called from an interrupt).
 - **No `g2_lock()` around CPU reads of the BBA on the synchronous Katana path**
   (a 250 ms read deadline would stall the title's sound, and a title handler
   waiting on its own suspended DMA would deadlock, interrupts being on). With
-  the hook in, disc reads no longer take it; CD-DA fetches started from
-  `GetDrvStat` still do. Under the tick and
-  under KOS the title's G2 DMA is suspended (§4.16).
+  the hook in, disc reads no longer take that path; CD-DA fetches started from
+  `GetDrvStat` still do. Under the tick and under KOS the title's G2 DMA is
+  suspended (§4.16).
 - `CMD_INIT`, `CMD_REQ_MODE` and `CMD_SET_MODE` are force-completed with
   **nothing written back**. Count first (`g_gd_cmd_counts[24]`, `[30]`, `[31]`)
   before spending bytes on it.
@@ -481,25 +486,29 @@ its stack margin; the title then fails `gdFsInit` and exits to the BIOS menu
 (flycast logs `SYS_MISC 1`, then `REIOS: Booting up`) or spins forever.
 isoldr does not meet this because its image ends at `0x8c007400`.
 
-**Where it stands (2026-10-03):**
+**Where it stands (2026-10-17, `make loaders` of `6a39620` + `GD_DMAEND_SLOT`):**
 
-- **LOW (the CD build): `_end = 0x8c00d5e0`, 5.6 KB over the bound.** The CD
-  loader cannot host a retail Katana title at its own base. That is accepted
-  (user decision, 2026-09-21): the host chainloads its own HIGH set before any
-  disc image and refuses a low base whose image reaches a range the title
-  paints (`low_loader_painted_by_title`). Say so when a change makes it worse.
-  `.gdstage` ends 1568 B under `_stack`.
-- **HIGH (the host's set): `_end = base+0x9d0c`, `.gdstage` ends 1760 B under
-  `_stack` (`base+0xbc00`)** (2026-10-03, with `DISC` and `GD_STAGE_BIG_SECTORS`
-  3). This is the binding budget. The next bytes come from
-  `GD_STAGE_BIG_SECTORS` (2 KB a sector, costs Windows CE's staged reads) or
-  from a feature flag of §4.3.
+| Image | `_end` | `.gdstage` ends under `_stack` |
+| --- | --- | --- |
+| LOW (the CD build) | `0x8c00db00`, 6.8 KB over the bound | 256 B |
+| universal (`dcload-relocatable.elf`, HIGH) | base+`0xa3bc` | 64 B |
+| resident (`dcload-resident.elf`) | base+`0xa1e0` | 544 B |
+| network (`dcload-resident-net.elf`) | base+`0xa400` | **0 B** |
+
+- **The CD loader cannot host a retail Katana title at its own base.** That is
+  accepted (user decision, 2026-09-21): the host chainloads its own HIGH set
+  before any disc image and refuses a low base whose image reaches a range the
+  title paints (`low_loader_painted_by_title`). Say so when a change makes it
+  worse.
+- **The HIGH images are the binding budget.** The next bytes come from
+  tightening code, not from removing a feature (ask the user first), or from
+  `GD_STAGE_BIG_SECTORS` (2 KB a sector, costs Windows CE's staged reads).
 
 Rules when adding anything DC-side:
 
-- Check `_end` and `__gdstage_end` in `dcload.map` for **both** families
-  (`make config` / `DCLOAD_BASE=0x8ce00000` for HIGH) after any change that
-  adds state.
+- Check `_end` and `__gdstage_end` (`sh-elf-nm`, or `dcload.map`) for **every**
+  image after any change that adds code or state: the LOW build and the three
+  `make loaders` images.
 - Put large buffers in `.hiram` (`HIRAM_BUF`), not BSS. `.hiram` is nearly full.
 - `bb` is near the end of BSS — one of the first things a descending stack
   reaches. Nobody has ordered BSS deliberately yet.
@@ -564,34 +573,29 @@ link-change events. So:
 - **The IP travels in the adapter's SRAM**, at GAPS offset `0x5000` (magic
   `'DCWS'` + IP + complement), written by `rtl_handoff_save()` just before
   `go()` and read into `g_warm_ip`. RAM cannot carry it (1st_read zero-fills,
-  crt0 zeroes BSS). The screen shows `(Warm Start)`. The DHCP lease itself is
-  not carried, but what it said of the network is (2026-10-12): `g_net_cfg`
-  (netmask, router, DNS, from the ACK, `dhcp.c`) follows the address in the
-  same block, words 3-5 and their check in word 6, so every hop hands it on and
-  the host can read it from the title's loader (§4.21). **A CD older than
-  the carry** leaves an address without its network. 2.0.3 does not even
-  leave the chip for a warm start: the universal image starts it cold and
-  takes its address from the host's first packets (`cmd_loadbin()`), so
-  `set_ip_dhcp()` never runs a DHCP exchange. Either way, the universal
-  image (HIGH, not resident: `NET_CFG_INFORM`, `adapter.h`) sends one
-  DHCPINFORM from that address (`dhcp_inform()`, RFC 2131 §3.4, 2 s).
-  `set_ip_dhcp()` sends it from the main loop with the link up, while
-  `g_net_cfg_known` is 0; a valid check or a lease's ACK sets that flag. The
-  network is learnt without a new lease, and the address never changes under
-  the host. The ACK takes the renewal's path in `handle_dhcp_reply()`; one
-  that arrives after the wait is still taken (its `yiaddr` 0 matches the
-  offer that never came). Until 2026-10-12 the INFORM was sent only after a
-  warm start, so behind a 2.0.3 CD it never left. The host goes through this
-  image on the way to the title's loader (`loaders::plan`, `0x8ce00000`
-  first). A server that ignores INFORM leaves zeros, handed on with a valid
-  check, so no later hop asks again. Cost: the universal image's `.gdstage`
-  ends 64 B under `_stack`, with §4.10's broadcast path; this is the binding
-  HIGH budget.
-- BBA only for the IP: the LAN Adapter has nowhere to carry it, so a resident LAN
-  loader is told its address by the host (§4.18). The LAN Adapter does adopt a chip
-  dcload left configured (`la_warm_usable()`: chip type, `DLCR6_FLAGS`, bank 2,
-  reception off, link good, a station address programmed), skipping the reset,
-  the EEPROM read and the 2.3 s link wait; anything else is the cold path.
+  crt0 zeroes BSS). The screen shows `(Warm Start)`.
+- **What the lease said of the network travels with it**: `g_net_cfg`
+  (netmask, router, DNS, from the ACK, `dhcp.c`) in words 3-5 of the same
+  block, checked by word 6, so every hop hands it on and the host can read it
+  from the title's loader (§4.21).
+- **Learning the network without a lease** (`NET_CFG_INFORM`, `adapter.h`: the
+  universal image only). A CD older than this carry leaves an address without
+  its network, and 2.0.3 does not leave the chip for a warm start at all: the
+  universal image then starts cold and takes its address from the host's first
+  packets (`cmd_loadbin()`). While `g_net_cfg_known` is 0 (a valid check or a
+  lease's ACK sets it), `set_ip_dhcp()` sends one DHCPINFORM from that address
+  (`dhcp_inform()`, RFC 2131 §3.4, 2 s) from the main loop with the link up;
+  the address never changes under the host. The ACK takes the renewal's path
+  in `handle_dhcp_reply()`, even late (its `yiaddr` 0 matches the offer that
+  never came). The host goes through this image on the way to the title's
+  loader (`loaders::plan`, `0x8ce00000` first). A server that ignores INFORM
+  leaves zeros, handed on with a valid check, so no later hop asks again.
+- BBA only for the IP: the LAN Adapter has nowhere to carry it, so a resident
+  LAN loader is told its address by the host (§4.18). The LAN Adapter does
+  adopt a chip dcload left configured (`la_warm_usable()`: chip type,
+  `DLCR6_FLAGS`, bank 2, reception off, link good, a station address
+  programmed), skipping the reset, the EEPROM read and the 2.3 s link wait;
+  anything else is the cold path.
 
 Commands are matched on the MAC and `our_ip` is taken from the packet
 (`cmd_loadbin()`), which is why the host can reach a DC without a lease.
@@ -603,20 +607,16 @@ Only bites on a real LAN:
 1. **Ports** (`process_udp()`): the DHCP parser runs only for 67 → 68.
 2. **xid and chaddr** (`handle_dhcp_reply()`): the xid we sent is kept in
    `dhcp_my_xid`; another machine's broadcast OFFER is not adopted.
+3. **Broadcast replies** (`process_pkt()`): a server may broadcast its OFFER
+   and ACK whatever the client's flag says. Where DHCP runs (not resident), a
+   broadcast takes the unicast path, `process_mine()`, which passes ARP on and
+   takes only 67 → 68 as DHCP; sent to ARP alone, the universal image stayed
+   on "Waiting for IP" behind such a router.
 
 A rejected reply returns -1 so the wait continues. `g_dhcp_replies` /
 `g_dhcp_not_ours` show whether this happens (readable with `SBIN` during the
 DHCP wait). A NAK restarts `dhcp_go()` recursively, bounded by
 `DHCP_NAK_NEST_MAX = 5`.
-
-3. **Broadcast replies** (`process_pkt()`, 2026-10-12): a server may broadcast
-   its OFFER and ACK whatever the client's flag says. Until then a broadcast
-   went to `process_broadcast()`, ARP only, so behind such a router the
-   universal image sent DISCOVER after DISCOVER and stayed on "Waiting for
-   IP". Where DHCP runs (not resident), a broadcast now takes the unicast
-   path, `process_mine()`, which passes ARP on and takes only 67 -> 68 as
-   DHCP. One call fewer: this paid for itself (the universal image's
-   `.gdstage` ends 64 B under `_stack` with the cold-start INFORM of §4.9).
 
 ### 4.11 The base is per-game, and the host moves the loader
 
@@ -656,16 +656,17 @@ loader there before uploading the title. Things this must not break:
 5. **A preset's address was chosen for isoldr (13 KB); we reserve `0x10000`.**
    Sonic Adventure 2's preset `0x8cfe8000` puts the loader's stack where the
    title's Maple DMA list lives (`0x0cff0000`): black screen. The host scans the
-   title for such constants before choosing (§16).
+   title for such constants, and for its heap's bounds, before choosing (§16).
 
-**The loader set is one relocatable image.** `make loaders` links
-`loaders/dcload-relocatable.elf` at `0x8ce00000` with `DCLOAD_EMIT_RELOCS=1`
+**The loader set is relocatable images.** `make loaders` links, at
+`0x8ce00000` with `DCLOAD_EMIT_RELOCS=1`, `loaders/dcload-relocatable.elf`
+(the universal image) and the two resident images of §4.18 and §4.21
 (`LOADER_BASES` is empty; list bases there to get pre-linked ELFs back). It
-does not deploy: copy the ELF to the host's `loaders/` and prove the copy by
-md5 (§14.19). It also links `dcload-resident.elf` next to it (§4.18). **One set is kept there**; an A/B is a build into a directory of
+does not deploy: copy the ELFs to the host's `loaders/` and prove the copy by
+md5 (§14.19). **One set is kept there**; an A/B is a build into a directory of
 its own, passed with `--loader-dir` — a flycast set needs
 `DREAMCAST_IP=192.168.1.130 CDDA_TICKS_X8192=580480` (§3.5, §4.13). The host
-relocates the image to any base in either family:
+relocates an image to any base in either family:
 
 - The image only has `R_SH_DIR32` relocations. Each is classified by **the value
   of the symbol it names** (image, `_stack`, `.hiram`, `_maple_dma_buffer`) and
@@ -680,10 +681,9 @@ relocates the image to any base in either family:
 - **Every address C code uses must be a linker symbol, never a `-D` number** —
   a `-D` folds into a literal pool with no relocation. Only `exception.S` uses
   `DCLOAD_BASE` as a `-D`; C code uses `_dcload_base` (§14.11).
-- A LOW target's image must fit under `0x8c00f400`. **The HIGH set does not fit
-  at `0x8c004000`** (image and `.gdstage` ~1.9 KB past the VBR):
-  `LoaderSet::can_provide` relocates for real to answer a low base, and the host
-  leaves the low family when it cannot.
+- A LOW target's image must fit under `0x8c00f400`. **The HIGH images do not
+  fit at `0x8c004000`**: `LoaderSet::can_provide` relocates for real to answer
+  a low base, and the host leaves the low family when it cannot.
 
 `DCLOAD_BASE`/`DCLOAD_STACK`/`DCLOAD_HIRAM`/`DCLOAD_MAPLE` reach the linker
 script, the C sources and `exception.S` from the Makefile only.
@@ -694,26 +694,28 @@ script, the C sources and `exception.S` from the Makefile only.
 same two writes `rtl_bb_detect()` uses (`0xa1001414 ← 0`,
 `0xa1001418 ← 0x5a14a500`), after probing the four G2 slot windows for
 `"GAPS"`. dcload is then deaf: black screen, no packets, title running. Not
-reproducible under flycast.
+reproducible under flycast. This is the Katana library's expansion probe
+(the same function in Unreal Tournament and Phantasy Star Online).
 
 **The fix is on the host**: `gaps_probe_patches()` changes the `"GAPS"`
 comparison constant in the title (found by content), so the probe finds nothing
 and the title takes its no-expansion-device path. On by default;
-`--no-gaps-guard` disables it.
+`--no-gaps-guard` disables it. A network title served by the loader (§4.21)
+must see the adapter: the host keeps the probe and turns its calls to the two
+switch-off functions into `nop`s instead (`gaps_power_down_patches`).
 
 **A title can also carry its own BBA driver** (Unreal Tournament PAL, online
-play, 2026-10-11). Its probe never looks for `"GAPS"`: it writes the key
-`0x5a14a501` to the control register `0xa1001418` and takes a read-back of 1
-for an adapter; its init then clears the adapter's 32 KB of SRAM through
-`0xa1840000` (our RX ring) and resets the chip. The loader went deaf right
-after the title's first directory reads, at any base. The same guard
+play). Its probe never looks for `"GAPS"`: it writes the key `0x5a14a501` to
+the control register `0xa1001418` and takes a read-back of 1 for an adapter;
+its init then clears the adapter's 32 KB of SRAM through `0xa1840000` (our RX
+ring) and resets the chip, and the loader is deaf at any base. The same guard
 (`gaps_control_patches`) points every loaded literal naming that register, with
 a `0x5a14a50x` key literal near it, at the key word itself through P2: the
 driver writes its own image, reads back the key, and finds no adapter.
-**Both rules apply only to a title served a disc image, and never to a dcload**
-(`is_dcload_image`: the VERS string `"dcload-ip <version> using "`): pushed as
-a bare program, a new loader had its own GAPS bring-up patched out and sat at
-"idle..." with the NIC off.
+**These rules apply only to a title served a disc image, and never to a
+dcload** (`is_dcload_image`: the VERS string `"dcload-ip <version> using "`):
+pushed as a bare program, a new loader had its own GAPS bring-up patched out
+and sat at "idle..." with the NIC off.
 
 A DC-side recovery does not work: after a full cold re-init `rtl_bb_tx()` never
 returned. Lesson: when every instrument goes quiet at once and the title is
@@ -731,116 +733,98 @@ design description**; this section is the summary and the rules. History:
 
 - **Ring and lead.** Each channel loops over one ring in sound RAM, written by a
   single write head kept a fixed distance — the **lead** — ahead of the AICA.
-  The play position is not read from the AICA (its monitor select is shared with
-  the title's sound driver): **TMU1** (Pck/16), started in the key-on critical
-  section with `TCOR = end_tm` (one loop), stands in for it. `cdda_service()`
-  fetches only what the lead is short of, so fetches come one every 53 ms, at
-  the rate audio is consumed. (A double buffer filled on half boundaries, as
-  isoldr does from a drive, meant bursts of round trips the title is frozen for:
-  4-5 dropped frames a second in Snow Surfers.)
+  The play position is not read from the AICA (its monitor select is shared
+  with the title's sound driver): **TMU1** (Pck/16), started in the key-on
+  critical section with `TCOR = end_tm` (one loop), stands in for it.
+  `cdda_service()` fetches only what the lead is short of: one sub-fetch every
+  53 ms, at the rate audio is consumed. (A double buffer filled on half
+  boundaries, as isoldr does from a drive, meant bursts of round trips the
+  title is frozen for: 4-5 dropped frames a second.)
 - **Who calls it**: the top of the GD server loop, `gdGdcGetDrvStat` (before the
   lock), `cdda_service_between_chunks()` inside a long disc read, and the hook's
-  tick (`cdda_service_tick()`, §4.15). It declines while `g_gd_in_transfer` is
-  set (§4.5 invariant 2) or a title's G2 DMA writes sound RAM (ADST), and is not
-  re-entrant (`busy`).
-- **Format: 4-bit Yamaha ADPCM by default** (`DC24`): the host encodes and sends
-  the left block then the right. **Every key-on restarts the host's encoder**
-  (bit 31 of the request, from `cd.restart`), and every byte the AICA plays must
-  be the continuation of the one before. The host never emits a nibble the
-  AICA's decoders disagree on (§16). `CDDA_ADPCM=0` selects 16-bit PCM (`DC23`).
-- **Geometry** (ADPCM defaults):
-
-  | | |
-  | --- | --- |
-  | sub-fetch | 4 sectors = 2352 frames = 53 ms, one round trip, into `cdda_pcm` (`.hiram`) |
-  | ring | 26 sub-fetches = 61152 samples/channel = **1.39 s** (LEA is 16 bits), 60 KB of sound RAM for both |
-  | lead | 20 sub-fetches; less the trigger's lag, **893 ms** of audio ahead of the AICA |
-  | per service call | `CDDA_FETCHES_PER_SERVICE` plus one per sub-fetch the gap since the last call consumed, up to the lead |
-  | PCM | 3-sector sub-fetch, 1.04 s ring, 179 KB of sound RAM |
-
-- **Start** (`cdda_prime()`, used by PLAY, RELEASE, SEEK, the theft repair and
-  the overrun mute): key off and arm the fill; the services lay the lead and key
-  on only when it is whole (`cdda_prime_step()`), or sooner if the range ran out.
+  tick (`cdda_service_tick()`, §4.15). Windows CE never calls `GetDrvStat`:
+  `cdda_fill()` budgets the sub-fetches a long gap consumed.
+- **Format: 4-bit Yamaha ADPCM** (`DC24`, left block then right; `CDDA_ADPCM=0`
+  selects 16-bit PCM, `DC23`). Every byte the AICA plays must be the
+  continuation of the one before; the host never emits a nibble the AICA's
+  decoders disagree on (§16).
+- **Geometry** (ADPCM): sub-fetch 4 sectors = 2352 frames = 53 ms into
+  `cdda_pcm` (`.hiram`); ring 26 sub-fetches = 1.39 s (LEA is 16 bits), 60 KB
+  of sound RAM for both channels; lead 20 sub-fetches = **893 ms** ahead of the
+  AICA after the trigger's lag. PCM: 3-sector sub-fetch, 1.04 s ring, 179 KB.
+- **Start** (`cdda_prime()`: PLAY, RELEASE, SEEK, theft repair, overrun mute):
+  key off and arm the fill; the services lay the lead and key on only when it
+  is whole (`cdda_prime_step()`), or sooner if the range ran out.
 - **Silence, never garbage.** If the lead falls within one sub-fetch of nothing,
   the channels are keyed off and the stream restarts at what was last heard
-  (`cdda_current_lba()`): `g_cdda_mutes`. The lead is a difference modulo one
-  loop, so it cannot see itself gone past zero; a **service gap** over
-  `CDDA_GAP_LIMIT_TICKS` (838 ms) says so on the loader's clock instead. **Key-off silences
-  because register 20 carries RR = `0x1f`**; RR = 0 holds the level.
-- **Clock**: `end_tm` comes from `CDDA_TICKS_X8192` (isoldr's constant × 16;
-  `580480` on flycast, whose clocks are exact) and the host's trim: a ppm scale
-  in the `size` field of every audio ReturnValue, applied at the next TMU1
-  reload, ignored outside ±1.5 %.
-- **Phase**: the fill trigger reads the model `CDDA_LAG_SHIFT` late (an eighth
-  of a loop). Everything that measures uses `cdda_true_elapsed()` (lag added
-  back); only the fill trigger uses the lagged model.
-- **Fetch integrity.** Audio answers come without acknowledgement round trips,
-  so `cdda_fetch()`:
-  1. closes the LoadBinary window before each request, so completion is judged
-     on this answer's own window (`g_cdda_retv_nodata`: our LBA came back
-     without our data);
-  2. accepts only a ReturnValue whose `address` is the LBA it asked for —
-     `cmd_retval()` takes another one for nothing and lets the wait go on
-     (`g_retval_want`, `g_cdda_wrong_lba`);
-  3. keeps the door shut: `cmd_loadbin()` refuses any LoadBinary into the
-     staging buffer except the one awaited (`g_cdda_stale_lbin`);
-  4. suppresses the LoadBinary echo and ends the wait on the last PartBinary
-     (`bin_complete_escape`);
-  5. on failure, closes the window and drains for 10 ms.
-
-  Deadline **20 ms** per sub-fetch (normal ~3 ms). The host drops answers it
-  took longer than `CDDA_GIVE_UP` (15 ms) to produce and answers re-asks from a
-  cache of its last 48 requests.
-- **Channels**: TL (byte 41) is **attenuation** (0 = full). The send level
-  (DISDL) mirrors the game's CD input level (`0x2040`/`0x2044`), clamped to
-  `CDDA_DISDL`. Every `CDDA_CHECK_FETCHES` sub-fetches a watchdog re-reads the
-  channels: level drift is rewritten in place, a structural change confirmed
-  twice in a row is a theft (`g_cdda_ch_stolen`) and restarts the stream. An
-  all-zero control word is a failed read, not a theft.
-- **Sound RAM**: the rings sit under `CDDA_RING_TOP` = `0x150000`. The top of
-  RAM, isoldr's place, reaches into Snow Surfers' samples at our size.
-- **Idle listening**: a service with nothing to fill listens to the network for
-  at most 1 ms, at most every 20 ms, so `--diag` is answered while a title runs.
-- **TOC**: fetched once per session with `DC22`, area 2 (whole disc).
-- **Repeating ranges**: an ADPCM range's odd final sector is skipped (fetches go
-  in sector pairs) so the repeat still applies.
+  (`cdda_current_lba()`, `g_cdda_mutes`). The lead is a difference modulo one
+  loop and cannot see itself gone past zero; a **service gap** over
+  `CDDA_GAP_LIMIT_TICKS` (838 ms) on the loader's clock says so instead.
+  Key-off silences because register 20 carries RR = `0x1f` (RR = 0 holds the
+  level).
+- **Clock**: `end_tm` from `CDDA_TICKS_X8192` (isoldr's constant × 16; `580480`
+  on flycast, whose clocks are exact) and the host's trim: a ppm scale in the
+  `size` of every audio ReturnValue, applied at the next TMU1 reload, ignored
+  outside ±1.5 %. **Phase**: the fill trigger reads the model `CDDA_LAG_SHIFT`
+  late; everything that measures uses `cdda_true_elapsed()`.
+- **Fetch integrity** (`cdda_fetch()`, no acknowledgement round trips): close
+  the LoadBinary window before each request (`g_cdda_retv_nodata`); accept only
+  a ReturnValue naming the LBA asked for (`g_retval_want`, `g_cdda_wrong_lba`);
+  refuse any other LoadBinary into the staging buffer (`g_cdda_stale_lbin`);
+  suppress the echo and end the wait on the last PartBinary
+  (`bin_complete_escape`); on failure close the window and drain 10 ms.
+  Deadline **20 ms** per sub-fetch (normal ~3 ms); the host gives up after
+  `CDDA_GIVE_UP` (15 ms) and answers re-asks from a cache of 48 requests.
+- **Channels**: TL (byte 41) is **attenuation**. The send level (DISDL) mirrors
+  the game's CD input level (`0x2040`/`0x2044`), clamped to `CDDA_DISDL`. Every
+  `CDDA_CHECK_FETCHES` sub-fetches a watchdog re-reads the channels: level
+  drift is rewritten, a structural change seen twice is a theft
+  (`g_cdda_ch_stolen`) and restarts the stream; an all-zero control word is a
+  failed read.
+- **Sound RAM**: rings under `CDDA_RING_TOP` = `0x150000` (isoldr's top of RAM
+  reaches Snow Surfers' samples at our size). **TOC**: once per session, `DC22`
+  area 2. **Repeats**: an ADPCM range's odd final sector is skipped (fetches go
+  in sector pairs) so the repeat still applies. **Idle listening**: a service
+  with nothing to fill listens ≤ 1 ms, at most every 20 ms.
 
 #### Rules
 
 1. Never service while `g_gd_in_transfer` is set or a title's G2 DMA into sound
-   RAM is in flight; from an interrupt, only through `cdda_service_tick()`:
-   GD lock free, one sub-fetch, no listening.
-2. Every key-on restarts the ADPCM encoder; any re-key goes through
-   `cdda_prime()` (re-keying onto the existing ring decodes it from a reset
-   decoder: full-scale noise).
+   RAM is in flight (ADST); the service is not re-entrant (`busy`); from an
+   interrupt, only through `cdda_service_tick()`: GD lock free, one sub-fetch,
+   no listening.
+2. Every key-on restarts the host's ADPCM encoder (bit 31 of the request, from
+   `cd.restart`); any re-key goes through `cdda_prime()` (re-keying onto the
+   existing ring decodes it from a reset decoder: full-scale noise).
 3. The host's `CDDA_GIVE_UP` must stay below `CDDA_FETCH_DEADLINE_TICKS`.
 4. Key on only over a whole lead; key off before the lead runs out.
-5. A fetch is complete only on its own window: close it before the request.
+5. A fetch is complete only on its own window: close it before the request (a
+   window left from the previous fetch, same address and size, is already
+   complete — this pushed a stale sub-fetch for weeks under clean counters).
 6. Measure with the true model; trigger with the lagged one. Anything that could
    outlast one loop is judged on the loader's clock (`clk_since()`).
 7. All AICA access by the CPU inside `g2_lock()`, with a FIFO wait at most every
-   eight 32-bit stores. `g2_lock()` first waits for the ring's own DMA
+   eight 32-bit stores; `g2_lock()` first waits for the ring's own DMA
    (`g2dma_quiesce()`, §4.16). In ADPCM the ring is written by DMA: unaligned
-   edges (≤ 28 bytes a side) by the CPU, the 32-byte-aligned body on G2 channels
-   2 (left) and 3 (right), left running when `cdda_push()` returns. The staging
-   buffer is `STAGE_BYTES` (`FETCH_BYTES` + 64), 32-aligned, each block placed
-   congruent to its destination modulo 32. `CDDA_ADPCM=0` keeps CPU writes.
+   edges (≤ 28 bytes a side) by the CPU, the 32-byte-aligned body on G2
+   channels 2 (left) and 3 (right), left running when `cdda_push()` returns;
+   the staging buffer is `STAGE_BYTES` (`FETCH_BYTES` + 64), each block placed
+   congruent to its destination modulo 32.
 8. AICA reads from the SH4 sometimes return `0x00000000`: an implausible zero is
    a failed read.
 9. No variable divisors (libgcc's divider costs ~1 KB, §14.15).
 10. **Changing the geometry invalidates things outside `cdda.c`**: the host's
-    trim thresholds and `CddaClock` tests assume a stream paced one sub-fetch at
-    a time; the encoder cache (`RECENT` = 48) must cover the whole ring (26).
+    trim thresholds and `CddaClock` tests assume one sub-fetch every ~53 ms; the
+    encoder cache (`RECENT` = 48) must cover the whole ring (26).
 
-#### Build flags
+#### Build flags and constants
 
 | Flag | Default | What it does |
 | --- | --- | --- |
 | `WITH_CDDA` | `1` | the engine |
 | `CDDA_ADPCM` | `1` | 0 = 16-bit PCM |
-| `CDDA_RING_FETCHES` | `26` | ring size, as large as LEA allows |
-| `CDDA_LEAD_FETCHES` | `20` | audio kept ahead of the AICA |
-| `CDDA_FETCHES_PER_SERVICE` | `2` | sub-fetches per service call, plus the catch-up above |
+| `CDDA_RING_FETCHES` / `CDDA_LEAD_FETCHES` | `26` / `20` | ring size (as large as LEA allows) / audio kept ahead |
+| `CDDA_FETCHES_PER_SERVICE` | `2` | per service call, plus one per sub-fetch the gap consumed |
 | `CDDA_LAG_SHIFT` | `3` | how late the fill trigger reads the model, as a shift of one loop |
 | `CDDA_TICKS_X8192` | `578960` | Pck/16 ticks per 8192 samples; `580480` for flycast |
 | `CDDA_SERVICE_DRAIN_ITERS` | `256` | idle listening window; 0 removes it |
@@ -849,51 +833,35 @@ design description**; this section is the summary and the rules. History:
 | `GD_CDDA_BETWEEN_CHUNKS` | `1` | feed CD-DA during disc reads (`cdfs_syscalls.c`) |
 
 The Makefile leaves most of them empty so `cdda.c`'s default applies; each is
-added to `CFLAGS` inside its own `ifneq` — keep it that way.
+added to `CFLAGS` inside its own `ifneq` — keep it that way. Constants in
+`cdda.c`: fetch deadline 20 ms, drain 10 ms, TOC 500 ms, `CDDA_MUTE_GUARD` one
+sub-fetch, `CDDA_GAP_LIMIT_TICKS` 838 ms, `CDDA_CH_BAD_LIMIT` 2,
+`CDDA_CHECK_FETCHES` 13.
 
-Constants in `cdda.c`: `CDDA_FETCH_DEADLINE_TICKS` 20 ms,
-`CDDA_DRAIN_DEADLINE_TICKS` 10 ms, `CDDA_TOC_DEADLINE_TICKS` 500 ms,
-`CDDA_MUTE_GUARD` one sub-fetch, `CDDA_GAP_LIMIT_TICKS` 838 ms,
-`CDDA_CH_BAD_LIMIT` 2, `CDDA_CHECK_FETCHES` 13.
+#### Counters (`--diag` or `scripts/dc-counters.py`)
 
-#### Counters (read with `--diag` or `scripts/dc-counters.py`)
+Health: `g_cdda_plays`, `g_cdda_fetches` (~19/s), `g_cdda_fetch_fails`,
+`g_cdda_mutes`, `g_cdda_room_min` (least lead seen, TMU1 ticks, 3125 ≈ 1 ms;
+~893 ms is healthy), `g_cdda_svc_gap_max` (longest time without a service,
+Pck/4 ticks). Right answers: `g_cdda_wrong_lba`, `g_cdda_retv_nodata`,
+`g_cdda_stale_lbin`. Channels: `g_cdda_ch_stolen`. Clock: `g_cdda_end_tm`,
+`g_cdda_scale_ppm` (1000000 = no trim yet). Misc: `g_cdda_toc_fails`,
+`g_cdda_last_lba`.
 
-| Question | Counters |
-| --- | --- |
-| Is it healthy? | `g_cdda_plays`, `g_cdda_fetches` (sub-fetches, ~19/s), `g_cdda_fetch_fails`, `g_cdda_mutes`, `g_cdda_room_min` (least lead seen, TMU1 ticks, 3125 ≈ 1 ms; ~893 ms is healthy), `g_cdda_svc_gap_max` (longest time without a service, Pck/4 ticks) |
-| Right answers? | `g_cdda_wrong_lba`, `g_cdda_retv_nodata`, `g_cdda_stale_lbin` |
-| Channels | `g_cdda_ch_stolen` |
-| Clock | `g_cdda_end_tm`, `g_cdda_scale_ppm` (1000000 = no trim yet) |
-| Misc | `g_cdda_toc_fails`, `g_cdda_last_lba` |
+#### Limits and lessons
 
-TMU1 is Pck/16 (3125 ticks/ms) and the loader's clock Pck/4 (12500, §4.5):
-`--diag` prints both in milliseconds.
-
-#### Open questions and limits
-
-- No phase servo: long sessions without a PLAY/seek rely on the host's trim.
-- A title that stops calling the GD driver and has no hook stops the music
-  (isoldr too).
-- A play range shorter than the lead keys on early and is untested on hardware.
-
-#### Lessons from this engine
-
-- **When every counter is clean and a glitch is heard, record the output** and
-  align it with the host's stream decoded offline (flycast's `DecodeADPCM`):
-  that localises an ADPCM fault to the sub-fetch. Every counter was clean for
-  weeks over a fetch that pushed the previous sub-fetch again.
-- A completion test must be about this transfer: a window left over from the
-  previous one, same address and size, is already complete.
-- A model that wraps cannot see a whole period of lateness: judge it on a clock
-  it is not derived from (the loader's clock).
-- A counter panel cannot report a schedule: dropped frames came from bursty
-  fetching while every counter was healthy.
+- No phase servo: long sessions without a PLAY/seek rely on the host's trim. A
+  title that stops calling the GD driver and has no hook stops the music
+  (isoldr too). A range shorter than the lead keys on early (untested).
+- **Clean counters and an audible glitch: record the output** and align it with
+  the host's stream decoded offline (flycast's `DecodeADPCM`); it localises an
+  ADPCM fault to the sub-fetch. A counter panel cannot report a schedule, and a
+  model that wraps cannot see a whole period of lateness.
 - In a differential format a hole is carried forward by the decoder: muting
   before it and restarting clean is the only bounded outcome.
-- Read every field a register write zeroes as a decision (RR, §14.21).
 - A model shared by two machines must agree with every implementation of the
-  other end (the encoder had to match flycast's and Sega's clamping decoder).
-- Nothing one-off and lazy may happen inside a syscall the console is timing.
+  other end (flycast's and Sega's clamping decoder). Nothing one-off and lazy
+  may happen inside a syscall the console is timing.
 
 ### 4.14 The drive is stopped at boot
 
@@ -918,26 +886,24 @@ reversible: a KOS program calling `cdrom_init()` spins the drive back up.
 
 ### 4.15 Windows CE titles, and the interrupt hook
 
-Sega Rally 2 PAL boots, plays and saves under the loader; the history is
-`docs/wince-investigation.md`. **Booting a CE title boots an operating system**:
-`0WINCEOS.BIN` starts it and CE then loads ~250 files off the disc through its
-own GD driver.
+Sega Rally 2 PAL boots, plays and saves under the loader; history in
+`docs/wince-investigation.md`. **Booting a CE title boots an operating
+system**: `0WINCEOS.BIN` starts it and CE loads ~250 files through its own GD
+driver.
 
-**Boot** (host, `src/wince.rs`; automatic, `--no-wince` to disable): the first
-2048-byte sector of `0WINCEOS.BIN` is dropped and the rest loaded at
-`0x8c010000`, as isoldr does; the title is entered through the disc's own
-second bootstrap (`--boot-ipbin`).
+**Boot** (host, `src/wince.rs`; `--no-wince` disables): the first sector of
+`0WINCEOS.BIN` is dropped and the rest loaded at `0x8c010000`, as isoldr does;
+the title is entered through the disc's own second bootstrap (`--boot-ipbin`).
 
 **Memory.** CE's kernel takes `0x8c143000..0x8cef0000`, its driver globals
 `0x8cef0000..0x8d000000`. The host places the loader at the bottom of the pool
-(`ulRAMFree` rounded up to 64 KB: `0x8c150000` for Sega Rally 2 PAL, HIGH) and
-raises `ulRAMFree` above it. CE hands pages out from the top, so the top must
-stay as an unmodified CE has it: placed at the top (`0x8cee0000`, `ulRAMEnd`
-lowered, until 2026-10-09; the host's `--wince-loader-top`), the loader moved
-everything CE loads down by as much, and Sega Rally 2's achievement set, which
-looks for `RALLY2.EXE` on seven fixed pages, found it 80 KB lower. **Nothing in the loader may write outside its own span
-while a title runs.** Inside the span, three regions are dead while a title runs
-and are reused:
+(`ulRAMFree` rounded up to 64 KB, HIGH) and raises `ulRAMFree` above it. CE
+hands pages out from the top, so the top must stay as an unmodified CE has it:
+a loader there (`--wince-loader-top`) moves everything CE loads, and Sega Rally
+2's achievement set, which looks for `RALLY2.EXE` on fixed pages, misses it.
+**Nothing in the loader may write outside its own span while a title runs**
+(and the RA block lent by the host, §4.20). Three regions of the span are dead
+under a title and reused:
 
 | Region | Before `EXEC` | Under a title |
 | --- | --- | --- |
@@ -945,17 +911,13 @@ and are reused:
 | Maple DMA page (4 KB) | `MAPL` commands | the hook's stack (first KB) and the network exchange's stack (top) |
 | `gd_stage` (`.hiram`, 3 sectors) | -- | the TOC; streams under a Katana title |
 
-**The GD driver under CE.**
-
-- CE calls the BIOS driver body `0x8c0010f0` directly (§4.5, third door).
-- **CE runs with the MMU on.** DMAREAD's destination is physical; every other
-  buffer is virtual (`gd_is_virtual()`), staged and copied (§4.5).
-- **Streams** are PIO-chained; the host turns the branch that picks DMA for an
-  aligned read into a branch to PIO.
-- **Status words matter.** PROCESSING with status[3] = `CMD_WAIT_IRQ` makes CE sleep
-  on the GD interrupt; the retry path clears it under the MMU so CE polls.
-- **CE never calls `GetDrvStat`**: CD-DA is fed from ExecServer (hundreds of ms
-  apart) and from the hook's tick; `cdda_fill()` budgets the gap's sub-fetches.
+**The GD driver under CE.** CE calls the driver body `0x8c0010f0` directly
+(§4.5, third door). **CE runs with the MMU on**: DMAREAD's destination is
+physical, every other buffer virtual (`gd_is_virtual()`), staged and copied.
+Streams are PIO-chained (the host turns the branch that picks DMA into one to
+PIO). PROCESSING with status[3] = `CMD_WAIT_IRQ` makes CE sleep on the GD
+interrupt; the retry path clears it under the MMU so CE polls. CE never calls
+`GetDrvStat` (CD-DA comes from ExecServer and the tick).
 
 **A preemptive OS calls us.** CE's timer interrupt can run other threads for a
 whole quantum in the middle of a network exchange, and CE calls the driver on a
@@ -963,10 +925,10 @@ virtual thread stack where a TLB miss enters CE's kernel with IMASK 0. So every
 network exchange of the GD path (`ReadSectors`, `GetTOC`, `cdda_fetch`) goes
 through `gd_exchange()`: under the MMU (and under KOS, `g_gd_kos`) it masks
 interrupts (`bb_irq_hold()`) and then runs on the Maple page
-(`gd_on_loader_stack`, `cdfs_redir.s`), in that order. `gd_on_loader_stack()`
-also clears SR.FD and saves the FP registers (`fpu_push`/`fpu_pop`): CE runs
-threads with FD set (lazy FPU), and our first FPU instruction would otherwise
-enter CE's kernel on our stack. Every exchange ends with reception off.
+(`gd_on_loader_stack`, `cdfs_redir.s`), in that order. It also clears SR.FD and
+saves the FP registers (`fpu_push`/`fpu_pop`): CE runs threads with FD set
+(lazy FPU), and our first FPU instruction would enter CE's kernel on our stack.
+Every exchange ends with reception off (except under a network title, §4.21).
 
 **The interrupt hook** (`irq.c`, `irq_hook.S`, `WITH_IRQ_HOOK`). Every SH4
 interrupt enters at `VBR+0x600`; the loader patches the title's live table so
@@ -974,89 +936,70 @@ interrupt enters at `VBR+0x600`; the loader patches the title's live table so
 
 - **Two entries are recognised**, re-checked on GD syscalls
   (`irq_hook_check()`; `g_irq_rehooks` when a table lost the hook):
-  - **Windows CE's exact entry** (`+0x5e8..+0x600` zero and `567a d022 6163` at
-    `+0x600`): a 30-byte template goes over it (`+0x5e8` trampoline and its two
-    literals, `+0x600` `nop; bra; nop`), and `irq_entry` resumes at `+0x606`
-    with CE's three replaced instructions rebuilt.
-  - **The Katana library's entry** (six nops, then `mov.l r0,@-r15 ;
-    mov.l @(disp,pc),r0 ; jmp @r0 ; mov.l r1,@-r15`, copied by the title's crt0
-    to `VBR+0x100/+0x400/+0x600`): `g_irq_nop_entry` 1, nothing to rebuild.
-  - Anything else is refused and counted once per VBR (`g_irq_refused`,
-    `g_irq_refused_vbr`); the GD path then works without the hook.
-  - **The 24 bytes under `+0x600` may still hold our own trampoline**: a title
-    that copies its entry again writes from `+0x600` only. Jet Set Radio's
-    `1ST_READ.BIN` (a bootstrap) and the `JET_PAL.BIN` it boots each copy the
-    same Katana entry into one table at `0x8c00f400`; until 2026-10-10 the
-    leftover trampoline failed the "free" test and the hook was refused for
-    the rest of the session (2 interrupts through it, deaf between reads,
-    the host's keepalive ended the session in the SEGA logo). A re-copied
-    table is re-hooked and counted in `g_irq_rehooks`.
+  **Windows CE's exact entry** (`+0x5e8..+0x600` zero, `567a d022 6163` at
+  `+0x600`: a 30-byte template goes over it, `irq_entry` resumes at `+0x606`
+  with CE's three replaced instructions rebuilt) and **the Katana library's**
+  (six nops, then `mov.l r0,@-r15 ; mov.l @(disp,pc),r0 ; jmp @r0 ;
+  mov.l r1,@-r15`, copied by the crt0 to `VBR+0x100/+0x400/+0x600`;
+  `g_irq_nop_entry` 1). Anything else is refused once per VBR
+  (`g_irq_refused`, `g_irq_refused_vbr`) and the GD path works without the
+  hook. **The 24 bytes under `+0x600` may still hold our own trampoline** when a
+  title copies its entry again (Jet Set Radio's bootstrap and its program):
+  such a table is re-hooked.
 - **Rules the entry keeps, each a reset if broken** (SR.BL is 1 throughout):
   r15 is replaced before any push (a TLB miss under BL resets); FD is cleared
   and FPSCR, FPUL and both FP banks saved; the pair stores need r15 8-aligned
   (22 longs pushed before them: keep it even); C reached from `irq_tick()`
-  touches P1/P2 only and never waits on the title.
-- **Two stacks, never one**: the hook's (the Maple page's first KB) and the
-  exchange's (its top). Sharing one corrupted an exchange CE had preempted.
+  touches P1/P2 only and never waits on the title. **Two stacks, never one**:
+  the hook's and the exchange's (sharing one corrupted an exchange CE had
+  preempted).
 - **What the tick does**, only while the GD lock is free (every network use of
   the GD path holds it, so a free lock means nobody is half way through
-  `pkt_buf`, `bin_info` or the ring):
-  - feeds CD-DA at most every 5 ms (`IRQ_CDDA_PERIOD`) — one sub-fetch, no
-    listening window, on the exchange's stack;
-  - moves asynchronous reads (§4.5): drains the ring in passes of
-    `GA_POLL_ITERS`, judges each chunk (window whole + its ReturnValue = done,
-    250 ms = failed), copies it into the title's buffer and posts the next,
-    feeding CD-DA between chunks; looks at a read at most every 0.5 ms
-    (`IRQ_READ_PERIOD`) unless the RX interrupt or a finished RX DMA calls it;
-  - with `IRQ_IDLE_LISTEN`, listens to the network when nothing else owns it.
-- **Virtual destinations under CE** cannot be written from the tick (it cannot
-  take a TLB miss). On each wake the GD thread translates the next
-  `GA_XLAT_PAGES` 4 KB pages **by CE's own page tables** (`ga_walk()`: TTB,
-  section, MemBlock, entry — what CE's TLB refill and flycast's
-  `USE_WINCE_HACK` read), checks each with a byte inverted through the virtual
-  address and read back uncached at the physical one, purges the lines, and
-  stores the result in `ga_xpa[]`; the tick writes through P1. A chunk beyond
-  the translated pages waits for the thread; when nothing translates the read
-  goes back to the synchronous loop (`g_ga_sync`). A UTLB probe cannot do this
-  under flycast (`FAST_MMU`).
-- **The BBA's RX interrupt** (Katana titles): `irq_rx_arm()` routes Holly EXT
-  bit 3 to a level while a chunk is on the wire — the highest of IML6/IML4/IML2
-  whose masks the title left at zero, else IML6, **shared**. The tick
-  acknowledges the chip (`rtl_irq_ack()`), and `irq_entry` swallows the
-  interrupt (`g_irq_swallow`) unless something of the title's is pending on that
-  level. **An entry with something of the title's pending on that level always
-  reaches the title** — swallowing a title's own interrupt froze Crazy Taxi.
-  **Everything else on our level is swallowed, including a stray entry** whose
-  cause was gone when the tick looked (our bit cleared between the line's rise
-  and the CPU taking it: `g_irq_rx_stray`). Passed on, a stray reached a level
-  the title has no handler for, and Shenmue II's kernel sends any unknown event
-  to its debug monitor (`jsr 0xac004000`), which waits forever for a host:
-  black screen before the menu (2026-10-05, event `0x3a0` in its saved
-  context). `g_irq_rx`, `g_irq_rx_evt`, `g_irq_iml[9]` (the title's masks).
+  `pkt_buf`, `bin_info` or the ring): feeds CD-DA at most every 5 ms
+  (`IRQ_CDDA_PERIOD`, one sub-fetch); moves asynchronous reads (§4.5: drains the
+  ring in passes of `GA_POLL_ITERS`, judges each chunk — window whole + its
+  ReturnValue, 250 ms = failed —, copies it and posts the next, at most every
+  0.5 ms (`IRQ_READ_PERIOD`) unless the RX interrupt or a finished RX DMA calls
+  it); with `IRQ_IDLE_LISTEN`, listens when nothing else owns the network.
+- **Virtual destinations under CE** cannot be written from the tick (no TLB
+  miss allowed). On each wake the GD thread translates the next `GA_XLAT_PAGES`
+  4 KB pages **by CE's own page tables** (`ga_walk()`: TTB, section, MemBlock,
+  entry — what flycast's `USE_WINCE_HACK` reads), checks each with a byte
+  inverted through the virtual address and read back uncached at the physical
+  one, purges the lines, and stores the result in `ga_xpa[]`; the tick writes
+  through P1. A chunk beyond the translated pages waits for the thread; when
+  nothing translates, the read goes back to the synchronous loop (`g_ga_sync`).
+  A UTLB probe cannot do this under flycast (`FAST_MMU`).
+- **The BBA's RX interrupt** (Katana titles; under CE the tick runs on CE's
+  timer): `irq_rx_arm()` routes Holly EXT bit 3 while a chunk is on the wire to
+  the highest of IML6/IML4/IML2 whose masks the title left at zero, else IML6,
+  **shared**. The tick acknowledges the chip (`rtl_irq_ack()`); `irq_entry`
+  swallows the interrupt (`g_irq_swallow`) unless something of the title's is
+  pending on that level — **an entry with the title's pending always reaches
+  the title** (swallowing it froze Crazy Taxi) — **and swallows a stray entry**
+  whose cause was gone (`g_irq_rx_stray`): passed on, it reached a level the
+  title has no handler for, and Shenmue II's kernel sends unknown events to its
+  debug monitor, which waits forever for a host. `g_irq_rx`, `g_irq_rx_evt`,
+  `g_irq_iml[9]` (the title's masks).
 - Counters: `g_irq_hooked`, `g_irq_vbr`, `g_irq_entries`, `g_irq_ticks`,
-  `g_irq_tick_max`, `g_irq_tick_sum` (the CPU the hook takes), `g_irq_evt_last`.
-- **Where the title is**: `g_irq_pc[32]`, SPC and SSR of the last 16 interrupts
-  (the latest at `[(g_irq_pc_at - 1) & 15]`), read with `dc-counters.py --raw`.
-  A title that stops while its interrupts go on: CE's scheduler with no thread
-  ready (Sega Rally 2, 2026-10-09: `0x8c0123b4`, `0x8c02db34` in US v1.003), or a
-  loop of the title's.
+  `g_irq_tick_max`, `g_irq_tick_sum`, `g_irq_evt_last`. **Where the title is**:
+  `g_irq_pc[32]`, SPC and SSR of the last 16 interrupts (latest at
+  `[(g_irq_pc_at - 1) & 15]`; `dc-counters.py --raw` or `--diag`). A title that
+  stops while its interrupts go on: CE's scheduler with no thread ready (Sega
+  Rally 2 US: `0x8c0123b4`, `0x8c02db34`), or a loop of the title's.
 
 **Status**: CE (hook, CD-DA from the tick, asynchronous reads) measured on the
 console and under flycast; Katana titles with the hook and RX interrupt run on
-the console (Crazy Taxi 2, Sonic Adventure 2, Shenmue II). Sonic Adventure (1)
-has not been re-measured with asynchronous Katana reads, which yield between
-chunks (see `GD_YIELD_BETWEEN_CHUNKS`, §4.5).
+the console (Crazy Taxi 2, Sonic Adventure 2, Shenmue II, Jet Set Radio). Sonic
+Adventure (1) has not been re-measured with asynchronous Katana reads.
 
-**Debugging CE.**
-
-- **flycast is built with `FAST_MMU`**: a UTLB probe misses pages a real SH4
-  would have reloaded. Translate by CE's page tables instead.
-- Under flycast, the GDB stub stops the emulation on every MMU exception while a
-  client is attached, and every CE API call is one. One attach halts flycast for
-  good: read everything in that attach (`scripts/dc-integrity.py --elf
-  <relocated ELF>`, a dump of the loader span), then restart flycast.
-- In a dump, `pc` is SPC, and an exception taken in a delay slot sets SPC to the
-  **branch** before it: a `pc` on a `bra` means the fault is at `pc+2`.
+**Debugging CE under flycast**: `FAST_MMU` makes a UTLB probe miss pages a real
+SH4 would have reloaded; the GDB stub stops the emulation on every MMU
+exception while attached (every CE API call is one), so one attach halts
+flycast for good: read everything in that attach (`scripts/dc-integrity.py
+--elf <relocated ELF>`, a dump of the loader span), then restart it. In a dump,
+an exception in a delay slot sets SPC to the **branch** before it: a `pc` on a
+`bra` means the fault is at `pc+2`.
 
 ### 4.16 G2 DMA: the CPU stays free while the bus moves the bytes
 
@@ -1120,76 +1063,59 @@ what is gained is CPU, not transfer time.
 ### 4.17 Changing the disc in game
 
 The host (`dcload-ip-rs swap-disc <image>`, its `AGENTS.md` §1) serves another
-image to the running title; the loader plays a real drive's lid. Modelled on
-isoldr's `HAVE_MULTI_DISC`.
+image to the running title; the loader plays a real drive's lid, on isoldr's
+`HAVE_MULTI_DISC` model. Shenmue II PAL swaps from disc 1 to disc 4 on the
+console. Windows CE never calls `GetDrvStat`: no swap under CE.
 
-- **`DISC`** (host → DC, answered): `address` = generation (host-chosen, 1..),
-  reply `size` 0 accepted (a repeated generation is accepted again), 1 busy,
-  `0xffffffff` refused. `gd_disc_request()` (`cdfs_syscalls.c`) answers busy
-  while a GD command is `PROCESSING`/`STREAMING` or `g_gd_in_transfer` is set,
-  so **every read served before the answer is the old disc's**; the host
-  installs the new image on the answer. `cmd_disc()` only notes the generation
-  (`g_disc_pending`): it can run inside a read's wait, where nothing else may
-  transmit (§4.5 invariant 1).
-- **The lid** is played by `gdGdcGetDrvStat`, counted in its calls like isoldr's.
-  At the top of the syscall, before the lock, and **only between commands**
-  (not in a transfer, not inside a CD-DA service, command not
-  `PROCESSING`/`STREAMING`: a title's interrupt handler calls it too, §4.5
-  invariant 2) the pending swap calls `cdda_disc_changed()` (stop the audio,
-  forget the cached TOC) and starts `disc_change` (return 1 below 10 calls).
-  Call 2: `drv_stat = OPEN` (6), media 0, for `DISC_SWAP_CLOSE_CALLS` (240, 4 s
-  at 60 calls a second: Shenmue II's "swap disc" screen did not see 30) calls.
-  Call `DISC_SWAP_CLOSE_CALLS` + 1: PAUSED, `CD_GDROM`, return 2 -- that call only; after it the status
-  is the title's again (PLAYING reported as usual). The count stops at 1023.
-- **Commands fail while the lid is open** (`disc_change` 2..`DISC_SWAP_CLOSE_CALLS`):
-  the server completes every command with `err = 2` (NOT READY) and
-  `ata_status = 6`, so `GetCmdStat` says FAILED with `status[0] = 2`,
-  `status[1] = 0x3a` (ASC "medium not present"). gdFs's completion code
-  (disassembled: `0x8c1ef042`) turns NOT READY (-29) into -23 (TRAYOPEND) only
-  with `status[1] == 0x3a` and a `GetDrvStat` of OPEN or BUSY, and key 6 into
-  -33. Shenmue II's swap screen (`0x8c0801a0`) waits for -23 from
-  `gdFsGetErrStat` of the system handle, which only gets an answer when its
-  `gdFsReqDrvStat` command completes. Reporting OPEN in `GetDrvStat` alone did
-  not move the game (2026-10-04, flycast and console).
-- **The recognition window.** After the open window (`DISC_SWAP_CLOSE_CALLS`)
-  commands fail NOT READY with `status[1] = 0x104` for `DISC_SWAP_CHECK_CALLS`
-  (120) calls, drive status BUSY: gdFs maps that to -37 (`CHECKBUSY`), which
-  moves Shenmue II's swap screen from "wait for the tray" (`0x8c0801a0`) to
-  "wait for the media change" (`0x8c080240`); UNIT ATTENTION then moves it on.
-- **BootROM service 2, `syBtCheckDisc`.** The title then calls vector
-  `0x8c0000e0` (r4 = 2), which the real BIOS answers from the DRIVE -- the CD
-  dcload booted from -- so the title compared the wrong disc ("Invalid disk").
-  `cdfs_redir_enable()` takes that vector too (`sysvec_redir`, saved and
+- **`DISC`** (host → DC, answered): `address` = generation (1..), reply `size`
+  0 accepted (a repeated generation too), 1 busy, `0xffffffff` refused.
+  `gd_disc_request()` answers busy while a GD command is
+  `PROCESSING`/`STREAMING` or `g_gd_in_transfer` is set, so **every read served
+  before the answer is the old disc's**; the host installs the new image on the
+  answer. `cmd_disc()` only notes the generation (`g_disc_pending`): it can run
+  inside a read's wait (§4.5 invariant 1).
+- **The lid** is played by `gdGdcGetDrvStat`, counted in its calls, at the top
+  of the syscall and **only between commands** (not in a transfer or a CD-DA
+  service, no command `PROCESSING`/`STREAMING`: a title's interrupt handler
+  calls it too). The pending swap calls `cdda_disc_changed()` (stop the audio,
+  forget the TOC) and starts `disc_change`. Then, in calls:
+  1. **open** for `DISC_SWAP_CLOSE_CALLS` (240, 4 s; Shenmue II did not see
+     30): `drv_stat = OPEN`, media 0, and every command completes with
+     `err = 2` (NOT READY), `ata_status = 6`, `status[1] = 0x3a` ("medium not
+     present"). gdFs turns that into -23 (TRAYOPEND) only with an OPEN or BUSY
+     `GetDrvStat`, and Shenmue II's swap screen waits for -23 from its
+     `gdFsReqDrvStat` command: reporting OPEN in `GetDrvStat` alone does not
+     move the game. One call then answers PAUSED, `CD_GDROM`.
+  2. **recognition** for `DISC_SWAP_CHECK_CALLS` (120): NOT READY with
+     `status[1] = 0x104`, drive BUSY → gdFs -37 (`CHECKBUSY`): "wait for the
+     media change".
+  3. **UNIT ATTENTION, once** at `DISC_SWAP_ATTN_CALLS` + 1: `need_reinit`; the
+     next command other than `CMD_INIT` completes with `err = 6`, and it (or
+     `CMD_INIT`) clears it. isoldr keeps failing until a reset, which hangs a
+     title that only retries.
+  The count stops at 1023.
+- **BootROM service 2, `syBtCheckDisc`** (vector `0x8c0000e0`, r4 = 2): the
+  real BIOS answers it from the drive — the CD dcload booted from ("Invalid
+  disk"). `cdfs_redir_enable()` takes the vector (`sysvec_redir`, saved and
   restored with the GD pair): `gd_bios_check_disc()` reads 7 sectors of the
   served image's IP.BIN to `0x8c008100`, where `syBtGetCurrentSystemID` reads
-  the disc number and product from (`0x8c008000` holds the boot disc's header,
-  put there by the host), and returns 0; -1 while the lid or the check window
+  the disc number and product (`0x8c008000` holds the boot disc's header, put
+  there by the host), and returns 0; -1 while the lid or the check window
   runs. The LBA on the wire is `GD_BOOT_SECTOR_LBA` (`0x3ffffffe`): only the
-  host knows `boot_sector()`. Every other function (1 = BIOS menu) goes to the
-  saved BIOS handler untouched. isoldr does the same (`syscalls.s`).
-- **UNIT ATTENTION, once.** At call `DISC_SWAP_ATTN_CALLS` + 1 (close + 30 + 1)
-  `need_reinit` is set; the next command other than `CMD_INIT` is completed with
-  `err = 6` (`GetCmdStat` says FAILED, `status[0] = 6`) and clears it. `CMD_INIT`
-  clears it too. isoldr keeps failing everything until a reset, which hangs a
-  title that only retries.
-- **Limits.** Windows CE never calls `GetDrvStat`, so no swap under CE. A title
-  that answers an open lid with `syBtExit()` goes back to the BIOS menu
-  (§14.14) and the session ends. Not measured on hardware or under flycast.
-- Counters: `g_disc_swaps`, `g_disc_swap_busy`.
-- Cost: HIGH `_end` = base+`0x9d44`, `.gdstage` ended 1696 B under `_stack`,
-  after `GD_STAGE_BIG_SECTORS` went from 4 to 3 (default in `cdfs_syscalls.c`;
-  only Windows CE's staged reads use it).
+  host knows `boot_sector()`. Other functions go to the BIOS untouched.
+- A title that answers an open lid with `syBtExit()` goes back to the BIOS menu
+  (§14.14) and the session ends. Counters: `g_disc_swaps`, `g_disc_swap_busy`.
 
 ### 4.18 The resident image, and trimming a build
 
-`make loaders` builds, next to the universal `dcload-relocatable.elf`, one more
-relocatable image, `dcload-resident.elf` (`LOADER_RESIDENT_FLAGS`,
-`DCLOAD_RESIDENT=1`): the same loader without its screen and DHCP. **It is what
-a title runs on**; the universal image, which shows a screen and can take a
-DHCP lease, does every hop. Both serve every kind of title, both adapters and
-CD-DA. The resident image is ~5.8 KB smaller (`_end` base+`0x8940`, `.gdstage`
-ending 6848 B under `_stack`, against 1056 B for the universal one, 2026-10-05):
-that room is where features that run under a title go.
+`make loaders` builds, next to the universal `dcload-relocatable.elf`, the
+relocatable `dcload-resident.elf` (`LOADER_RESIDENT_FLAGS`:
+`DCLOAD_RESIDENT=1 WITH_RCHEEVOS=1`): the same loader without its screen and
+DHCP, with the RetroAchievements sampler. **It is what a title runs on**; the
+universal image, which shows a screen and can take a DHCP lease, does every
+hop. Both serve every kind of title, both adapters and CD-DA. The room the
+screen and DHCP leave is where features that run under a title go. A network
+title runs on a third image (§4.21).
 
 **Resident** (`DCLOAD_RESIDENT=1`): no `video.o`, every display call a stub
 (`dcload.c` `#else` block; crt0's jump table for `exception.S` still resolves),
@@ -1199,11 +1125,10 @@ image's `.data` after relocation and before upload (`variants::patch_resident`),
 or from the BBA's warm start.
 
 **Trimming by hand.** `DCLOAD_OS`, `WITH_BBA`, `WITH_LAN_ADAPTER` and
-`WITH_CDDA` leave out what a case never runs; add them to
-`LOADER_RESIDENT_FLAGS` or build into an A/B directory. Nothing ships trimmed
-(until 2026-10-05 `make loaders` built twelve such variants and the host picked
-one per title; withdrawn: a HIGH loader takes the same 64 KB whatever its size).
-`MAPL` is kept in all of them.
+`WITH_CDDA` leave out what a case never runs; add them to a `LOADER_*_FLAGS`
+or build into an A/B directory. Only the network image ships trimmed
+(`DCLOAD_OS=katana`): a HIGH loader takes the same 64 KB whatever its size, so
+per-title variants were withdrawn. `MAPL` is kept in all of them.
 
 | `DCLOAD_OS` | Left out |
 | --- | --- |
@@ -1224,8 +1149,8 @@ the fine deadline (`fine_deadline_*`, `g_fine_timeouts`), the idle-poll limit
 stop waits bounded on the loader's clock (`LA_TX_WAIT_TICKS`), and no 2.3 s link
 spin under a title. Out-of-sequence calls count (`g_la_oos`) instead of
 drawing and hanging. With `GA_LAN=1` (default; 0 returns the LAN Adapter to
-synchronous reads, the console A/B) it takes part in asynchronous reads, the idle
-listen and the RX interrupt: `irq.c` routes Holly EXT bit 2 (`EXT_LAN`, KOS
+synchronous reads) it takes part in asynchronous reads, the idle listen and the
+RX interrupt: `irq.c` routes Holly EXT bit 2 (`EXT_LAN`, KOS
 `ASIC_EVT_EXP_8BIT`) instead of the BBA's bit 3, with the packet-ready interrupt
 enabled in `DLCR3` while a chunk is on the wire (`la_irq_enable`) and masked by
 the tick (`la_irq_ack`). There is no RX DMA on it (the data port is one byte a G2
@@ -1233,359 +1158,206 @@ access): **a chunk costs milliseconds of CPU inside the tick, with SR.BL set.
 Not measured on hardware.**
 
 **VERS's third field** (`cmd_version`): the variant word, `0xA5` in the top byte,
-bits 0-3 layout (0 LOW, 1 HIGH; 2 was the core), 4-7 kind of title (0 all, 1 Katana, 2 KOS,
+bits 0-3 layout (0 LOW, 1 HIGH), 4-7 kind of title (0 all, 1 Katana, 2 KOS,
 3 CE), then CD-DA, BBA, LAN, MARK, DISC, resident, RetroAchievements (bit 14), the
 title's own network (bit 15, §4.21). The host reads it (`VariantWord`) and the adapter
 from the reply's `address` field; bit 15 tells it the running resident image is
 `dcload-resident-net.elf`, whose symbols it must read.
 
-### 4.19 The core (withdrawn 2026-10-05)
+### 4.19 The core (withdrawn)
 
 `DCLOAD_LAYOUT=core` put the whole resident loader in the system hole
-(`0x8c004000..0x8c00c000`) for titles that fill high RAM, with a shadow copy in
-high RAM until the title's first BIOS call. Withdrawn, never having run a
-title: the hole is not the system's to give. Shenmue II keeps its resident
-kernel and debug monitor there (`0x8c004000..`, its VBR handlers at
-`0x8c004c60`, its tables up to `0x8c00fa40`), and the title it was built for
-runs with a HIGH loader taken out of its own heap (host AGENTS.md §5, HLib
-heap). In git history (`9170c7f`, `7c4e064`) if a title ever needs it.
+(`0x8c004000..0x8c00c000`) for titles that fill high RAM. Withdrawn, never
+having run a title: the hole is not the system's to give. Shenmue II keeps its
+resident kernel and debug monitor there (`0x8c004000..`, its VBR handlers at
+`0x8c004c60`, its tables up to `0x8c00fa40`), and runs with a HIGH loader taken
+out of its own heap (host AGENTS.md §5, HLib heap). In git history (`9170c7f`,
+`7c4e064`) if a title ever needs it.
 
 ### 4.20 RetroAchievements: the loader samples, the host judges
 
-`ra.c`, `WITH_RCHEEVOS` (resident image only, HIGH layout: the Makefile refuses
-it in the LOW one). **Run on the console under a Katana title**: Sonic Adventure 2
-(2026-10-07) sampled 60 frames a second, lost none, and unlocked its achievements;
-since 2026-10-08 the resident image of the host's own `loaders/` carries it
-(first `33a6c8fa…`, the set SA2 ran on). Not run under flycast or Windows CE: the CE cache overlay is checked
-only against a modelled write-back cache, with the C encoder, against the host's
-decoder on the PC (`scripts/ra-sampler-harness`).
+`ra.c`, `WITH_RCHEEVOS` (resident images only; the Makefile refuses it in the
+LOW layout). The console samples RAM ranges at each vblank; the host's
+`rcheevos` judges (conditions carry `Delta`, `Prior`, hit counts, pointers,
+floats: none of it is needed on the DC). **Run on the console**: Sonic
+Adventure 2 sampled 60 frames a second, lost none and unlocked its
+achievements; Sega Rally 2 US runs with it. Not run under flycast.
 
-- **`RACT`** (host → DC): `address` = generation (1..). **A table comes in
-  parts**, one datagram each (the loader takes no IP fragment: SA2's first table,
-  a single 1476-byte `RACT`, was fragmented by Windows and never seen, 2026-10-07).
-  Each part's data, big-endian 32-bit: ranges in all, chains in all, first range of
-  the part, its ranges, first chain of the part, its chains; then `{RAM offset,
-  words}` per range, **ascending and apart** over the whole table, then the chain
-  words (below), which come after the last range. A part with both firsts 0 starts
-  a table and turns sampling off (`ra_on`) until it is whole; a part that does not
-  follow the last one received (lost, late, another generation) is ignored, and the
-  host, unanswered, sends the whole table again a second later. **Only the part
-  that completes a table is answered**: `size` 0, or `0xffffffff` for more than
-  `RA_RANGES` (384) ranges, a range over 1023 words, more than `RA_WORDS` (1024)
-  words (ranges' and chains' together), more than `RA_CHAINS` (64) chains, a chain
-  whose parent is not an earlier word, an unaligned, unordered or out-of-RAM range,
-  or a table that fits neither the Katana room nor the CE room (a refusal may
-  answer an earlier part). **Its data is two words, the most words a table may
-  have under a Katana title and under Windows CE** (`ra_max_words()` of each room);
-  the host checks the one that applies, and `ra_attach()` checks it again at the
-  first tick (`g_ra_nofit`). The same table again is a request for a keyframe.
-  Before parts (2026-10-09) the table was limited to one datagram, 160 ranges:
-  Sega Rally 2's set, merged to fit them, took 967 words.
-- **Chains: the loader follows pointers itself.** After the ranges, `RACT` carries
-  the number of chains and, for each, one word `parent index << 22 | shift flag
-  << 21 | offset in words` (signed, 21 bits). A chain is a table word, numbered
-  after the ranges' words, that is **the word at `((word[parent] >> shift) &
-  0xffffff) + offset`**: shift 0 for a 24-bit pointer in the low three bytes of its
-  word (`0xW` at an aligned address), 8 for one in the high three (an address that
-  is 1 mod 4; Shenmue II keeps one there). A parent is an earlier word, a range's
-  or a chain's, so one pass resolves a chain of any depth. Each frame
-  `ra_sample()` reads the ranges' words of a chunk first (and, under CE, puts the
-  dirty cache lines over them), then resolves the chunk's chain words from the
-  parent's value -- in `ra_tmp` if it is in the chunk, else in `prev`, where a word
-  that did not change is what it was. A chain word is then diffed and sent like any
-  other, and under CE `ra_oc_word()` looks for it in the 16 cache entries its
-  address allows. The host works out the same addresses from the same words
-  (`chains.rs`), so nothing about them travels. **Why**: followed by discovery,
-  every value a pointer takes costs the table a word and the console a round trip
-  (SA2's root pointer leads to 37 words); chains keep the table the size it was and
-  lose no frame when a pointer moves. Real sets (2026-10-07): SA2 57 chain words,
-  Shenmue II 2.
-- **The sample**: `ra_tick()`, called by `irq_tick()` on every interrupt before
-  anything else, **whoever owns the network**, because it only reads RAM. It
-  acts when `SB_ISTNRM` bit 3 (vblank-in) is up and at least 8 ms have passed.
-  The tick runs before the title's handler, so the bit is still up. **Reads go
-  through P1**: the title's cache holds its dirty lines, a P2 read would see
-  stale RAM; P1 never takes the TLB miss the tick may not.
-- **Memory**: the previous frame, a window of `RA_CHUNK` (16) words and the batch
-  buffer live in **dead RAM**
-  (`gd_ra_scratch()`, `cdfs_syscalls.c`), laid out by `ra_attach()` on every tick
-  (a different base means the title's MMU came on and everything restarts with a
-  keyframe): under a **Katana title the 6 KB `gd_stage_big`**, which only CE uses;
-  under **Windows CE the loader's own dead stack** between the stage and `_stack`
-  (CE reads into the stage). Only the tables are BSS (~1 KB). Rules: **nothing may
-  touch the scratch before the title runs** (until EXEC the loader's stack
-  overlaps it; `cmd_ract()` only writes the tables, the tick only runs once the
-  hook is in); `GD_RING_TRACE` and `GD_STAGE_BIG_SECTORS` < 3 conflict with it.
-  **The CE room is lent by the host** (2026-10-08): it takes `RA_ROOM` (16 KB
-  since 2026-10-09, 8 KB before) out of CE's RAM right above the loader
-  (`ulRAMFree`, `wince::take`, the same word that keeps CE off the loader's own
-  span; under it with `--wince-loader-top`) and writes that block's P1 address
-  and size in words into `g_ra_ce_room` / `g_ra_ce_room_words` before EXEC;
-  `gd_ra_scratch()` and `gd_ra_ce_words()` then use it, and the `RACT` reply
-  reports 1024 words for CE (744 for Katana). The block is the loader's while the
-  title runs, like its span; nothing touches it before the hook is in. Without it
-  (`--no-ra`, or an older host) **the CE room is what is left under `_stack`**
-  (1184 B with this build): too small for any table since the 384-range tables
-  (2026-10-09; 2400 B and ~280 words before). That room holds
-  the previous frame (1 word per table word), a keyframe's worth of buffer (1.04
-  words) and the window. Every byte the sampler's code or BSS grows by comes out of
-  it, so it has been paid for: the chains took it from ~248 words to ~160, and
-  replacing the cache scan below (and its `ra_pre`, hit list and binary searches)
-  by a per-line lookup took it to ~328, the TMU2 clock fallback (§4.5
-  invariant 4, 288 B) back to ~288, the lent block's two words and code (64 B)
-  to ~280, the 384-range tables (896 B) and the parts (~330 B) to nothing. The
-  host reads the limit from the `RACT`
-  reply; a table the CE room cannot hold is disabled at the first tick
-  (`g_ra_nofit`).
-- **Windows CE and the cache** (`ra_oc_word()`). CE runs with the
-  MMU on and **copy-back** pages, so a word the title wrote can sit in a dirty
-  line of the operand cache that RAM lacks, and -- the cache being indexed by
-  virtual address -- in an entry a read through the physical address (P1) never
-  hits (`docs/wince-investigation.md` §6: a buffer at VPN `0x080df000`, PPN
-  `0x0ce98000`). So under the MMU every word is read from RAM through **P2**
-  (uncached) and, if a **valid and dirty** line of the operand cache holds it, from
-  that line: the line is looked for by its **physical tag** (address array bits
-  28:10, plus the entry's own bits 11:5) in the 4 entries its address bits 11:5
-  allow (`ra_oc_find()`: CE maps 4 KB pages, §9i of `docs/wince-investigation.md`),
-  and the word read from the data array (`0xf4000000` /
-  `0xf5000000`). The last line looked for is remembered, so a range's eight words
-  to a line cost one lookup. Clean lines are ignored (RAM is as good and newer than
-  a stale copy). Skipped, and counted `g_ra_oc_skip`, if CCR.ORA is set (half the
-  array is RAM); nothing to do with the cache off. **Why per line, not a scan**: the
-  first version scanned all 512 entries once into a list of the dirty lines that
-  touch the table: fewer array reads, but 1.3 KB of code, BSS and scratch that were
-  the whole of the CE room. **An address array read is slow, and the tick runs with
-  interrupts blocked**: looking in 16 entries a line (1 KB pages) kept the tick near
-  2 ms at every vblank (`g_ra_tick_max` 1.9 ms, 589 words), and Sega Rally 2 US
-  stopped for good -- every CE thread asleep, the scheduler idle (`g_irq_pc`), at
-  its intro video, its VMU menu or its first screens (2026-10-09). Without the
-  overlay it played, and with 4 entries a line it plays (console, same day: intro,
-  VMU save). Values right on the console: unverified (flycast models no cache).
-- **`RAFR`** (DC → host, **no answer**, like `DC25`): `address` = sequence, `size`
-  = payload bytes. Payload: generation word, record count, then records. A frame
-  is one or more records, each one **window** of at most `RA_WIN` (128) words:
-  header `frame << 16 | 0x8000 key | 0x4000 last | window << 9 | changed`, a
-  bitmap of `RA_WIN_MAP` (4) words, one word per set bit. Only windows with a
-  change are sent, plus the `last` flag on the final record; a frame with no
-  change is one empty record (hit counts run on frames). A keyframe sets every
-  bit of every window: the first frame after a table, after a dropped frame,
-  and every 120 frames. Records are cut into datagrams of at most 1400 B at
-  record boundaries, so a keyframe spans two.
-- **Sent** from the tick's else-chain (`ra_flush_due()` / `ra_flush()`), only
-  when the GD lock is free and no read is on the wire, through `gd_exchange()`
-  like every other transmit under a title, at most two datagrams a tick. Due at
-  6 frames, 50 ms, when what is left cannot take another keyframe, or when a
-  send left records over; for a table near the room's size, which never leaves
-  room for a second keyframe, also when half the buffer is used. **Only a keyframe
-  reserves its whole size** (`ra_worst()`); a frame of changes is checked window by
-  window and given up if it outgrows the room (its partly updated `prev` is put
-  right by the keyframe that follows). Reserving a keyframe for every frame starved
-  a 705-word table in the Katana room: the keyframe still being sent left no room
-  for the next frame, which was dropped and asked for another keyframe (harness,
-  2026-10-09). A frame that does not fit while the network is busy (a load) is
-  dropped, `g_ra_dropped`, and the next is a keyframe: the host never sees a delta
-  against a frame it did not get.
-- **Why the host judges**: conditions carry `Delta`, `Prior`, hit counts,
-  `ResetIf`, pointers, floats, measured values; `rcheevos` does all of it on the
-  host and the loader needs none of it.
-- **Sizes come from measurement** (`dcload-ip-rs ra-count`, 2026-10-06, before
-  pointers): Sonic Adventure 2 reads 324 distinct words in 133 ranges, Shenmue II
-  179 in 56. Hence 512 / 160, and 128 words was never enough. Sega Rally 2
-  (2026-10-08): 1775 words in 337 ranges with everything, seven copies of every
-  condition; hence 384 ranges and words bounded by the room (Katana 744, CE with
-  the lent block 1024) rather than a constant.
-- **Cost**: footprint measured, resident `_end` base+`0x8940` → `0x9940` (+4.1 KB),
-  `.gdstage` ends 2752 B under `_stack` (6848 B before); with the clock fallback
-  (2026-10-08) `_end` base+`0x9a48`, 2464 B; with the lent CE block base+`0x9a88`,
-  2400 B; with parts and 384 ranges (2026-10-09) base+`0x9f54`, 1184 B; with the hook's ring of PCs (same day) base+`0xa008`, 992 B; with `DRST` base+`0xa0f0`, 768 B (the universal image: 384 B, the binding HIGH budget). CPU
-  **estimated, not
-  measured**: ~40-100 µs a frame under a Katana title, 0.3-0.6 %; under CE add the
-  per-line cache lookups (above), a worst tick near 300 µs -- `g_ra_tick_max` will
-  say.
-- **Limits**: no vblank, no sample: a title the hook refuses (`g_irq_refused`)
-  and KOS titles are not served. 744 words under a Katana title (`gd_stage_big`),
-  1024 under Windows CE with the lent block, none without. **The CPU is the next
-  wall, not the room**: `g_ra_tick_max` read 1.8 ms under CE on the console
-  (2026-10-08) with Sega Rally 2's achievements, and the per-line cache lookup
-  grows with the table. A set that does not fit is served in steps by the host (host
-  AGENTS.md): its rich presence out of the table and read with `SBIQ` every few
-  seconds instead, then its leaderboards left out. A pointer
-  that is not 24 bits, or sits across two words, or has an offset past ±4 MB, is
-  not a chain: the host leaves those reads to discovery.
-- **Host test**: `scripts/ra-sampler-harness/` compiles `ra.c` for the PC with
-  stubbed hardware headers and a scripted machine (`harness ce` adds the MMU, a
-  write-back operand cache with synonyms, stale clean copies and evictions); the
-  host repo's `ra::loader_c` tests decode what it sends and compare every frame,
-  and fail when the overlay or the dirty-bit test is broken (checked by mutation).
+- **`RACT`** (host → DC, answered): `address` = generation (1..). **A table
+  comes in parts**, one datagram each (the loader takes no IP fragment). Each
+  part, big-endian 32-bit: ranges in all, chains in all, first range of the
+  part, its ranges, first chain of the part, its chains; then `{RAM offset,
+  words}` per range, **ascending and apart** over the whole table, then the
+  chain words, after the last range. A part with both firsts 0 starts a table
+  and turns sampling off (`ra_on`) until it is whole; a part that does not
+  follow the last one received is ignored, and the host, unanswered, resends
+  the whole table a second later. **Only the part that completes a table is
+  answered**: `size` 0, or `0xffffffff` for more than `RA_RANGES` (384) ranges,
+  a range over 1023 words, more than `RA_WORDS` (1024) words in all, more than
+  `RA_CHAINS` (64) chains, a chain whose parent is not an earlier word, an
+  unaligned, unordered or out-of-RAM range, or a table that fits neither room.
+  **Its data is two words: the most words a table may have under a Katana
+  title and under Windows CE** (`ra_max_words()`); `ra_attach()` checks again
+  at the first tick (`g_ra_nofit`). The same table again asks for a keyframe.
+- **Chains: the loader follows pointers itself.** Each chain word is
+  `parent index << 22 | shift flag << 21 | offset in words` (signed, 21 bits)
+  and names **the word at `((word[parent] >> shift) & 0xffffff) + offset`**:
+  shift 0 for a 24-bit pointer in the low three bytes, 8 for one in the high
+  three. A parent is an earlier word, so one pass resolves any depth; a chain
+  word is diffed and sent like any other, and the host computes the same
+  addresses (`chains.rs`). Without chains, every value a pointer takes cost the
+  table a word and the console a round trip. A pointer that is not 24 bits,
+  sits across two words or has an offset past ±4 MB is left to the host's
+  discovery.
+- **The sample**: `ra_tick()`, from `irq_tick()` on every interrupt, before
+  anything else and **whoever owns the network** (it only reads RAM); it acts
+  when `SB_ISTNRM` bit 3 (vblank-in) is up (the tick runs before the title's
+  handler) and ≥ 8 ms have passed. **Reads go through P1** (the title's dirty
+  lines; P1 never takes a TLB miss).
+- **Memory**: the previous frame (1 word per table word), a keyframe's worth of
+  buffer (1.04 words per word) and a 16-word window live in **dead RAM**
+  (`gd_ra_scratch()`), laid out by `ra_attach()` on every tick (a different base
+  means the MMU came on: restart with a keyframe). Under a **Katana title**:
+  the 6 KB `gd_stage_big`, which only CE uses (744 words). Under **Windows CE**:
+  a block the host lends (`RA_ROOM` 16 KB taken from CE's RAM above the loader,
+  `wince::take`; P1 address and size in words written into `g_ra_ce_room` /
+  `g_ra_ce_room_words` before EXEC; 1024 words); without it (`--no-ra`, an
+  older host), the space left
+  under `_stack`, too small for any table. Only the tables are BSS (~1 KB).
+  **Nothing may touch the scratch before the title runs** (until EXEC the
+  loader's stack overlaps it): `cmd_ract()` only writes the tables, the tick
+  runs only once the hook is in. `GD_RING_TRACE` and `GD_STAGE_BIG_SECTORS` < 3
+  conflict with it.
+- **Windows CE and the cache** (`ra_oc_word()`). CE runs copy-back pages with
+  the MMU on, and the cache is indexed by virtual address, so a word the title
+  wrote can sit in a dirty line a P1 read never hits. Under the MMU every word
+  is read through **P2** and, if a **valid and dirty** operand-cache line holds
+  it, from that line: looked for by **physical tag** (address array bits 28:10
+  plus the entry's bits 11:5) in the **4 entries** its bits 11:5 allow
+  (`ra_oc_find()`; CE maps 4 KB pages), data read at `0xf4000000`/`0xf5000000`,
+  the last line remembered. Clean lines are ignored; skipped
+  (`g_ra_oc_skip`) if CCR.ORA is set. **An address-array read is slow and the
+  tick runs with interrupts blocked**: 16 entries a line kept the tick near
+  2 ms every vblank and Sega Rally 2 US went to sleep for good; a 512-entry scan
+  cost 1.3 KB the CE room did not have. Correct values on the console:
+  unverified (flycast models no cache).
+- **`RAFR`** (DC → host, **no answer**): `address` = sequence, `size` = payload
+  bytes. Payload: generation, record count, records. A record is one **window**
+  of at most `RA_WIN` (128) words: header `frame << 16 | 0x8000 key | 0x4000
+  last | window << 9 | changed`, a bitmap of `RA_WIN_MAP` (4) words, one word
+  per set bit. Only changed windows are sent, plus the `last` flag; a frame with
+  no change is one empty record. A keyframe sets every bit: after a table, after
+  a dropped frame, every 120 frames. Datagrams ≤ 1400 B, cut at record
+  boundaries.
+- **Sent** from the tick's else-chain (`ra_flush_due()` / `ra_flush()`) only
+  while the GD lock is free and no read is on the wire, through `gd_exchange()`,
+  ≤ 2 datagrams a tick; due at 6 frames, 50 ms, when the buffer cannot take
+  another keyframe, or when a send left records over. **Only a keyframe
+  reserves its whole size** (`ra_worst()`; reserving one per frame starved large
+  tables); a frame of changes is given up window by window if it outgrows the
+  room. A frame that does not fit is dropped (`g_ra_dropped`) and the next is a
+  keyframe: the host never sees a delta against a frame it did not get.
+- **Limits**: no hook (`g_irq_refused`) or KOS: no sample. **The CPU is the next
+  wall, not the room** (`g_ra_tick_max` read 1.8 ms under CE before the 4-entry
+  lookup). A set that does not fit is served in steps by the host (rich
+  presence read with `SBIQ`, then leaderboards left out).
+- **Host test**: `scripts/ra-sampler-harness/` compiles `ra.c` for the PC
+  against a scripted machine (`harness ce`: MMU, write-back cache with synonyms
+  and evictions); the host's `ra::loader_c` tests decode and compare every
+  frame, and fail when the overlay or the dirty-bit test is broken (mutation
+  checked).
 - Counters: `g_ra_frames`, `g_ra_sent`, `g_ra_dropped`, `g_ra_keys`,
-  `g_ra_tick_max` (Pck/4 ticks), `g_ra_gen`, `g_ra_nofit`, and for CE
-  `g_ra_oc_words`, `g_ra_oc_skip`.
+  `g_ra_tick_max` (Pck/4 ticks), `g_ra_gen`, `g_ra_nofit`, `g_ra_oc_words`,
+  `g_ra_oc_skip`.
 
-### 4.21 A network title shares the adapter: its ETD driver is the loader
+### 4.21 A network title shares the adapter: its driver is the loader
 
-`vnic.c`, `vnic_entry.S`, `WITH_VNIC` (2026-10-11). **Not run on hardware or
-under flycast yet.** The header of `vnic.c` is the design description.
+`vnic.c`, `vnic_entry.S`, `WITH_VNIC`. **The header of `vnic.c` is the design
+description.** Run on the console: Unreal Tournament NTSC connects and lists
+its servers; Phantasy Star Online Ver.2 PAL reaches its server.
 
-- **Why.** A title that plays online carries Sega's ETD library, a whole
-  RTL8139 driver. Unreal Tournament PAL's init (`0x8c1c4a74`) powers the GAPS
-  bridge down and up, clears the adapter's SRAM (the loader's RX ring) and
-  resets the chip: the loader was deaf after the title's first directory reads.
-  The host's GAPS guard (`gaps_control_patches`) gives it no adapter instead,
-  which is its offline path.
-- **One owner.** Two drivers cannot share an RTL8139 (one CAPR, four TX
-  descriptors taken in turn). The loader keeps the chip; the host writes a stub
-  over each ETD entry point (`mov.l @(1,PC),r1 ; jmp @r1 ; mov #index,r0 ;
-  [nop] ; .long _vnic_etd`, `dcload-ip-rs src/dispatch/vnic.rs`) and tells the
-  loader where the driver keeps its four callbacks and their contexts
-  (`g_vnic_slot`, written before EXEC). The four setters are not replaced: the
-  loader reads the words they write.
-- **The contract** (`vnic_call()`, indices in this order): `ETD_Init` 0,
-  `ETD_Stop` 1 (ETD switched the bridge off here: never again), `ETD_GetEthAddr`
-  2, `ETD_SetCtlPrm` 3 (accepted, not applied), the link poll 4 (always up,
-  state 4 = 100 Mbit full, calls the link callback), `ETD_CtlXmit` 5 (the
-  title's traffic on/off), `ETD_SetRecvBuf` 6, `ETD_SetSendBuf` 7 (one frame;
-  -6 while one waits). Return values are ETD's. A frame is delivered as ETD's
-  interrupt handler did: `RX(ctx, len, 0)`, the title answers
-  `SetRecvBuf(buf)` (0 = drop), the bytes are copied, `RX(ctx, 0, buf)`: the
-  title finds the frame by that address (until 2026-10-12 the loader passed the
-  length there, and every received frame was lost, ARP replies included). A sent
-  frame's buffer goes back with `TX(ctx, buf)`, from which the title sends its
-  next. The title's callbacks only move a buffer between two lists under its
-  own lock (IMASK 15 through `0x8c1c6082`, SR.BL left alone): callable from the
-  tick and from inside a GD wait, as from an interrupt.
+- **Why.** A title that plays online carries a whole RTL8139 driver (Sega's ETD
+  library, or PSO's), whose init powers the GAPS bridge down and up, clears the
+  adapter's SRAM (the loader's RX ring) and resets the chip. Two drivers cannot
+  share the chip (one CAPR, four TX descriptors taken in turn), so the loader
+  keeps it and serves the title's driver. Without this, the GAPS guard (§4.12)
+  gives the title no adapter: its offline path.
+- **ETD** (Unreal Tournament). The host writes a stub over each entry point
+  (`mov.l @(1,PC),r1 ; jmp @r1 ; mov #index,r0 ; [nop] ; .long _vnic_etd`,
+  `dcload-ip-rs src/dispatch/vnic.rs`) and tells the loader where the driver
+  keeps its four callbacks and contexts (`g_vnic_slot`, before EXEC); the
+  setters stay the title's. `vnic_call()` indices: `ETD_Init` 0, `ETD_Stop` 1
+  (never switches the bridge off), `ETD_GetEthAddr` 2, `ETD_SetCtlPrm` 3
+  (accepted, not applied), link poll 4 (always up, state 4 = 100 Mbit full),
+  `ETD_CtlXmit` 5, `ETD_SetRecvBuf` 6, `ETD_SetSendBuf` 7 (one frame; -6 while
+  one waits). A received frame goes as ETD's handler did: `RX(ctx, len, 0)`,
+  the title answers `SetRecvBuf(buf)` (0 = drop), copy, `RX(ctx, 0, buf)` — the
+  title finds the frame **by that address**. A sent buffer goes back with
+  `TX(ctx, buf)`. The title's callbacks only move buffers between lists under
+  its own lock (IMASK 15): callable from the tick and inside a GD wait.
+- **PSO's API** (v2.011 PAL, Ver.2 PAL): a table of seven functions filled by
+  device. The host points init, send, terminate, getmac and the two literals of
+  its link test at `_vnic_pso + 4 * n` (indices 8-12); open/close/info stay the
+  title's. `open` keeps one callback per frame type (ARP, IP) in `g_vnic_slot`
+  0-1, which are also the handles. Delivery: `cb(h, 0, len)` returns the buffer
+  (0 = drop), copy, `cb(h, 1, len)`; other frame types are dropped. `send` is
+  synchronous: the frame is copied into `vnic_txcopy` (1514 B of BSS), -1 while
+  one waits.
+- **Late patches** (PSO Ver.2, whose program exists only decrypted in RAM: its
+  1ST_READ bootstrap decrypts and PRS-decompresses `DP_ADDRESS.JPN`, and
+  `KATSUO.SEA` enters it). The host decodes the program itself
+  (`dispatch::pso_v2_decode`), writes address/value pairs into `g_vnic_late`
+  before EXEC, and serves KATSUO.SEA with the literal it jumps through pointed
+  at `g_vnic_late_entry`; `_vnic_late` writes the words, restores every
+  register and jumps on (`g_vnic_late_done`). The pairs: the driver's, the
+  expansion probe's, the heap's end, and the two serial-number checks
+  (`dispatch::pso_serial_check_patches`): 10, all of `VNIC_LATE_MAX`. **No
+  serial number or access key goes in the code** (user decision).
 - **Whose frame.** The loader's: UDP to `our_ip` and `dcload_syscall_port`,
-  ICMP echo to `our_ip`. ARP: both. The rest: the title's (its address may be
-  ours if its DHCP is answered for our MAC; DHCP is the title's, the resident
-  image has none). Sorted in `rtl_bb_rx()` / `la_bb_rx`, before `process_pkt()`,
-  which builds the loader's answers in place.
-- **When.** While the title's driver is on: `bb->stop()` leaves reception on
-  (every exchange used to end with it off), `irq_rx_arm(0)` keeps the chip's RX
-  interrupt routed, and `vnic_tick()` -- in the tick's else-chain right after
-  the GD lock test, before the disc read, so a title's frame goes out between
-  two chunks -- sends what `SetSendBuf` queued (through `gd_exchange()` and
-  `pkt_buf`, up to 4 a tick) and drains the ring (`gd_vnic_drain()`) when the
-  RX interrupt came, or every 5 ms. A read on the wire drains it itself. Nothing
-  in `vnic_call()` touches the adapter: it runs on the title's stack, with its
-  G2 DMA possibly running; the first tick after `CtlXmit(1)` starts reception.
-- **The other API: Phantasy Star Online** (v2.011 PAL, 2026-10-11). The same
-  driver core without ETD's names, behind a table of seven functions its network
-  layer fills from one literal pool by device (init, info, open, close, send,
-  terminate, getmac; the modem's otherwise). The host points the four that touch
-  the chip (init, send, terminate, getmac) and the two literals naming its link
-  test at `_vnic_pso + 4 * n` (`bra _vnic_etd ; mov #8+n,r0`, indices 8-12);
-  open/close/info stay the title's. `open` keeps one callback per frame type
-  (ARP, IP) in two words (`g_vnic_slot` 0-1, also their contexts: the title
-  passes the word as the handle). Delivery: `cb(h, 0, len)` returns the buffer
-  (0 = drop), copy, `cb(h, 1, len)`. Other frame types are dropped. Its `send`
-  is synchronous (no TX callback): the frame is copied into `vnic_txcopy`
-  (1514 B of BSS) and -1 ("queue full") answered while one waits.
-- **Late patches: Phantasy Star Online Ver.2.** Its 1ST_READ.BIN is a bootstrap:
-  IWASHI.SEA decrypts DP_ADDRESS.JPN (PSO's subtractive generator, words of the
-  result replaced from IWASHI's table at KATSUO's offsets), decompresses it
-  (PRS) to 0x8c010000, and KATSUO.SEA enters it through 0x8c01002c. The driver
-  (v2.011's, moved by 0x5cb40) exists only in RAM. The host decodes the program
-  itself (`dispatch::pso_v2_decode`), writes the words into `g_vnic_late`
-  (count, the entry word, address/value pairs) before EXEC, and serves
-  KATSUO.SEA with the literal it jumps through pointed at `g_vnic_late_entry`
-  (a guard word, put in the read's own bytes). `_vnic_late` writes the words,
-  gives every register back and jumps where KATSUO would have
-  (`g_vnic_late_done` counts what it wrote). The decoded program's syMalloc heap
-  runs `0x8c5c6880..0x8d000000`: the host places the loader by it too
-  (`0x8cfe0000`, its constants name the last 64 KB) and its end, a word of the
-  decoded program (`0x8c030820`), is lowered as one more late pair. With the
-  expansion probe's word and the two serial-number checks (`jsr` to the
-  PRIME.PRS module answered 1, `dispatch::pso_serial_check_patches`) that is 10,
-  all that `VNIC_LATE_MAX` holds.
-- **The entry.** `_vnic_etd` keeps MACH/MACL (the Hitachi compiler's callers
-  may keep them live) and passes the index as a fourth argument. `vnic.c` must
-  stay free of FPU instructions (GCC spills to FP registers under pressure, and
-  this runs with the title's FPSCR): check `vnic.asm` after a change.
-- **Its own image.** `vnic.c` costs ~1 KB, and the resident image had 768 B
-  under its `.gdstage`: `make loaders` builds `dcload-resident-net.elf`
-  (`LOADER_NET_FLAGS`: the resident flags, `WITH_VNIC=1`, `DCLOAD_OS=katana`,
-  which leaves out the CE and KOS paths -- ETD is a Katana library). `_end`
-  base+`0x9f40`, `.gdstage` ending 1216 B under `_stack` (2026-10-11, with
-  PSO's API and the late patches; 3200 B with ETD alone). The universal and the
-  plain resident images are byte for byte what they were. `_vnic_etd`,
-  `_vnic_pso` and `g_vnic_late_entry` are `--gc-sections` roots
-  (`--require-defined`): nothing in the loader names them.
-- **Host.** Recognises ETD only exactly: the error strings its pools name, the
-  first instructions of every entry point and setter at their offsets from
-  `ETD_Init` (Unreal Tournament PAL's version). Anything else keeps the GAPS
-  guard. Decided from the disc's boot binary before the loader is placed (the
-  network image is chosen then), patched after upload, guarded against reloads.
-  `--no-vnic` gives the title no adapter, as before.
-- **The title must see the slot, alive** (2026-10-12). The Katana library's
-  expansion probe (UT `0x8c020338`, the same in both PSO) records every slot
-  answering `"GAPS"` and switches it off as §4.12 describes; with the GAPS
-  guard left out, Unreal Tournament powered the bridge down before its first
-  disc read and went back to the BIOS menu when `gdFsInit` failed. For a network
-  title the host keeps the probe and turns every `bsr` to its two switch-off
-  functions into a `nop` instead (`gaps_power_down_patches`: the function
-  loading `0x5a00a500` and adding 0x18, the one called just before it adding
-  0x14; 12 calls in UT).
-- **The adapter's settings in flash** (2026-10-12). A title uses the adapter
-  only if partition 2 of the flash holds block `0xE0` (the BBA's IP settings,
-  KOS `dc/flashrom.h`); UT reads blocks `0x80..0xEB` and otherwise offers only
-  the modem. `vnic_flash_arm()` (at EXEC, with `cdfs_redir_enable()`) takes the
-  flashrom vector `0x8c0000b8` when the host filled `g_vnic_isp` (address,
-  netmask, gateway, two DNS, as numbers a.b.c.d): `_vnic_flash` passes a read to
-  the BIOS and lays over it a `0xE0` block (method 3, static, the console's own
-  address) in the first free block, and that block's bitmap bit cleared, so the
-  block library takes it as the newest. Nothing is written: a title's write
-  (r7 2, answered with the length) or delete (r7 3, answered 0) is answered as
-  done and never reaches the BIOS (2026-10-12, asked so that saving Unreal
-  Tournament NTSC's LAN settings leaves the flash alone). The Katana flash
-  library works from its RAM copy and checks only the return values; a re-read
-  in the same session sees the flash as it was (the SRAM's ~6.5 KB free cannot
-  shadow a 16 KB partition). **Unreal Tournament NTSC** keeps its own copy
-  of these settings in blocks `0x60..0x69` (ten times 60 bytes, the
-  `0xE0..0xE9` layout: address +8, netmask +12, DNS +20/+24, gateway +28),
-  read at boot with the Katana flash library (`UTDC.BIN` `0x8c08d960`); missing,
-  they read as `0xFF` and it clears them (empty LAN fields). So the overlay
-  lays eleven blocks in the first free ones, which must follow each other:
-  `0xE0`, `0x60` with `0xE0`'s data, `0x61..0x69` as zeros; each is made on the
-  fly (`vf_byte`), only the CRCs kept. Cost: `.gdstage` ends 64 B under
-  `_stack` in the network image (2026-10-12). The method value is KOS's reading, **not yet checked
-  against a title**. Read on the console (2026-10-12): Unreal Tournament PAL
-  copies the partition into the Katana flash library's cache and finds the
-  block there; it then sees the adapter (its probe calls `ETD_Init`), but its
-  main menu offers no Network entry: the build constant `0x8c219510` (1 in
-  the PAL build, never written) hides it, and the DCLAN interface is only
-  opened from that menu. Host:
-  `--net-mask`, `--net-gateway`, `--net-dns`, each else from the lease the
-  loader carries (`g_net_cfg`, §4.9: from the CD's lease, or asked again by
-  the universal image behind an older CD), else 255.255.255.0, the subnet's .1 and the gateway;
-  `--no-flash-isp`. Cost: `_end` base+`0xa3c0`, `.gdstage` ending 64 B under
-  `_stack` (with UT NTSC's blocks).
-- **One block reaches the flash** (2026-10-14, user's request: PSO Ver.2's
-  serial number and access key, block 7, otherwise asked every session).
-  `g_vnic_flash_keep` (from the host; 0 = none) names a block ID; a write
-  (`vnic_flash_write()`) of exactly one 64-byte block of that ID, in partition
-  2's data area, is written by the BIOS **to the first free slot of the real
-  flash** (`vf_blk_at`, the overlay's first slot, which hides it for the rest
-  of the session), then its bitmap bit (the byte read back, less that bit:
-  a write may only clear bits; checked on the PC against a model of the
-  BIOS that refuses anything else, 2026-10-14); the next
-  one to the next slot, at most `VF_BLOCKS` a session (`g_vnic_flash_kept`).
-  Not where the title asked: the Katana library writes its bitmap first, then
-  the block in the slot after the last it sees, which is after the overlay --
-  the real flash would get a hole of eleven blank "used" or "free" slots. The
-  title's bitmap writes and every delete still go nowhere. The used blocks of
-  the real flash stay one run from the start, so the next session's overlay
-  goes after them and the library finds block 7 there. Paid for by making
-  `vnic.c` smaller, no feature removed (`vnic_call`'s cases share their
-  tails, one C entry for flash reads and writes, one pass over the overlay's
-  bytes and one over the bitmap's bits): `.gdstage` ends **exactly at
-  `_stack`, 0 B left** in the network image. **Not yet run on the console.**
+  ICMP echo to `our_ip`; ARP goes to both; the rest is the title's (DHCP
+  included). Sorted in `rtl_bb_rx()` / `la_bb_rx`, before `process_pkt()`.
+- **When.** While the title's driver is on, `bb->stop()` leaves reception on,
+  `irq_rx_arm(0)` keeps the RX interrupt routed, and `vnic_tick()` (the tick's
+  else-chain, after the GD lock test and before the disc read) sends what was
+  queued (through `gd_exchange()`, up to 4 a tick) and drains the ring
+  (`gd_vnic_drain()`) on the RX interrupt or every 5 ms. **Nothing in
+  `vnic_call()` touches the adapter**: it runs on the title's stack, with its
+  G2 DMA possibly running.
+- **The entry.** `_vnic_etd` keeps MACH/MACL and passes the index as a fourth
+  argument. `vnic.c` must stay free of FPU instructions (it runs with the
+  title's FPSCR): check `vnic.asm` after a change. `_vnic_etd`, `_vnic_pso` and
+  `g_vnic_late_entry` are `--gc-sections` roots (`--require-defined`).
+- **Its own image**, `dcload-resident-net.elf` (`LOADER_NET_FLAGS`: resident +
+  `WITH_VNIC=1 DCLOAD_OS=katana`). **Its `.gdstage` ends exactly at `_stack`**
+  (§4.6): any byte added comes from tightening code.
+- **The flash** (`vnic_flash_arm()` at EXEC takes the flashrom vector
+  `0x8c0000b8` when the host filled `g_vnic_isp`). A title uses the adapter
+  only if flash partition 2 holds block `0xE0` (KOS `dc/flashrom.h`).
+  `_vnic_flash` passes reads to the BIOS and lays `VF_BLOCKS` (11) blocks over
+  the first free slots, bitmap bits cleared so they are the newest: `0xE0`
+  (method 3 = static, from KOS, **unchecked against a title**; the console's
+  address, netmask, gateway, two DNS) and `0x60..0x69` (Unreal Tournament
+  NTSC's own copy, `0x60` with `0xE0`'s data, the rest zeros), made on the fly
+  (`vf_byte`). **Writes and deletes are answered as done and go nowhere**,
+  except one block (`g_vnic_flash_keep`: PSO Ver.2's serial/key, block 7):
+  `vnic_flash_write()` writes it to the first free slot of the real flash and
+  clears only its bitmap bit (`g_vnic_flash_kept`), so the real flash stays one
+  run of used blocks; **not yet run on the console**. Host: `--net-mask`,
+  `--net-gateway`, `--net-dns`, else the lease the loader carries (`g_net_cfg`,
+  §4.9), else a /24 guess; `--no-flash-isp`.
+- **Host recognition** is exact (ETD: error strings and entry-point bytes at
+  their offsets from `ETD_Init`; PSO: per version), decided from the boot
+  binary or the program a Ginsu loader boots, before the loader is placed;
+  anything else keeps the GAPS guard. `--no-vnic` gives no adapter. The title
+  must see the slot alive: the host neutralises the expansion probe's
+  switch-off calls (§4.12).
 - **Limits.** A title's frame waits for the next interrupt (~1 ms under a
-  Katana title, a frame at worst). No multicast (`RT_MAR0` is 0). `SetCtlPrm`'s
-  filters and modes are ignored. ETD's statistics (`GetEthXinf`) and `Diag` are
-  not served (Unreal Tournament calls `Diag` only from inside `ETD_Init`).
-  Recognised: Unreal Tournament PAL (ETD), Phantasy Star Online v2.011 PAL and
-  Ver.2 PAL (PSO's API); any other version keeps the GAPS guard.
-- Counters: `g_vnic_rx`, `g_vnic_rx_drop` (no callback, or the title refused
-  the buffer), `g_vnic_tx`, `g_vnic_tx_fail`, `g_vnic_on`, `g_vnic_late_done`.
+  Katana title). No multicast (`RT_MAR0` 0). `SetCtlPrm`'s filters, ETD's
+  statistics and `Diag` are not served. Recognised: Unreal Tournament PAL/NTSC,
+  PSO v2.011 PAL and Ver.2 PAL. UT PAL has no online menu (a build constant
+  hides it).
+- Counters: `g_vnic_rx`, `g_vnic_rx_drop`, `g_vnic_tx`, `g_vnic_tx_fail`,
+  `g_vnic_on`, `g_vnic_late_done`, `g_vnic_flash_kept`.
 
 ## 5. 1st_read bootstrap (`target-src/1st_read`)
 
@@ -1717,6 +1489,9 @@ word). Reply `MARK` at the same address: `size` 0 after a paint, the bitmap's
 byte count after a check (bit i = block i changed), or `0xffffffff` if the range
 touches the loader's image, stack, `.hiram` or Maple page. The host paints
 before `EXEC` and checks a few blocks a second while the title runs (§16).
+**A paint is not neutral to a title that reads RAM it never initialised**
+(Phantasy Star Online Ver.2 took a painted word as flags; the host's
+`--no-marks`).
 
 **A `DBIN` names its range.** `cmd_donebin()` answers with the first missing
 part of the LoadBinary window (or `0, 0` when complete); `cmd_sendbinq()` ends a
@@ -1801,7 +1576,7 @@ hook, the tick's idle listen.
 
 | Script | What it answers |
 | --- | --- |
-| `dc-counters.py <ip>` | the counters on hardware, via `SBIQ`. Checks the base (from VERS) **and** 256 bytes of code against the ELF before decoding. For a host-relocated loader, produce the matching ELF with `dcload-ip-rs relocate loaders/dcload-relocatable.elf <base> -o <file>` and pass `--elf`. `--repeat N --interval S` prints deltas; `--raw addr len` dumps. Needs `sh-elf-nm`. |
+| `dc-counters.py <ip>` | the counters on hardware, via `SBIQ`. Checks the base (from VERS) **and** 256 bytes of code against the ELF before decoding. For a host-relocated loader, produce the matching ELF with `dcload-ip-rs relocate loaders/<image>.elf <base> -o <file>` and pass `--elf`. `--repeat N --interval S` prints deltas; `--raw addr len` dumps. Needs `sh-elf-nm`. |
 | `dc-rates.sh [s]` | counters sampled twice, printed as rates per second. |
 | `dc-peek.py <symbol\|addr>` | read guest memory under flycast; `--base`/`--elf` after a relocation. Never hard-code a counter address. |
 | `dc-sample.py`, `dc-track.py` | poll counters; `dc-track` re-attaches per sample (a held GDB connection freezes the guest). |
@@ -1816,8 +1591,10 @@ hook, the tick's idle listen.
 | `flycast-counters.sh` | reads the `dcdiag` flycast patch — **absent from the current flycast tree**; re-apply before use. |
 | `sa-repeat.sh`, `sa-gdi-control.sh`, `flycast-transition.sh` | Sonic Adventure session drivers; `sa-gdi-control.sh` boots the GDI in flycast without dcload (§14.18). |
 | `make-preset-db.py` | generates `docs/game-presets.tsv`. |
+| `ra-sampler-harness/` | `ra.c` on the PC against a scripted machine (§4.20). |
 
-**Always-compiled counters** (CD-DA in §4.13, hook in §4.15, G2 DMA in §4.16):
+**Always-compiled counters** (CD-DA in §4.13, hook in §4.15, G2 DMA in §4.16,
+RA in §4.20, network title in §4.21):
 
 - Footprint: `g_gd_sp_min`, `g_gd_sp_in_image` (§4.6).
 - GD: `g_gd_idx_counts[]` (per syscall index; `[2]` ExecServer and `[4]`
@@ -1825,31 +1602,32 @@ hook, the tick's idle listen.
   a free check of the array alignment), `g_gd_cmd_counts[]` (per GD command,
   counted before the lock), `g_gd_park_longs`, `g_cdfs_sync_chunks`,
   `g_cdfs_sync_reentered`, `g_gd_spindown`, `g_cdfs_read_retries`/`_fails`/
-  `_holes`/`_stale`, `g_gd_stale_lbin`, `g_gd_in_transfer`, and the lock group
-  (`g_gd_lock_stuck`/`g_gd_lock_held_long`/`_stuck_owner`/`_stuck_ticks`/
-  `g_gd_lock_owner`/`_gen`).
+  `_holes`/`_stale`, `g_gd_stale_lbin`, `g_gd_self_refused`,
+  `g_gd_in_transfer`, and the lock group (`g_gd_lock_stuck`/
+  `g_gd_lock_held_long`/`_stuck_owner`/`_stuck_ticks`/`g_gd_lock_owner`/`_gen`).
   **`_fails` and `_holes` are different ends of the link**: fails means the host
   never answered, holes means it answered short. Since the host stopped
   acknowledging disc reads, `_holes` is the only place a lost packet in a read
   shows up.
 - Transfers: `g_lbin_count`, `g_lbin_noecho`, `g_bin_data_done`,
-  `g_dbin_count`, `g_dbin_incomplete`, `g_pbin_ok`/`_rejected`/`_clamped`,
+  `g_dbin_count`, `g_dbin_incomplete` (no longer a signal on the disc path,
+  which sends no DBIN), `g_pbin_ok`/`_rejected`/`_clamped`,
   `g_last_load_addr`/`_size`, `g_last_reject_*`.
 - RX: `g_rx_frames`, `g_rx_polls`, `g_rx_wraps`, `g_rx_overflow`, `g_rx_reinit`,
   `g_rx_linkchange`, `g_rx_link_giveup`, `g_rx_hdr_defer`, `g_rx_resync`,
   `g_rx_missed` (the chip's own drop tally), `g_rx_last_capr`/`_cbr`.
-- Timeouts: `g_fine_timeouts` (fine deadline exits) and `g_idle_polls_max` are
-  **different exits** — reading the second as "no timeout fired" hid a 3 s
-  freeze. `g_pmcr_backwards`.
+- Timeouts and clock: `g_fine_timeouts` (fine deadline exits) and
+  `g_idle_polls_max` are **different exits** — reading the second as "no
+  timeout fired" hid a 3 s freeze. `g_pmcr_backwards`, `g_clk_tmu2` (§4.5).
 - DHCP / warm start: `g_dhcp_replies`, `g_dhcp_not_ours`, `g_warm_start`,
-  `g_warm_ip`.
+  `g_warm_ip`, `g_net_cfg`, `g_net_cfg_known`.
 - Maple: `g_maple_dma_empty`, `g_maple_dma_timeouts` (§8).
 
-**The loader writes nothing outside its own footprint while a title runs.** An
-instrument that needs to must justify the address against the title
-(`GUEST_TICK_BLOCK` is the one such address, off by default). A former
-post-mortem block at `0x8cf0c000` wrote into Windows CE's driver globals on
-every read.
+**The loader writes nothing outside its own footprint while a title runs**
+(except the block the host lends it under Windows CE, §4.20). An instrument
+that needs to must justify the address against the title (`GUEST_TICK_BLOCK` is
+the one such address, off by default). A former post-mortem block at
+`0x8cf0c000` wrote into Windows CE's driver globals on every read.
 
 Signatures worth knowing: `ExecServer` advancing one-for-one with
 `g_cdfs_sync_reentered` = the server never comes back (§4.5); `g_rx_polls` per
@@ -1864,7 +1642,9 @@ an instrument that costs a round trip changes the timing it measures; a null
 result means nothing until the instrument has been shown to detect something
 (positive control); observe before acting, because a fix that crashes destroys
 its own measurement; and count on both sides of a boundary (a guest counter
-against a capture on the wire) to tell lost TX from lost RX.
+against a capture on the wire) to tell lost TX from lost RX. Before blaming
+the loader for a freeze, run the title without dcload (flycast, the same
+image): Unreal Tournament NTSC's online freeze was the game's own.
 
 ## 12. CI and branching
 
@@ -1899,15 +1679,14 @@ against a capture on the wire) to tell lost TX from lost RX.
 7. **Setting `VERSION` anywhere but `Makefile.cfg`.**
 8. **Adding a command or syscall on one side only** — both `commands.h` and both
    `syscalls.h`, byte-identical layouts.
-9. **Trusting a guard that no longer guards.** Two scripts (removed 2026-10-03)
-   kept reporting success over code that no longer existed, and the host's
-   CD-DA trim tests passed on a geometry the console no longer had. Prove a
-   check can fail before trusting it. **A timeout is a check
-   too**: the read deadline could not fire for two months because nothing
-   started TMU2, and the first session that relied on it froze the game for
-   7 s. **And a bound guards the loop it is in, not the function**: a repair
-   loop with no budget below a carefully bounded one turned a silent console
-   into an unbounded `SendBinQ` flood that froze the title.
+9. **Trusting a guard that no longer guards.** Scripts kept reporting success
+   over code that no longer existed, and the host's CD-DA trim tests passed on a
+   geometry the console no longer had. Prove a check can fail before trusting
+   it. **A timeout is a check too**: the read deadline could not fire for two
+   months because nothing started its timer, and the first session that relied
+   on it froze the game for 7 s. **And a bound guards the loop it is in, not the
+   function**: a repair loop with no budget below a carefully bounded one turned
+   a silent console into an unbounded `SendBinQ` flood that froze the title.
 10. **Testing the old image.** `make` does not regenerate the CDI, and
     regenerating does not deploy it. Run `mkdcdisc`, copy, then prove the
     deployed image contains the new `1st_read.bin` **by content** (search for
@@ -1915,7 +1694,7 @@ against a capture on the wire) to tell lost TX from lost RX.
 11. **Hard-coding an address the linker owns.** A GD-vector tripwire compared
     against a literal; an unrelated change moved the target and the machine
     rebooted at `EXEC` with no trace. Compare against the symbol.
-12. **Adding DC-side state without checking `_end`** — §4.6, both families.
+12. **Adding DC-side state without checking `_end`** — §4.6, every image.
 13. **Leaving an instrument on.** `GD_TRACE`/`GD_TRACE_CALLER` can stop a title
     booting. **And an instrument on a failure path is inside the blast radius**:
     a trace `write()` transmits, waits, and is fetched back with `SendBinQ`, so
@@ -1948,7 +1727,9 @@ against a capture on the wire) to tell lost TX from lost RX.
     transmits, and an interrupt can land while `pkt_buf` or `bin_info` is in
     use (§4.5). The hook's tick works only while the GD lock is free, and the
     hook re-verifies the title's VBR on GD syscalls (isoldr's
-    `exception_vbr_ok()`).
+    `exception_vbr_ok()`). The same holds for a listen window opened from a
+    syscall a title's handler can interrupt: it re-entered itself and zeroed the
+    outer window's bounds, which then spun forever.
 21. **Reading a hardware field by the name in the comment.** AICA TL is
     attenuation; writing it as a volume silenced CD-DA while every counter was
     healthy. Check fields against a working driver (KOS `arm/aica.c`).
@@ -1959,12 +1740,12 @@ against a capture on the wire) to tell lost TX from lost RX.
     level before concluding it does not fire.
 23. **Measuring across the title on a clock the title can touch.** A wait that
     spans the title's own code — an asynchronous read, a period mark, a service
-    gap — is only as good as a clock nobody else writes. TMU2 was ours until
-    Sonic Adventure 2: its asynchronous reads "timed out" at the first look,
-    one frame after the request, and the signature was
-    a count that could not add up (65 deadline exits of 250 ms in 4.5 s of a
-    one-at-a-time engine). Check the arithmetic of a timeout counter against
-    wall time before chasing what it seems to report (§4.5 invariant 4).
+    gap — is only as good as a clock nobody else writes. On TMU2, Sonic
+    Adventure 2's asynchronous reads "timed out" at the first look, one frame
+    after the request, and the signature was a count that could not add up (65
+    deadline exits of 250 ms in 4.5 s of a one-at-a-time engine). Check the
+    arithmetic of a timeout counter against wall time before chasing what it
+    seems to report (§4.5).
 
 ## 15. Where to look first
 
@@ -1988,6 +1769,8 @@ against a capture on the wire) to tell lost TX from lost RX.
 - **CD-DA** → the header of `cdda.c`, then §4.13.
 - **Interrupt hook, asynchronous reads** → `irq.c`, `irq_hook.S`, the `ga_*`
   functions of `cdfs_syscalls.c`, §4.15.
+- **The loader's clock** → the header block of `adapter.h`, §4.5.
+- **A network title** → the header of `vnic.c`, §4.21.
 - **Anything that runs while a game runs** → `_end` and §4.6.
 - **A new example program** → copy one, add it to `example-src/Makefile`.
 - **A new on-screen field** → `video.s`, `dcload.c`.
@@ -1997,11 +1780,12 @@ against a capture on the wire) to tell lost TX from lost RX.
 ## 16. The Rust host server
 
 `dcload-ip-rs`, at `/mnt/e/Nextcloud/Projets/Dreamcast/dcload-ip-rs/`, serves
-GD-ROM and CD-DA emulation and has **its own `AGENTS.md`**: loader placement,
-title patches (GAPS guard, GD driver body, Windows CE, KOS), `MARK`, `--diag`,
-VM2, pacing and the CD-DA encoder are described there. `dc-tool-ip` remains the
-reference for the basic protocol. **Never run `cargo` in the user's `target/`**
-(it breaks their Windows build); use `CARGO_TARGET_DIR=<scratchpad>`.
+GD-ROM and CD-DA emulation and has **its own `AGENTS.md`**: loader placement
+(presets, heaps, Ginsu loaders), title patches (GAPS guard, GD driver body,
+Windows CE, KOS, network titles), `MARK`, `--diag`, VM2, pacing and the CD-DA
+encoder are described there. `dc-tool-ip` remains the reference for the basic
+protocol. **Never run `cargo` in the user's `target/`** (it breaks their
+Windows build); use `CARGO_TARGET_DIR=<scratchpad>`.
 
 **`DISC`** (§4.17) is answered 0/1/`0xffffffff` and the host opens the new image
 before asking, installing it only on 0.
@@ -2015,22 +1799,26 @@ is redeployed with any change here (§4.11, §14.19).
   linked base, then the cable (0 VGA, 2 RGB, 3 composite), then the variant word
   (§4.18). Append new fields at the end; older loaders send fewer. The reply's
   `address` is `installed_adapter` (octal 0300 LAN / 0400 BBA).
-- **The resident image** (§4.18): the host chainloads `dcload-resident.elf` as
-  the title's loader (a disc image, a high base) and writes `our_ip` and
-  `dcload_syscall_port` into it (`variants::patch_resident`); every hop is
-  `dcload-relocatable.elf`. When VERS's variant word says `resident`, the host
-  reads symbols from the resident file. Renaming those two symbols, or the
-  file, breaks it.
+- **The images** (§4.18, §4.21): the host chainloads `dcload-resident.elf` (or
+  `dcload-resident-net.elf` for a network title) as the title's loader and
+  writes `our_ip` and `dcload_syscall_port` into it (`variants::patch_resident`);
+  every hop is `dcload-relocatable.elf`. When VERS's variant word says
+  `resident`, the host reads symbols from the resident file. Renaming those two
+  symbols, or the files, breaks it.
 - **Layout**: `loaders::layout()`, `live_footprint()`, `HIRAM_RESERVED`
   (`0x3000`), `LOADER_SPAN` (`0x10000`) mirror the Makefile layout (§4.11). The
   relocator assumes only `R_SH_DIR32`, linker-symbol addresses, and `.guestvbr`
   references only through the jump table, and repeats the link's stack asserts
   (every image section, `.gdstage` included, under `_stack`; 800 B from `_end`).
-- **Symbols read by name** — renaming one breaks the host: the counters
-  (`src/diag.rs`, `src/stackwatch.rs`, `scripts/dc-counters.py`); `_gd_stage`
-  and `_gd_stage_big` (where a disc read may land inside the loader);
-  `_g_gd_kos` (set to 1 before `EXEC` for a KOS binary, §4.5); `_gd_bios_entry`
-  (`cdfs_redir.s`, written over a title's direct calls to the BIOS GD driver).
+- **Symbols read or written by name** — renaming one breaks the host: the
+  counters (`src/diag.rs`, `src/stackwatch.rs`, `scripts/dc-counters.py`);
+  `_gd_stage` and `_gd_stage_big` (where a disc read may land inside the
+  loader); `_g_gd_kos` (set to 1 before `EXEC` for a KOS binary, §4.5);
+  `_gd_bios_entry` (`cdfs_redir.s`, written over a title's direct calls to the
+  BIOS GD driver); `g_ra_ce_room`/`_words` (§4.20); `g_vnic_slot`,
+  `g_vnic_late`, `g_vnic_late_entry`, `g_vnic_isp`, `g_vnic_flash_keep`,
+  `g_net_cfg`, `_vnic_etd`, `_vnic_pso` (§4.21); `g_gd_dmaend_slot`,
+  `g_gd_dmaend_param` (§4.5).
 - **Disc reads** (`send_sectors()`): one at a time, **no LoadBinary echo, no
   DoneBinary probe** — the loader judges the chunk (§4.5). The LoadBinary names
   exactly the requested destination; the ReturnValue's address is
@@ -2044,7 +1832,8 @@ is redeployed with any change here (§4.11, §14.19).
   outrunning it desyncs CAPR from CBR. The ring is already at its back-pressure
   limit (`g_rx_overflow`, `g_rx_resync` non-zero with `g_rx_missed` 0); the
   residual loss is the status-word race of §4.8 rule 4, which costs a read its
-  250 ms deadline.
+  250 ms deadline. **Do not lower the pacing**: a longer pause would not change
+  the resyncs.
 - **Audio** (`DC23`/`DC24`): no echo or DoneBinary; ReturnValue `address` =
   LBA, `size` = trim ppm. The host's `CDDA_GIVE_UP` (15 ms) **must stay below
   the loader's 20 ms fetch deadline**, its encoder cache (`RECENT` = 48) must
@@ -2068,6 +1857,8 @@ Code first. Then:
 | `target-src/dcload/dcload.x.in` + `dcload.map` | memory map and `_end` |
 | `target-src/dcload/cdda.c` (header) | CD-DA design |
 | `target-src/dcload/cdfs_syscalls.c`, `cdfs_redir.s` | GD emulation |
+| `target-src/dcload/adapter.h` (header) | the loader's clock |
+| `target-src/dcload/vnic.c` (header) | network titles |
 | `target-src/dcload/go.S` | the handoff |
 | `target-src/1st_read/loader.s` | bootstrap |
 | `host-src/tool/dc-tool.c` | CLI and protocol behaviour |

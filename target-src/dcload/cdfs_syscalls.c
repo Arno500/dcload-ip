@@ -505,6 +505,47 @@ unsigned int g_gd_park_longs;
 unsigned int g_gd_kos;
 #endif
 
+#if GD_DMAEND_SLOT
+/*
+ * A DMA STREAM THAT MOVES ON THE G1 DMA-END INTERRUPT (2026-10-17).
+ *
+ * NBA 2K2's CD layer (VCCD, in the MAIN*.BIN its Ginsu boot runs) reads a
+ * DMAREAD_STREAM one sector a piece: it stores its continuation in a word of
+ * its own, asks ReqDmaTrans, and waits. Its GD DMA-end handler (ISTNRM bit
+ * 14) takes the word, clears it and calls G1DmaEnd(word, 0), which calls it.
+ * Nothing here raises that interrupt, so the title waited on its first piece
+ * for good, rendering frames, the stream STREAMING.
+ *
+ * The host finds that handler by content (dcload-ip-rs gd_dma_end_slot) and
+ * writes the word's P1 address here before EXEC, with the argument the
+ * handler passes; after each DMA piece the server does what the handler
+ * would. 0 = no such title. Called from the server, as a PIO stream's
+ * callback is (isoldr does the same for PIO), with interrupts masked as they
+ * are in a handler; the continuation asks for the next piece itself, so a
+ * whole stream is served inside the ExecServer that finds the first one.
+ */
+unsigned int g_gd_dmaend_slot;
+unsigned int g_gd_dmaend_param;
+unsigned int g_gd_dmaend_calls;
+
+static void gd_dma_end(void)
+{
+	volatile unsigned int *slot = (volatile unsigned int *)g_gd_dmaend_slot;
+	unsigned int func, sr;
+
+	if (!slot || !(func = *slot))
+	{
+		return;
+	}
+	*slot = 0;
+	g_gd_dmaend_calls++;
+	__asm__ volatile ("stc sr,%0" : "=r" (sr));
+	__asm__ volatile ("ldc %0,sr" : : "r" (sr | 0xf0U));
+	((void (*)(unsigned int))func)(g_gd_dmaend_param);
+	__asm__ volatile ("ldc %0,sr" : : "r" (sr));
+}
+#endif
+
 /*
  * Non-zero while a disc read (ReadSectors, GetTOC) waits in bb->loop().
  *
@@ -2331,6 +2372,12 @@ static void data_stream(void)
 		{
 			((void (*)(unsigned int))_GDS.callback)(_GDS.callback_param);
 		}
+#if GD_DMAEND_SLOT
+		else if (dma)
+		{
+			gd_dma_end();	/* every piece, as the interrupt would */
+		}
+#endif
 	}
 
 	gd_piece_size = 0;

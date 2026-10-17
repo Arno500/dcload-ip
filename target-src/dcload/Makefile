@@ -524,6 +524,12 @@ CFLAGS += -DRTL_RX_DMA=$(RTL_RX_DMA)
 GA_KATANA_READS ?= 1
 CFLAGS += -DGA_KATANA_READS=$(GA_KATANA_READS)
 
+# The G1 DMA-end handler of a title's DMA stream, done by the server after each
+# piece when the host names the word that handler takes its continuation from
+# (cdfs_syscalls.c, g_gd_dmaend_slot; NBA 2K2). ~100 B: the resident images.
+GD_DMAEND_SLOT ?= 0
+CFLAGS += -DGD_DMAEND_SLOT=$(GD_DMAEND_SLOT)
+
 # Diagnostic only: what an asynchronous chunk that missed its deadline had
 # received, and the state of reception at that moment (g_gaf_*). Never in a
 # shipped set.
@@ -697,14 +703,15 @@ LOADER_DIR   = loaders
 LOADER_RELOC_BASE = 0x8ce00000
 # The resident image's flags (AGENTS.md 4.18): no screen, no DHCP, what runs
 # under a title. Any DCLOAD_OS / WITH_* knob may be added here to trim it.
-LOADER_RESIDENT_FLAGS = DCLOAD_RESIDENT=1 WITH_RCHEEVOS=1
+LOADER_RESIDENT_FLAGS = DCLOAD_RESIDENT=1 WITH_RCHEEVOS=1 GD_DMAEND_SLOT=1
 # The resident image for a title that plays on the network (AGENTS.md 4.21):
 # the same, plus the title's ETD driver served by the loader. Katana only (ETD
 # is a Katana library), which is also what makes room for it: the resident
 # image has 768 B left under its .gdstage, vnic.c needs ~1 KB, and leaving out
 # the CE and KOS paths frees ~4 KB. The host serves it only to a title whose
 # ETD driver it recognised (dcload-ip-rs src/vnic.rs).
-LOADER_NET_FLAGS = $(LOADER_RESIDENT_FLAGS) WITH_VNIC=1 DCLOAD_OS=katana
+# GD_DMAEND_SLOT stays out: this image has no byte left under its .gdstage.
+LOADER_NET_FLAGS = $(LOADER_RESIDENT_FLAGS) WITH_VNIC=1 DCLOAD_OS=katana GD_DMAEND_SLOT=0
 
 # One relocatable image: $(1) its name in $(LOADER_DIR), $(2) extra make flags.
 # The relocations are the whole point of it, and objcopy is well within its

@@ -156,8 +156,10 @@ extern volatile int drain_iters;
  * title did not read), the tick no longer looked at a read on the wire, and
  * no read deadline could fire; g_irq_tick_sum stopped growing. clk_check()
  * (from the tick and from ReqCmd) sees the counter's mode change and moves
- * the clock to TMU2 for good: CE's kernel touches TMU0 and TMU1 only, and
- * the loader timed CE on TMU2 until 2026-10-03. A Katana or KOS title keeps
+ * the clock to TMU2 for good. CE's kernel runs TMU2 itself as a free-running
+ * Pck/4 counter (TCOR2 = all ones, no interrupt, never stopped; DDHAL.DLL
+ * reads TCNT2 for its timings): sharing it is harmless, and taking it over
+ * restarts TCNT2 once. A Katana or KOS title keeps
  * the counter (TMU2 is theirs, see above). The interval running across the
  * switch is measured wrong once.
  */
