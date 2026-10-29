@@ -411,6 +411,20 @@ Katana and KOS titles. The seconds timeout (`PMCR_Read`) stays on the counter.
 **flycast reads 0 from PMCR without the local `sh4_mmr.cpp` patch** (§11): the
 clock is then TMU2 there for every title.
 
+**A chainload must not stop the counter** (2026-10-29). `PMCR_Enable()`'s reset
+bit is the STOP bit, and STOP written to a RUNNING counter stops it (perfctr.h;
+flycast models it so). `pmcr_enabled` starts 0 in every image, so each loader of
+a chainload used to flip the clock: under flycast the CDI's, the hop's and the
+resident loader left PMCR1 at `0x0023`, stopped, from EXEC on. `clk_check()`
+looks at the mode only, so the clock stayed the dead counter: `clk_since()`
+always 0, no read deadline ever fired (`g_fine_timeouts` 0 for a whole session),
+and the first answer lost left the title polling a read nobody asked again
+(`g_gd_in_transfer` 1, `g_ga_posts` one more than `g_cdfs_sync_chunks`): Crazy
+Taxi at its SEGA logo, Sonic Adventure loading its first level. `PMCR_Init()`
+now leaves counter 1 alone when it moves across a short spin (a stopped one
+holds its count, a disabled one reads 0). A stall backstop in `clk_check()`
+did not fit the relocatable image (60 bytes free under `_stack`).
+
 **The GD lock's C sections run masked.** `gd_take()` raises IMASK to 15
 before taking the lock and `gd_give()` gives the caller's IMASK back (only
 IMASK: T and the rest of SR stay). ReqCmd, GetCmdStat, GetDrvStat and

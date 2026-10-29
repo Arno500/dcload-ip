@@ -32,6 +32,33 @@ static unsigned char pmcr_enabled = 0;
 
 void PMCR_Init(unsigned char which, unsigned char mode, unsigned char count_type) // Will do nothing if perfcounter is already running!
 {
+	/*
+	 * Counter 1 already counting (a previous loader's): keep it. pmcr_enabled
+	 * cannot say so across a chainload -- every image starts with it 0 -- and
+	 * PMCR_Enable()'s reset bit is the STOP bit, which stops a RUNNING counter.
+	 * So each loader of a chainload flipped the loader's clock: under flycast
+	 * (2026-10-29) the CDI's, the hop's and the resident loader left PMCR1 at
+	 * 0x0023, stopped, from EXEC on. clk_since() was then always 0, no read
+	 * deadline fired, and the first answer lost left the title polling a read
+	 * nobody asked again (Crazy Taxi at its SEGA logo, Sonic Adventure loading
+	 * its first level). A stopped counter holds its count, a disabled one
+	 * reads 0: only a running one moves across the spin.
+	 */
+	if (which == 1)
+	{
+		unsigned int before = *(volatile unsigned int *)PMCTR1L_REG;
+		unsigned int i;
+
+		for (i = 0; i < 64; i++)
+		{
+			__asm__ volatile ("nop");
+		}
+		if (*(volatile unsigned int *)PMCTR1L_REG != before)
+		{
+			pmcr_enabled |= 1;
+			return;
+		}
+	}
 	// Don't do anything if being asked to enable an already-enabled counter
 	if( (which == 1) && ((!pmcr_enabled) || (pmcr_enabled == 2)) )
 	{
